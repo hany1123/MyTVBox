@@ -59,6 +59,10 @@ struct SitePickerView: View {
             .toolbarColorScheme(.dark, for: .navigationBar)
         }
         .preferredColorScheme(.dark)
+        .task {
+            // 打开选择器时后台预热各站点首页，选定后立刻有画面
+            ContentViewModel.prefetch(sites: availableSites)
+        }
     }
 
     // MARK: - Header

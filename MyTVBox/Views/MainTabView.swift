@@ -74,6 +74,14 @@ struct MainTabView: View {
 private struct SettingsTab: View {
     @EnvironmentObject var appState: AppState
 
+    /// 从 Info.plist 读取，避免手写版本号跟工程配置脱节
+    private var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "—"
+        let build = info?["CFBundleVersion"] as? String ?? "—"
+        return "\(short) (\(build))"
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
@@ -99,7 +107,7 @@ private struct SettingsTab: View {
                         SectionHeader(title: "关于", code: "02")
                             .padding(.top, 8)
 
-                        infoRow(icon: "info.circle", title: "版本", value: "1.2.0 (20260606)")
+                        infoRow(icon: "info.circle", title: "版本", value: appVersion)
                         infoRow(icon: "lock.shield", title: "隐私", value: "所有数据仅本机存储")
                     }
                     .padding(.horizontal, 18)

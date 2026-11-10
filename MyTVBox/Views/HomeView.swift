@@ -13,9 +13,11 @@ struct HomeView: View {
     @State private var showSitePicker: Bool = false
     @State private var headerPulse: Bool = false
 
-    private var availableSitesCount: Int {
-        (appState.currentConfig?.sites ?? []).filter { $0.type != 3 }.count
+    private var availableSites: [Site] {
+        (appState.currentConfig?.sites ?? []).filter { $0.type != 3 && $0.api != nil }
     }
+
+    private var availableSitesCount: Int { availableSites.count }
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -70,10 +72,10 @@ struct HomeView: View {
         }
         .task(id: appState.currentSite?.key) {
             guard let site = appState.currentSite else { return }
-            // 已有数据且不是切换站点时不必重新拉取
-            if viewModel.videoList.isEmpty || viewModel.currentCategory != nil {
-                await viewModel.loadVideoList(site: site, category: nil)
-            }
+            // 切换站点后立即重载（有缓存则先渲染缓存再静默刷新），
+            // 请求由 ViewModel 自行持有，不会因视图 task 取消而中断
+            viewModel.reload(site: site, category: nil)
+            warmUpNeighbors(around: site)
         }
         .onAppear { headerPulse = true }
     }
@@ -178,6 +180,15 @@ struct HomeView: View {
             Text(String(format: "// %02d", viewModel.videoList.count))
                 .font(TVBoxTheme.mono(10, weight: .medium))
                 .foregroundStyle(TVBoxTheme.textMuted)
+
+            // 缓存已出图、后台仍在刷新时的细微提示
+            if viewModel.isLoading && viewModel.isShowingCached {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(TVBoxTheme.accent)
+                    .scaleEffect(0.7)
+            }
+
             Rectangle().fill(TVBoxTheme.stroke).frame(height: 1)
         }
     }
@@ -263,6 +274,20 @@ struct HomeView: View {
     }
 
     // MARK: - 行为
+
+    /// 后台预热相邻站点首页，来回切换时秒开
+    @MainActor
+    private func warmUpNeighbors(around site: Site) {
+        let list = availableSites
+        guard list.count > 1,
+              let idx = list.firstIndex(where: { $0.key == site.key }) else { return }
+        var targets: [Site] = []
+        for offset in [1, -1, 2] {
+            let i = (idx + offset + list.count) % list.count
+            if i != idx { targets.append(list[i]) }
+        }
+        ContentViewModel.prefetch(sites: targets)
+    }
 
     private func refresh() async {
         guard let site = appState.currentSite else { return }

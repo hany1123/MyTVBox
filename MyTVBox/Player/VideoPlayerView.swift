@@ -148,6 +148,8 @@ struct VideoPlayerView: View {
         .statusBarHidden(isFullscreen)
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
+        // 播放页隐藏底部 TabBar —— 横屏时它正好压在画面上
+        .toolbar(.hidden, for: .tabBar)
         .fullScreenCover(isPresented: $isFullscreen) {
             FullscreenPlayerView(viewModel: viewModel) {
                 isFullscreen = false
@@ -156,10 +158,12 @@ struct VideoPlayerView: View {
         .onAppear {
             viewModel.start()
             scheduleAutoHide()
+            TabBarVisibility.setHidden(true)
         }
         .onDisappear {
             viewModel.saveProgress()
             hideTask?.cancel()
+            TabBarVisibility.setHidden(false)
         }
     }
 
