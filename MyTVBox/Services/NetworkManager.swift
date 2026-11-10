@@ -44,7 +44,7 @@ final class NetworkManager {
 
     /// 发起请求并返回原始 Data
     func data(from urlString: String, timeout: TimeInterval? = nil) async throws -> Data {
-        guard let url = URL(string: urlString) else { throw NetworkError.invalidURL }
+        guard let url = URLNormalizer.url(urlString) else { throw NetworkError.invalidURL }
         let request = makeRequest(url: url, timeout: timeout)
         let (data, response) = try await session.data(for: request)
         try validate(response)
