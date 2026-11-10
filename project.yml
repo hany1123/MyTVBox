@@ -28,7 +28,7 @@ targets:
     settings:
       base:
         INFOPLIST_FILE: MyTVBox/Info.plist
-        PRODUCT_BUNDLE_IDENTIFIER: com.mytvbox.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.newbox.ios
         TARGETED_DEVICE_FAMILY: "1,2"
         ENABLE_BITCODE: "NO"
         CODE_SIGNING_ALLOWED: "NO"
@@ -39,8 +39,8 @@ targets:
     info:
       path: MyTVBox/Info.plist
       properties:
-        CFBundleDisplayName: MyTVBox
-        CFBundleIdentifier: com.mytvbox.app
+        CFBundleDisplayName: NewBox
+        CFBundleIdentifier: com.newbox.ios
         CFBundleShortVersionString: "1.2.0"
         CFBundleVersion: "20260606.1"
         MinimumOSVersion: "16.0"
