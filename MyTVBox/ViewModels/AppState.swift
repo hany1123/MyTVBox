@@ -32,6 +32,8 @@ final class AppState: ObservableObject {
     @Published var currentSite: Site?
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
+    /// 非错误类信息（如「加载成功但部分站点 iOS 不支持」），与 errorMessage 分开以免误报「出错了」
+    @Published var configNotice: String?
 
     @Published var subscriptions: [Subscription] = []
     @Published var activeSubscriptionId: UUID?
@@ -153,6 +155,7 @@ final class AppState: ObservableObject {
                 self.currentSite = sites.first
             }
             self.errorMessage = nil
+            self.configNotice = nil
             if let sid = subscriptionId,
                let idx = subscriptions.firstIndex(where: { $0.id == sid }) {
                 subscriptions[idx].lastUpdated = Date()
@@ -163,6 +166,7 @@ final class AppState: ObservableObject {
 
         isLoading = true
         errorMessage = nil
+        configNotice = nil
         defer { isLoading = false }
 
         do {
@@ -185,11 +189,22 @@ final class AppState: ObservableObject {
                 saveSubscriptions()
             }
 
-            // 提示可用站点情况
-            let usableCount = cmsSites.count + spiderWithURL.count
-            let spiderOnlyCount = allSites.count - usableCount
-            if spiderOnlyCount > 0 && cmsSites.count > 0 {
-                self.errorMessage = "已加载 \(allSites.count) 个站点，其中 \(cmsSites.count) 个可用，\(spiderOnlyCount) 个 Spider 源缺少 JS 引擎支持。"
+            // 提示可用站点情况（成功路径写 configNotice，不占 errorMessage）
+            let stats = ConfigService.shared.lastStats
+            let usableCount = stats?.usableSites ?? (cmsSites.count + spiderWithURL.count)
+            let totalCount = stats?.totalSites ?? allSites.count
+            let droppedCount = stats?.droppedJarSites ?? (totalCount - usableCount)
+            let livesCount = stats?.lives ?? (cfg.lives?.count ?? 0)
+
+            if totalCount > 0 && usableCount == 0 {
+                var msg = "接口读取成功，但 \(totalCount) 个站点全部为 JAR 型（需 Android 运行时），iOS 无法加载。"
+                if livesCount > 0 { msg += "另有 \(livesCount) 路直播源可用。" }
+                msg += "\n建议换一个含 CMS / JS 站点的接口，或切回内置源。"
+                self.configNotice = msg
+            } else if droppedCount > 0 && usableCount > 0 {
+                self.configNotice = "已加载 \(usableCount) 个可用站点（另有 \(droppedCount) 个 JAR 型站点无法在 iOS 运行）。"
+            } else if usableCount > 0 {
+                self.configNotice = "已加载 \(usableCount) 个可用站点。"
             }
         } catch {
             // 如果是默认 CatPaw 订阅源加载失败，使用 CatPawConfigBuilder 生成配置

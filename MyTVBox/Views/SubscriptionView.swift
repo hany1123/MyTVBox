@@ -69,6 +69,11 @@ struct SubscriptionView: View {
         } message: {
             Text(vm.errorMessage)
         }
+        .alert("接口信息", isPresented: $vm.showNotice) {
+            Button("知道了", role: .cancel) { vm.showNotice = false }
+        } message: {
+            Text(vm.noticeMessage)
+        }
         .task {
             vm.attach(appState: appState)
         }

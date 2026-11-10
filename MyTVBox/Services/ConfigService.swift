@@ -4,6 +4,17 @@ import Foundation
 final class ConfigService {
     static let shared = ConfigService()
 
+    /// 最近一次解析的站点统计（用于向用户解释「为什么站点很少」）
+    struct ConfigStats {
+        var totalSites: Int = 0
+        var usableSites: Int = 0
+        var droppedJarSites: Int = 0
+        var lives: Int = 0
+    }
+
+    /// 最近一次 `loadConfig` 的诊断结果；调用方在 await 之后读取
+    private(set) var lastStats: ConfigStats?
+
     private let network = NetworkManager.shared
 
     private init() {}
@@ -14,6 +25,7 @@ final class ConfigService {
     /// - 支持 CatPaw Spider 模块 URL（自动尝试常见配置路径）
     /// - 支持 base64 编码的 JSON 配置
     func loadConfig(from urlString: String) async throws -> TVBoxConfig {
+        lastStats = nil
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw NetworkError.invalidURL }
 
@@ -124,7 +136,14 @@ final class ConfigService {
     /// 解析配置并滤掉 iOS 无法执行的站点（type 3 = JAR 爬虫，需要 JVM）
     private func decodeWithExtras(_ data: Data) throws -> TVBoxConfig {
         let cfg = try _decodeWithExtras(data)
-        let usable = (cfg.sites ?? []).filter { [0, 1, 4].contains($0.type) }
+        let all = cfg.sites ?? []
+        let usable = all.filter { [0, 1, 4].contains($0.type) }
+        lastStats = ConfigStats(
+            totalSites: all.count,
+            usableSites: usable.count,
+            droppedJarSites: all.count - usable.count,
+            lives: cfg.lives?.count ?? 0
+        )
         return TVBoxConfig(spider: cfg.spider, sites: usable, lives: cfg.lives,
                            parses: cfg.parses, flags: cfg.flags, ijk: cfg.ijk)
     }
@@ -244,7 +263,7 @@ final class ConfigService {
 
     /// 从同一域名的常见配置路径尝试获取 JSON 配置
     private func tryAlternativePaths(baseURL: String) async -> TVBoxConfig? {
-        guard let url = URL(string: baseURL),
+        guard let url = URLNormalizer.url(baseURL),
               let scheme = url.scheme,
               let host = url.host else { return nil }
 

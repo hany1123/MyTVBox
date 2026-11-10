@@ -220,9 +220,12 @@ struct HomeView: View {
                 .font(TVBoxTheme.mono(11, weight: .heavy))
                 .tracking(3)
                 .foregroundStyle(TVBoxTheme.textSecondary)
-            Text("请先在设置中添加并激活订阅源")
+            Text(appState.configNotice ?? "请先在设置中添加并激活订阅源")
                 .font(TVBoxTheme.text(13))
                 .foregroundStyle(TVBoxTheme.textMuted)
+                .multilineTextAlignment(.center)
+                .lineSpacing(4)
+                .padding(.horizontal, 32)
         }
         .frame(maxWidth: .infinity)
     }
