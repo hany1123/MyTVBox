@@ -44,8 +44,8 @@ final class AppState: ObservableObject {
     private let didSeedDefaultKey = "MyTVBox.didSeedDefaultSubscription"
 
     // MARK: - 默认订阅源
-    static let defaultSubscriptionName = "默认源"
-    static let defaultSubscriptionURL = "http://wexfnw:wexfnw@cat.xn--4kq62z5rby2qupq9ub.top/index.js.md5"
+    static let defaultSubscriptionName = "内置源"
+    static let defaultSubscriptionURL = BuiltinSources.defaultURL
 
     init() {
         loadSubscriptions()
@@ -66,22 +66,16 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// 首次启动时注入内置默认订阅源，并设为激活
+    /// 确保内置源存在（老版本升级后也会自动补上）
     private func seedDefaultSubscriptionIfNeeded() {
         let defaults = UserDefaults.standard
-        // 已经注入过则不再重复
-        if defaults.bool(forKey: didSeedDefaultKey) { return }
-        // 用户已自行添加过订阅则不注入
-        guard subscriptions.isEmpty else {
-            defaults.set(true, forKey: didSeedDefaultKey)
-            return
-        }
+        if subscriptions.contains(where: { BuiltinSources.isBuiltin($0.url) }) { return }
         let sub = Subscription(
             name: Self.defaultSubscriptionName,
             url: Self.defaultSubscriptionURL,
             isActive: true
         )
-        subscriptions.append(sub)
+        subscriptions.insert(sub, at: 0)
         activeSubscriptionId = sub.id
         saveSubscriptions()
         defaults.set(true, forKey: didSeedDefaultKey)
@@ -150,6 +144,23 @@ final class AppState: ObservableObject {
 
     /// 从指定 URL 加载配置（并更新订阅时间戳）
     func loadConfig(from url: String, subscriptionId: UUID? = nil) async {
+        // 内置源：本地构造，不走网络
+        if BuiltinSources.isBuiltin(url) {
+            let cfg = BuiltinSources.config()
+            self.currentConfig = cfg
+            let sites = cfg.sites ?? []
+            if currentSite == nil || !sites.contains(where: { $0.key == currentSite?.key }) {
+                self.currentSite = sites.first
+            }
+            self.errorMessage = nil
+            if let sid = subscriptionId,
+               let idx = subscriptions.firstIndex(where: { $0.id == sid }) {
+                subscriptions[idx].lastUpdated = Date()
+                saveSubscriptions()
+            }
+            return
+        }
+
         isLoading = true
         errorMessage = nil
         defer { isLoading = false }
