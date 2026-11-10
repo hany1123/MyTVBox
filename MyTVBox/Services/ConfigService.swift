@@ -121,7 +121,15 @@ final class ConfigService {
     // MARK: - 解码增强
 
     /// 解码 JSON，支持 base64 编码兜底 + 数组格式 [{api,name}] 兼容
+    /// 解析配置并滤掉 iOS 无法执行的站点（type 3 = JAR 爬虫，需要 JVM）
     private func decodeWithExtras(_ data: Data) throws -> TVBoxConfig {
+        let cfg = try _decodeWithExtras(data)
+        let usable = (cfg.sites ?? []).filter { [0, 1, 4].contains($0.type) }
+        return TVBoxConfig(spider: cfg.spider, sites: usable, lives: cfg.lives,
+                           parses: cfg.parses, flags: cfg.flags, ijk: cfg.ijk)
+    }
+
+    private func _decodeWithExtras(_ data: Data) throws -> TVBoxConfig {
         // 1. 直接 JSON 解码（标准 TVBox 对象格式）
         if let cfg = try? network.decodeJSON(TVBoxConfig.self, data: data) {
             return cfg
@@ -129,6 +137,15 @@ final class ConfigService {
 
         // 2. 尝试数组格式：[{api, name}, ...] → 转换为 CMS 站点列表
         if let cfg = try? decodeArrayFormat(data) {
+            return cfg
+        }
+
+        // 2.5 `$#` 加密配置（十六进制 + AES-128-CBC，部分接口在用）
+        if let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           ConfigDecryptor.isEncrypted(text),
+           let plain = ConfigDecryptor.decrypt(text),
+           let cfg = try? network.decodeJSON(TVBoxConfig.self, data: plain) {
             return cfg
         }
 
