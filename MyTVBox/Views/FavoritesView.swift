@@ -99,9 +99,10 @@ struct FavoritesView: View {
         } else {
             ScrollView {
                 LazyVGrid(columns: [
-                    GridItem(.flexible(), spacing: 14),
-                    GridItem(.flexible(), spacing: 14)
-                ], spacing: 18) {
+                    GridItem(.flexible(), spacing: 10),
+                    GridItem(.flexible(), spacing: 10),
+                    GridItem(.flexible(), spacing: 10)
+                ], spacing: 14) {
                     ForEach(favorites) { fav in
                         let item = VideoItem(
                             vodId: fav.vodId,

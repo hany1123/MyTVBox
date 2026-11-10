@@ -207,6 +207,11 @@ struct VideoDetail: Codable, Identifiable, Hashable {
 
     /// 解析播放来源与剧集 (vod_play_from / vod_play_url 用 $$$ 分隔多源,
     /// 每源内部用 # 分隔多集, 集名与URL用 $ 分隔)
+    ///
+    /// 重要：同一部片子常有多组线路，其中一组是「网页分享页」（如 `feifan` 的
+    /// `https://vip.ffzy-play9.com/share/xxx`），必须经解析器才能播；
+    /// 另一组才是 m3u8 直链（`ffm3u8`）。原实现按顺序取第 0 组，导致把 HTML
+    /// 交给 AVPlayer 而报 "Cannot Open"。这里按「能否直连播放」重新排序。
     func parsePlaySources() -> [PlaySource] {
         guard let from = vodPlayFrom, let urls = vodPlayUrl else { return [] }
         let fromList = from.components(separatedBy: "$$$")
@@ -233,7 +238,58 @@ struct VideoDetail: Codable, Identifiable, Hashable {
                 result.append(PlaySource(name: trimmedName, episodes: episodes))
             }
         }
-        return result
+        // 稳定排序：可直连播放的线路优先，其余（网页/需解析）降级到后面
+        return result.enumerated()
+            .sorted { a, b in
+                let sa = PlayURL.mediaScore(a.element, sourceName: a.element.name)
+                let sb = PlayURL.mediaScore(b.element, sourceName: b.element.name)
+                if sa != sb { return sa > sb }
+                return a.offset < b.offset
+            }
+            .map { $0.element }
+    }
+}
+
+// MARK: - 直链判定
+
+extension PlayURL {
+    /// 地址看起来能否被 AVPlayer 直接播放（m3u8 / mp4 / flv / ts / mpd）
+    static func isDirectPlayable(url: String) -> Bool {
+        let lower = url.lowercased()
+        guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else {
+            return lower.hasPrefix("file://")
+        }
+        // 去掉 query 后看路径后缀
+        let path = lower.components(separatedBy: "?").first ?? lower
+        let mediaExts = [".m3u8", ".mp4", ".m4v", ".mov", ".flv", ".ts", ".mpd", ".mkv"]
+        if mediaExts.contains(where: { path.hasSuffix($0) || path.contains($0 + "?") }) {
+            return true
+        }
+        // 路径里带 m3u8 但不在结尾（如 /xxx.m3u8/token/...）也算
+        if path.contains(".m3u8") || path.contains("/hls/") { return true }
+        // 明确的网页分享页
+        if path.contains("/share/") || path.contains("/play/") && !path.contains(".m3u8") {
+            return false
+        }
+        return false
+    }
+
+    /// 线路打分：越高越该排在前面
+    static func mediaScore(_ source: PlaySource, sourceName: String) -> Int {
+        let nameLower = sourceName.lowercased()
+        var score = 0
+        // 线路名本身带 m3u8，通常就是直链线路
+        if nameLower.contains("m3u8") { score += 4 }
+        if nameLower.contains("mp4") { score += 3 }
+        // 抽前几集判断实际地址形态
+        let sample = source.episodes.prefix(3)
+        let playable = sample.filter { isDirectPlayable(url: $0.url) }.count
+        if playable == sample.count && playable > 0 {
+            score += 6
+        } else if playable > 0 {
+            score += 2
+        }
+        return score
     }
 }
 

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 可复用的内容网格 —— 固定 2 列；底部支持加载更多指示器
+/// 可复用的内容网格 —— 手机 3 列 / 大屏 4~5 列；底部支持加载更多指示器
 /// - 倒数第 4 个 item 出现时触发 onLoadMore（避免到底再触发的延迟感）
 struct ContentGridView: View {
 
@@ -9,9 +9,18 @@ struct ContentGridView: View {
     let onLoadMore: () -> Void
     let onItemTap: (VideoItem) -> Void
 
-    private let columns = 2
-    private let columnSpacing: CGFloat = 14
-    private let rowSpacing: CGFloat = 18
+    /// 水平内边距
+    private let horizontalPadding: CGFloat = 12
+    private let columnSpacing: CGFloat = 10
+    private let rowSpacing: CGFloat = 14
+
+    /// 按可用宽度决定列数：手机 3 列，iPad / 横屏更多
+    private func columnCount(for width: CGFloat) -> Int {
+        if width >= 820 { return 6 }
+        if width >= 620 { return 5 }
+        if width >= 480 { return 4 }
+        return 3
+    }
 
     var body: some View {
         // GeometryReader 只用于测量父级宽度，不占高度
@@ -23,18 +32,21 @@ struct ContentGridView: View {
             .frame(height: 0)
 
             if let width = gridWidth {
+                let columns = columnCount(for: width)
                 let totalSpacing = columnSpacing * CGFloat(columns - 1)
-                let cardWidth = (width - totalSpacing - 32) / CGFloat(columns)  // 32 = horizontal padding
+                let cardWidth = max(64, (width - totalSpacing - horizontalPadding * 2) / CGFloat(columns))
+                let compact = columns >= 4
 
                 LazyVGrid(
-                    columns: Array(repeating: GridItem(.fixed(cardWidth), spacing: columnSpacing), count: columns),
+                    columns: Array(repeating: GridItem(.fixed(cardWidth), spacing: columnSpacing),
+                                   count: columns),
                     spacing: rowSpacing
                 ) {
                     ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
                         Button {
                             onItemTap(item)
                         } label: {
-                            VideoCardView(item: item, index: idx + 1)
+                            VideoCardView(item: item, index: idx + 1, compact: compact)
                         }
                         .buttonStyle(CardPressStyle())
                         .onAppear {
@@ -43,7 +55,7 @@ struct ContentGridView: View {
                         }
                     }
                 }
-                .padding(.horizontal, 16)
+                .padding(.horizontal, horizontalPadding)
             }
 
             if isLoadingMore {

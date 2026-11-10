@@ -55,8 +55,9 @@ struct SearchView: View {
     // MARK: - 网格列
 
     private let columns: [GridItem] = [
-        GridItem(.flexible(), spacing: 14),
-        GridItem(.flexible(), spacing: 14)
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10)
     ]
 
     // MARK: - Body
@@ -316,7 +317,7 @@ struct SearchView: View {
             .padding(.top, 4)
 
             // 结果网格
-            LazyVGrid(columns: columns, spacing: 18) {
+            LazyVGrid(columns: columns, spacing: 14) {
                 ForEach(Array(results.enumerated()), id: \.element.id) { idx, item in
                     Button {
                         path.append(item)

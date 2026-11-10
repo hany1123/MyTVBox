@@ -87,12 +87,50 @@ final class VideoPlayerViewModel: ObservableObject {
     // MARK: - Lifecycle
 
     /// 视图出现时调用：开始首次播放（处理续播）
+    /// 若当前线路是网页地址（需解析器），自动切到第一条可直连的线路
     func start() {
-        guard let url = currentEpisode.flatMap({ URL(string: $0.url) }) else {
-            errorMessage = "无效的播放地址"
+        if let ep = currentEpisode, PlayURL.isDirectPlayable(url: ep.url),
+           let url = URL(string: ep.url) {
+            loadAndPlay(url: url, restoreProgress: true)
             return
         }
-        loadAndPlay(url: url, restoreProgress: true)
+        // 自动降级：找第一条能直连的线路
+        if let fallback = firstPlayableSourceIndex() {
+            currentSourceIndex = fallback
+            let eps = sources[fallback].episodes
+            let keep = eps.indices.contains(currentEpisodeIndex) ? currentEpisodeIndex : 0
+            currentEpisodeIndex = keep
+            if let url = URL(string: eps[keep].url) {
+                loadAndPlay(url: url, restoreProgress: true)
+                return
+            }
+        }
+        errorMessage = "所有线路都需要解析器\n当前版本只能播放 M3U8 直链"
+    }
+
+    /// 返回第一条含可直连地址的线路下标
+    private func firstPlayableSourceIndex() -> Int? {
+        for (i, src) in sources.enumerated() {
+            if src.episodes.contains(where: { PlayURL.isDirectPlayable(url: $0.url) }) {
+                return i
+            }
+        }
+        return nil
+    }
+
+    /// 针对不同「不可直连」地址给出可操作的提示
+    private func playbackHint(url: String) -> String {
+        let lower = url.lowercased()
+        let netdiskHosts = ["pan.quark.cn", "pan.baidu.com", "aliyundrive.com",
+                            "alipan.com", "cloud.189.cn", "caiyun.139.com",
+                            "115.com", "123pan.com", "xunlei.com"]
+        if netdiskHosts.contains(where: { lower.contains($0) }) {
+            return "这是网盘资源，需在网盘 App 内打开"
+        }
+        if lower.contains("/share/") || lower.contains("/play/") {
+            return "该线路是网页分享页，需要解析器\n请切换到 M3U8 线路"
+        }
+        return "无法识别的播放地址\n请切换到其他线路"
     }
 
     // MARK: - Episode / Source
@@ -101,8 +139,13 @@ final class VideoPlayerViewModel: ObservableObject {
         guard let src = currentSource, src.episodes.indices.contains(index) else { return }
         saveProgress()
         currentEpisodeIndex = index
-        guard let url = URL(string: src.episodes[index].url) else {
+        let ep = src.episodes[index]
+        guard let url = URL(string: ep.url) else {
             errorMessage = "无效的播放地址"
+            return
+        }
+        guard PlayURL.isDirectPlayable(url: ep.url) else {
+            errorMessage = playbackHint(url: ep.url)
             return
         }
         loadAndPlay(url: url, restoreProgress: false)
@@ -116,8 +159,14 @@ final class VideoPlayerViewModel: ObservableObject {
         // 集数索引超界则回 0
         let epCount = sources[index].episodes.count
         if currentEpisodeIndex >= epCount { currentEpisodeIndex = 0 }
-        guard let url = URL(string: sources[index].episodes[currentEpisodeIndex].url) else {
+        guard sources[index].episodes.indices.contains(currentEpisodeIndex) else { return }
+        let ep = sources[index].episodes[currentEpisodeIndex]
+        guard let url = URL(string: ep.url) else {
             errorMessage = "无效的播放地址"
+            return
+        }
+        guard PlayURL.isDirectPlayable(url: ep.url) else {
+            errorMessage = playbackHint(url: ep.url)
             return
         }
         // 切线路尝试保留进度

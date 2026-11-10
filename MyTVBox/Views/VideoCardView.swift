@@ -8,25 +8,37 @@ struct VideoCardView: View {
     let item: VideoItem
     /// 可选的序号（用于在卡片左下显示 "01" "02" ...）
     let index: Int?
+    /// 紧凑模式（4 列及以上时缩小字号与装饰）
+    let compact: Bool
 
-    init(item: VideoItem, index: Int? = nil) {
+    init(item: VideoItem, index: Int? = nil, compact: Bool = false) {
         self.item = item
         self.index = index
+        self.compact = compact
     }
 
+    private var titleSize: CGFloat { compact ? 11 : 13 }
+    private var metaSize: CGFloat { compact ? 8 : 10 }
+    private var badgeSize: CGFloat { compact ? 7.5 : 9 }
+    private var badgePadH: CGFloat { compact ? 5 : 7 }
+    private var badgePadV: CGFloat { compact ? 2 : 3 }
+    private var overlayPad: CGFloat { compact ? 5 : 7 }
+    private var cornerSize: CGFloat { compact ? 9 : 12 }
+    private var posterRadius: CGFloat { compact ? 8 : 10 }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: compact ? 6 : 8) {
             poster
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: compact ? 2 : 3) {
                 Text(item.vodName)
-                    .font(TVBoxTheme.text(13, weight: .semibold))
+                    .font(TVBoxTheme.text(titleSize, weight: .semibold))
                     .foregroundStyle(TVBoxTheme.textPrimary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if let meta = subMeta {
                     Text(meta)
-                        .font(TVBoxTheme.mono(10, weight: .medium))
+                        .font(TVBoxTheme.mono(metaSize, weight: .medium))
                         .foregroundStyle(TVBoxTheme.textMuted)
                         .lineLimit(1)
                 }
@@ -44,9 +56,9 @@ struct VideoCardView: View {
                 .clipped()
         }
         .aspectRatio(2.0 / 3.0, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: posterRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: posterRadius, style: .continuous)
                 .stroke(TVBoxTheme.stroke, lineWidth: 1)
         )
         .overlay(scanlineOverlay)
@@ -98,10 +110,10 @@ struct VideoCardView: View {
             }
             VStack(spacing: 6) {
                 Image(systemName: "tv")
-                    .font(.system(size: 26, weight: .light))
+                    .font(.system(size: compact ? 18 : 26, weight: .light))
                     .foregroundStyle(TVBoxTheme.textMuted)
                 Text("// NO SIGNAL")
-                    .font(TVBoxTheme.mono(9, weight: .heavy))
+                    .font(TVBoxTheme.mono(compact ? 7 : 9, weight: .heavy))
                     .tracking(2)
                     .foregroundStyle(TVBoxTheme.textMuted)
             }
@@ -112,25 +124,25 @@ struct VideoCardView: View {
 
     private var cornerBracketTL: some View {
         Path { p in
-            p.move(to: CGPoint(x: 0, y: 12))
+            p.move(to: CGPoint(x: 0, y: cornerSize))
             p.addLine(to: CGPoint(x: 0, y: 0))
-            p.addLine(to: CGPoint(x: 12, y: 0))
+            p.addLine(to: CGPoint(x: cornerSize, y: 0))
         }
         .stroke(TVBoxTheme.accent.opacity(0.85), lineWidth: 1.5)
-        .frame(width: 12, height: 12)
-        .padding(7)
+        .frame(width: cornerSize, height: cornerSize)
+        .padding(overlayPad)
         .allowsHitTesting(false)
     }
 
     private var cornerBracketBR: some View {
         Path { p in
-            p.move(to: CGPoint(x: 0, y: 12))
-            p.addLine(to: CGPoint(x: 12, y: 12))
-            p.addLine(to: CGPoint(x: 12, y: 0))
+            p.move(to: CGPoint(x: 0, y: cornerSize))
+            p.addLine(to: CGPoint(x: cornerSize, y: cornerSize))
+            p.addLine(to: CGPoint(x: cornerSize, y: 0))
         }
         .stroke(TVBoxTheme.accent.opacity(0.55), lineWidth: 1.5)
-        .frame(width: 12, height: 12)
-        .padding(7)
+        .frame(width: cornerSize, height: cornerSize)
+        .padding(overlayPad)
         .allowsHitTesting(false)
     }
 
@@ -139,18 +151,18 @@ struct VideoCardView: View {
         if let r = item.vodRemarks?.trimmingCharacters(in: .whitespaces),
            !r.isEmpty {
             Text(r)
-                .font(TVBoxTheme.mono(9, weight: .heavy))
+                .font(TVBoxTheme.mono(badgeSize, weight: .heavy))
                 .tracking(0.5)
                 .lineLimit(1)
                 .foregroundStyle(.black)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
+                .padding(.horizontal, badgePadH)
+                .padding(.vertical, badgePadV)
                 .background(
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
                         .fill(TVBoxTheme.accent)
                 )
                 .shadow(color: TVBoxTheme.accent.opacity(0.5), radius: 6, y: 2)
-                .padding(7)
+                .padding(overlayPad)
         }
     }
 
@@ -159,19 +171,19 @@ struct VideoCardView: View {
         if let idx = index {
             HStack(spacing: 3) {
                 Text("//")
-                    .font(TVBoxTheme.mono(9, weight: .heavy))
+                    .font(TVBoxTheme.mono(badgeSize, weight: .heavy))
                     .foregroundStyle(TVBoxTheme.accent.opacity(0.7))
                 Text(String(format: "%02d", idx))
-                    .font(TVBoxTheme.mono(11, weight: .black))
+                    .font(TVBoxTheme.mono(badgeSize + 2, weight: .black))
                     .foregroundStyle(TVBoxTheme.accent)
             }
-            .padding(.horizontal, 6)
+            .padding(.horizontal, compact ? 4 : 6)
             .padding(.vertical, 2)
             .background(
                 RoundedRectangle(cornerRadius: 4, style: .continuous)
                     .fill(.black.opacity(0.55))
             )
-            .padding(7)
+            .padding(overlayPad)
         }
     }
 
