@@ -158,28 +158,38 @@ struct PlayerControlsView: View {
                 viewModel.skip(by: -15)
             }
 
-            ZStack {
-                Circle()
-                    .stroke(PlayerTheme.amber, lineWidth: 1.5)
-                    .frame(width: 76, height: 76)
-                Circle()
-                    .fill(PlayerTheme.amber.opacity(0.15))
-                    .frame(width: 64, height: 64)
-                    .blur(radius: 6)
-                if viewModel.isLoading {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .tint(PlayerTheme.amber)
-                        .scaleEffect(1.4)
-                } else {
-                    Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 30, weight: .black))
-                        .foregroundColor(PlayerTheme.amber)
-                        .offset(x: viewModel.isPlaying ? 0 : 2)
+            VStack(spacing: 8) {
+                ZStack {
+                    Circle()
+                        .stroke(PlayerTheme.amber, lineWidth: 1.5)
+                        .frame(width: 76, height: 76)
+                    Circle()
+                        .fill(PlayerTheme.amber.opacity(0.15))
+                        .frame(width: 64, height: 64)
+                        .blur(radius: 6)
+                    if viewModel.isStalling {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .tint(PlayerTheme.amber)
+                            .scaleEffect(1.4)
+                    } else {
+                        Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 30, weight: .black))
+                            .foregroundColor(PlayerTheme.amber)
+                            .offset(x: viewModel.isPlaying ? 0 : 2)
+                    }
+                }
+                .contentShape(Circle())
+                .onTapGesture { viewModel.togglePlayPause() }
+
+                if viewModel.isStalling {
+                    Text(viewModel.isLoading ? "加载中" : "缓冲中")
+                        .font(PlayerTheme.mono(10, weight: .semibold))
+                        .tracking(1.5)
+                        .foregroundColor(PlayerTheme.textMid)
                 }
             }
-            .contentShape(Circle())
-            .onTapGesture { viewModel.togglePlayPause() }
+            .frame(height: 100)   // 固定高度，转圈/文字出现时按钮不跳动
 
             iconButton(system: "goforward.15", size: 26) {
                 viewModel.skip(by: 15)
@@ -198,6 +208,7 @@ struct PlayerControlsView: View {
                     set: { newValue in scrubTime = newValue }
                 ),
                 total: max(viewModel.duration, 0.001),
+                buffered: viewModel.bufferedRatio,
                 isScrubbing: $isScrubbing,
                 onSeek: { v in viewModel.seek(to: v) }
             )
@@ -298,6 +309,8 @@ struct PlayerControlsView: View {
 struct ScrubBar: View {
     @Binding var value: Double
     let total: Double
+    /// 已缓冲进度 0...1（画在主进度条下面的浅色预读段）
+    var buffered: Double = 0
     @Binding var isScrubbing: Bool
     let onSeek: (Double) -> Void
 
@@ -306,12 +319,18 @@ struct ScrubBar: View {
             let width = geo.size.width
             let progress = total > 0 ? CGFloat(value / total) : 0
             let clamped = min(max(progress, 0), 1)
+            let bufferedWidth = width * CGFloat(min(max(buffered, 0), 1))
 
             ZStack(alignment: .leading) {
                 // 轨道
                 Capsule()
                     .fill(PlayerTheme.hairline)
                     .frame(height: 3)
+
+                // 已缓冲（预读段）—— 比轨道亮一点、比播放进度暗
+                Capsule()
+                    .fill(Color.white.opacity(0.22))
+                    .frame(width: max(0, bufferedWidth), height: 3)
 
                 // 已播放
                 Capsule()
@@ -354,5 +373,74 @@ struct ScrubBar: View {
                     }
             )
         }
+    }
+}
+
+// MARK: - 缓冲状态浮层
+//
+// 控制层 3 秒后会自动隐藏，如果这时正好卡缓冲，用户会以为「画面死了」。
+// 这个浮层不跟随控制层显隐，只要有加载/缓冲/线路慢提示就常驻。
+
+struct PlayerBufferingOverlay: View {
+
+    @ObservedObject var viewModel: VideoPlayerViewModel
+
+    private var visible: Bool {
+        viewModel.isLoading || viewModel.isBuffering || viewModel.slowLineHint != nil
+    }
+
+    private var title: String {
+        if viewModel.isLoading { return "连接中" }
+        if viewModel.isBuffering {
+            if viewModel.bufferedAhead > 0.4 {
+                return String(format: "缓冲中 %.0fs", viewModel.bufferedAhead)
+            }
+            return "缓冲中"
+        }
+        return ""
+    }
+
+    var body: some View {
+        Group {
+            if visible {
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .tint(PlayerTheme.amber)
+                        .scaleEffect(1.15)
+
+                    if !title.isEmpty {
+                        Text(title)
+                            .font(PlayerTheme.mono(11, weight: .semibold))
+                            .tracking(1.5)
+                            .foregroundColor(PlayerTheme.textHigh)
+                    }
+
+                    if let hint = viewModel.slowLineHint {
+                        Text(hint)
+                            .font(PlayerTheme.sans(11))
+                            .foregroundColor(PlayerTheme.amber)
+                            .multilineTextAlignment(.center)
+                            .lineSpacing(3)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(PlayerTheme.ink.opacity(0.75))
+                                    .overlay(Capsule().stroke(PlayerTheme.amber.opacity(0.45), lineWidth: 1))
+                            )
+                    }
+                }
+                .padding(.horizontal, 26)
+                .padding(.vertical, 20)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(PlayerTheme.ink.opacity(0.55))
+                )
+                .transition(.opacity)
+                .allowsHitTesting(false)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: visible)
     }
 }

@@ -71,6 +71,11 @@ struct FullscreenPlayerView: View {
                         .allowsHitTesting(true)
                     }
 
+                    // 缓冲浮层
+                    PlayerBufferingOverlay(viewModel: viewModel)
+                        .opacity(controlsVisible ? 0 : 1)
+                        .allowsHitTesting(false)
+
                     if let err = viewModel.errorMessage {
                         VStack(spacing: 8) {
                             Image(systemName: "exclamationmark.triangle.fill")

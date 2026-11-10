@@ -124,6 +124,11 @@ struct VideoPlayerView: View {
                 .allowsHitTesting(true)
             }
 
+            // 缓冲浮层 —— 控制层自动隐藏后，卡缓冲仍然能看见状态
+            PlayerBufferingOverlay(viewModel: viewModel)
+                .opacity(controlsVisible ? 0 : 1)
+                .allowsHitTesting(false)
+
             // 错误提示
             if let err = viewModel.errorMessage {
                 VStack(spacing: 8) {
