@@ -12,6 +12,10 @@ struct AddSubscriptionView: View {
     @State private var isSaving: Bool = false
     @State private var errorText: String? = nil
     @State private var showError: Bool = false
+    @State private var noticeText: String = ""
+    @State private var showNotice: Bool = false
+    /// 接口体检备注（添加成功后是否需要额外说明）
+    @State private var pendingNotice: String? = nil
     @State private var validationState: ValidationState = .idle
     @FocusState private var focusedField: Field?
 
@@ -122,6 +126,11 @@ struct AddSubscriptionView: View {
                 Button("好", role: .cancel) {}
             } message: {
                 Text(errorText ?? "")
+            }
+            .alert("接口信息", isPresented: $showNotice) {
+                Button("知道了", role: .cancel) { dismiss() }
+            } message: {
+                Text(noticeText)
             }
             .onAppear { focusedField = .url }
         }
@@ -350,7 +359,19 @@ struct AddSubscriptionView: View {
 
         do {
             _ = try await ConfigService.shared.loadConfig(from: trimmedURL)
-            validationState = .ok
+            let st = ConfigService.shared.lastStats
+            if let st = st, st.totalSites > 0, st.usableSites == 0 {
+                var m = "接口读取成功，但 \(st.totalSites) 个站点全部为 JAR 型（需要 Android 运行时），iOS 无法加载。"
+                if st.lives > 0 { m += "\n另有 \(st.lives) 路直播源可用。" }
+                m += "\n\n建议换一个含 CMS / JS 站点的接口，或继续使用内置源。"
+                pendingNotice = m
+                validationState = .fail(m)
+            } else if let st = st, st.droppedJarSites > 0, st.usableSites > 0 {
+                validationState = .ok
+                pendingNotice = "已加载 \(st.usableSites) 个可用站点，另有 \(st.droppedJarSites) 个 JAR 型站点无法在 iOS 运行。"
+            } else {
+                validationState = .ok
+            }
         } catch {
             // 默认 Spider 模块 URL 有内置 fallback，视为可用
             if trimmedURL == AppState.defaultSubscriptionURL {
@@ -368,14 +389,24 @@ struct AddSubscriptionView: View {
         if appState.activeSubscriptionId == sub.id {
             await appState.loadConfig()
         }
-        dismiss()
+
+        // 有体检结论就留在页面上把原因讲清楚，用户点「知道了」再关
+        if let note = pendingNotice {
+            noticeText = note
+            showNotice = true
+        } else {
+            dismiss()
+        }
     }
 
     private func autoName(from url: String) -> String {
-        if let u = URL(string: url), let host = u.host, !host.isEmpty {
-            return host
+        // 保留中文域名原文（URL(string:) 对 IDN 返回 nil，且 punycode 不好看）
+        var s = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let r = s.range(of: "://") { s = String(s[r.upperBound...]) }
+        if let cut = s.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" }) {
+            s = String(s[s.startIndex..<cut])
         }
-        return "未命名接口"
+        return s.isEmpty ? "未命名接口" : s
     }
 }
 
