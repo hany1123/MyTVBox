@@ -194,7 +194,7 @@ final class SubscriptionViewModel: ObservableObject {
     }
 
     private func presentNotice(_ text: String) {
-        self.noticeMessage = text
+        self.noticeMessage = text + " [ZQVM1]"
         self.showNotice = true
     }
 }
