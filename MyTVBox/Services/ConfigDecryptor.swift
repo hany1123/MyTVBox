@@ -91,7 +91,10 @@ enum ConfigDecryptor {
         let ivBytes = Array(iv.utf8)
         guard keyBytes.count == 16, ivBytes.count == 16, !data.isEmpty else { return nil }
 
-        var out = [UInt8](repeating: 0, count: data.count + kCCBlockSizeAES128)
+        var out = [UInt8](repeating: 0, count: data.count + Int(kCCBlockSizeAES128))
+        let outCapacity = out.count
+        let inputLength = data.count
+        let keyLength = keyBytes.count
         var outLen = 0
         var status: CCCryptorStatus = CCCryptorStatus(kCCSuccess)
 
@@ -103,10 +106,10 @@ enum ConfigDecryptor {
                             CCOperation(kCCDecrypt),
                             CCAlgorithm(kCCAlgorithmAES),
                             CCOptions(kCCOptionPKCS7Padding),
-                            keyPtr.baseAddress, keyBytes.count,
+                            keyPtr.baseAddress, keyLength,
                             ivPtr.baseAddress,
-                            dataPtr.baseAddress, data.count,
-                            outPtr.baseAddress, out.count,
+                            dataPtr.baseAddress, inputLength,
+                            outPtr.baseAddress, outCapacity,
                             &outLen
                         )
                     }
