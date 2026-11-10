@@ -303,7 +303,7 @@ struct AddSubscriptionView: View {
     private func basicValidate() -> String? {
         let s = url.trimmed
         if s.isEmpty { return "URL 不能为空" }
-        guard let parsed = URL(string: s) else { return "URL 格式不合法" }
+        guard let parsed = URLNormalizer.url(s) else { return "URL 格式不合法" }
         guard let scheme = parsed.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
             return "仅支持 http / https 协议"
