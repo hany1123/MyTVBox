@@ -2,32 +2,123 @@ import Foundation
 import SwiftUI
 
 /// 订阅源（用户添加的接口地址）
+///
+/// 1.4.9 起支持「同时启用多个订阅源」：
+/// - `isEnabled`：是否参与合并站点池（多选）。旧数据只有 `isActive`，解码时自动兼容。
+/// - `activeSubscriptionId`：当前聚焦的订阅（界面高亮、单独刷新用），不再决定加载哪些源。
 struct Subscription: Codable, Identifiable, Hashable {
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, url
+        case isEnabled
+        case isActive       // 1.4.8 旧字段，仅为兼容老数据
+        case lastUpdated
+    }
+
     let id: UUID
     var name: String
     var url: String
-    var isActive: Bool
+    /// 是否参与合并站点池
+    var isEnabled: Bool
     var lastUpdated: Date?
 
     init(id: UUID = UUID(),
          name: String,
          url: String,
-         isActive: Bool = true,
+         isEnabled: Bool = true,
          lastUpdated: Date? = nil) {
         self.id = id
         self.name = name
         self.url = url
-        self.isActive = isActive
+        self.isEnabled = isEnabled
         self.lastUpdated = lastUpdated
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.url = try c.decode(String.self, forKey: .url)
+        // 优先读新字段；老数据回落 isActive；都没有则默认启用
+        if let v = try? c.decodeIfPresent(Bool.self, forKey: .isEnabled) {
+            self.isEnabled = v
+        } else if let v = try? c.decodeIfPresent(Bool.self, forKey: .isActive) {
+            self.isEnabled = v
+        } else {
+            self.isEnabled = true
+        }
+        self.lastUpdated = try? c.decodeIfPresent(Date.self, forKey: .lastUpdated)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(url, forKey: .url)
+        try c.encode(isEnabled, forKey: .isEnabled)
+        try c.encode(isEnabled, forKey: .isActive)
+        try c.encodeIfPresent(lastUpdated, forKey: .lastUpdated)
+    }
+}
+
+// MARK: - 订阅配置加载（文件级，非 MainActor 隔离）
+//
+// 1.4.9：多订阅要并发拉取。若把加载函数放进 `@MainActor` 的 AppState 里，
+// 静态方法同样被主线程隔离，TaskGroup 的每个子任务都要 hop 回主线程，
+// 并发就退化成串行。这里放在文件顶层，保证真正跑在并发执行器上。
+
+/// 单个订阅的加载结果（TVBoxConfig 不是 Sendable，故整体标注）
+struct LoadedSource: @unchecked Sendable {
+    let id: UUID
+    let config: TVBoxConfig
+    let stats: ConfigService.ConfigStats
+    let repos: [RepoLink]
+}
+
+/// 加载单个订阅的原始配置
+func loadSubscriptionConfig(_ sub: Subscription) async -> LoadedSource? {
+    // 内置源：本地构造，不走网络
+    if BuiltinSources.isBuiltin(sub.url) {
+        let cfg = BuiltinSources.config()
+        let stats = ConfigService.ConfigStats(
+            totalSites: cfg.sites?.count ?? 0,
+            usableSites: cfg.sites?.count ?? 0,
+            droppedJarSites: 0,
+            lives: cfg.lives?.count ?? 0
+        )
+        return LoadedSource(id: sub.id, config: cfg, stats: stats, repos: [])
+    }
+
+    // 每个订阅用独立实例，避免并发时 lastStats / lastRepos 互相覆盖
+    let service = ConfigService()
+    do {
+        let cfg = try await service.loadConfig(from: sub.url)
+        return LoadedSource(id: sub.id,
+                            config: cfg,
+                            stats: service.lastStats ?? ConfigService.ConfigStats(),
+                            repos: service.lastRepos)
+    } catch {
+        // 猫爪 / Spider 模块：退回到源码生成的 CMS 源
+        if CatPawConfigBuilder.isCatPawURL(sub.url),
+           let cfg = try? await CatPawConfigBuilder.shared.buildConfig(baseURL: sub.url) {
+            let stats = ConfigService.ConfigStats(
+                totalSites: cfg.sites?.count ?? 0,
+                usableSites: cfg.sites?.count ?? 0,
+                droppedJarSites: 0,
+                lives: cfg.lives?.count ?? 0
+            )
+            return LoadedSource(id: sub.id, config: cfg, stats: stats, repos: [])
+        }
+        return nil
     }
 }
 
 /// 全局应用状态
 @MainActor
 final class AppState: ObservableObject {
-
     // MARK: - 配置
 
+    /// 合并后的站点池：所有「已启用」订阅的站点合并在一起
     @Published var currentConfig: TVBoxConfig?
     @Published var currentSite: Site?
     @Published var isLoading: Bool = false
@@ -36,10 +127,13 @@ final class AppState: ObservableObject {
     @Published var configNotice: String?
 
     @Published var subscriptions: [Subscription] = []
+    /// 当前聚焦的订阅（只是界面高亮，不再决定加载范围）
     @Published var activeSubscriptionId: UUID?
     /// 当前订阅若是多仓，这里是可切换的子仓库列表
     @Published var availableRepos: [RepoLink] = []
     @Published var activeRepoURL: String?
+    /// 站点 key -> 所属订阅名（合并池里同名站点需要区分来源）
+    @Published var siteSourceNames: [String: String] = [:]
 
     // MARK: - 私有
 
@@ -48,7 +142,28 @@ final class AppState: ObservableObject {
     private let activeSiteKey = "MyTVBox.activeSite"
     private let didSeedDefaultKey = "MyTVBox.didSeedDefaultSubscription"
 
+    /// 每个订阅加载到的内容（合并站点池的原料）
+    private struct SourceGroup {
+        let subscriptionId: UUID
+        var name: String
+        var sites: [Site]
+        var lives: [LiveSource]
+        var parses: [ParseRule]
+        var flags: [String]
+        var repos: [RepoLink]
+        var stats: ConfigService.ConfigStats
+        /// 猫爪 / Spider 入口（合并时取第一个非空）
+        var spider: String?
+        /// ijk 播放内核配置（合并时取第一个非空）
+        var ijk: [AnyCodable]?
+    }
+
+    private var groups: [UUID: SourceGroup] = [:]
+    /// 子仓库 URL -> 所属订阅 id（切仓库时只替换该订阅的站点）
+    private var repoOwners: [String: UUID] = [:]
+
     // MARK: - 默认订阅源
+
     static let defaultSubscriptionName = "内置源"
     static let defaultSubscriptionURL = BuiltinSources.defaultURL
 
@@ -78,7 +193,7 @@ final class AppState: ObservableObject {
         let sub = Subscription(
             name: Self.defaultSubscriptionName,
             url: Self.defaultSubscriptionURL,
-            isActive: true
+            isEnabled: true
         )
         subscriptions.insert(sub, at: 0)
         activeSubscriptionId = sub.id
@@ -108,10 +223,12 @@ final class AppState: ObservableObject {
 
     func removeSubscription(_ id: UUID) {
         subscriptions.removeAll { $0.id == id }
+        groups.removeValue(forKey: id)
         if activeSubscriptionId == id {
             activeSubscriptionId = subscriptions.first?.id
         }
         saveSubscriptions()
+        rebuildMergedConfig()
     }
 
     func updateSubscription(_ sub: Subscription) {
@@ -136,43 +253,24 @@ final class AppState: ObservableObject {
         activeSubscription != nil
     }
 
-    // MARK: - 配置加载
-
-    /// 加载当前激活订阅的配置
-    func loadConfig() async {
-        guard let sub = activeSubscription else {
-            self.errorMessage = "未选择订阅源"
-            return
-        }
-        await loadConfig(from: sub.url, subscriptionId: sub.id)
+    /// 已启用（参与合并）的订阅
+    var enabledSubscriptions: [Subscription] {
+        subscriptions.filter { $0.isEnabled }
     }
 
-    /// 从指定 URL 加载配置（并更新订阅时间戳）
-    func loadConfig(from url: String, subscriptionId: UUID? = nil) async {
-        // 内置源：本地构造，不走网络
-        if BuiltinSources.isBuiltin(url) {
-            let cfg = BuiltinSources.config()
-            self.currentConfig = cfg
-            self.availableRepos = []
-            self.activeRepoURL = nil
-            let sites = cfg.sites ?? []
-            // 老版本内置源只有非凡影视一个站点；升级到 16 站版后自动挪到第一条，
-            // 避免继续停留在原先报错的线路（只做一次，之后尊重用户手动选择）
-            let migratedKey = "MyTVBox.builtinMigrated16"
-            let defs = UserDefaults.standard
-            if !defs.bool(forKey: migratedKey) {
-                defs.set(true, forKey: migratedKey)
-                self.currentSite = sites.first
-            } else if currentSite == nil || !sites.contains(where: { $0.key == currentSite?.key }) {
-                self.currentSite = sites.first
-            }
-            self.errorMessage = nil
-            self.configNotice = nil
-            if let sid = subscriptionId,
-               let idx = subscriptions.firstIndex(where: { $0.id == sid }) {
-                subscriptions[idx].lastUpdated = Date()
-                saveSubscriptions()
-            }
+    /// 是否有可用于加载的订阅
+    var hasEnabledSubscription: Bool {
+        !enabledSubscriptions.isEmpty
+    }
+
+    // MARK: - 配置加载
+
+    /// 加载全部「已启用」订阅并合并成一个站点池
+    func loadConfig() async {
+        let enabled = enabledSubscriptions
+        guard !enabled.isEmpty else {
+            self.errorMessage = "没有启用任何接口，请到「接口管理」里至少开启一个"
+            self.currentConfig = nil
             return
         }
 
@@ -181,91 +279,274 @@ final class AppState: ObservableObject {
         configNotice = nil
         defer { isLoading = false }
 
-        do {
-            let cfg = try await ConfigService.shared.loadConfig(from: url)
-            self.currentConfig = cfg
-            self.availableRepos = ConfigService.shared.lastRepos
-            self.activeRepoURL = nil
-
-            // 智能选择默认站点：优先 CMS 标准接口（type != 3），其次 type 3 中有真实 URL 的
-            let allSites = cfg.sites ?? []
-            let cmsSites = allSites.filter { $0.type != 3 || $0.spiderKey != nil }
-            let spiderWithURL = allSites.filter { $0.type == 3 && $0.spiderKey == nil && ($0.api ?? "").hasPrefix("http") }
-
-            if currentSite == nil || !allSites.contains(where: { $0.key == currentSite?.key }) {
-                self.currentSite = cmsSites.first ?? spiderWithURL.first ?? allSites.first
+        // 并发拉取各订阅（每个订阅用独立 ConfigService 实例，避免共享诊断状态被覆盖）
+        let results: [LoadedSource] = await withTaskGroup(
+            of: LoadedSource?.self,
+            returning: [LoadedSource].self
+        ) { group in
+            for sub in enabled {
+                group.addTask {
+                    await loadSubscriptionConfig(sub)
+                }
             }
-
-            // 更新订阅时间戳
-            if let sid = subscriptionId,
-               let idx = subscriptions.firstIndex(where: { $0.id == sid }) {
-                subscriptions[idx].lastUpdated = Date()
-                saveSubscriptions()
+            var collected: [LoadedSource] = []
+            for await item in group {
+                if let item { collected.append(item) }
             }
+            return collected
+        }
 
-            // 提示可用站点情况（成功路径写 configNotice，不占 errorMessage）
-            let stats = ConfigService.shared.lastStats
-            let usableCount = stats?.usableSites ?? (cmsSites.count + spiderWithURL.count)
-            let totalCount = stats?.totalSites ?? allSites.count
-            let droppedCount = stats?.droppedJarSites ?? (totalCount - usableCount)
-            let livesCount = stats?.lives ?? (cfg.lives?.count ?? 0)
+        var okCount = 0
+        var siteTotal = 0
+        var dropped = 0
+        var livesTotal = 0
+        for item in results {
+            let id = item.id
+            groups[id] = SourceGroup(
+                subscriptionId: id,
+                name: subscriptions.first { $0.id == id }?.name ?? "接口",
+                sites: item.config.sites ?? [],
+                lives: item.config.lives ?? [],
+                parses: item.config.parses ?? [],
+                flags: item.config.flags ?? [],
+                repos: item.repos,
+                stats: item.stats,
+                spider: item.config.spider,
+                ijk: item.config.ijk
+            )
+            for repo in item.repos { repoOwners[repo.url] = id }
+            okCount += 1
+            siteTotal += item.stats.totalSites
+            dropped += item.stats.droppedJarSites
+            livesTotal += item.stats.lives
+        }
 
-            if totalCount > 0 && usableCount == 0 {
-                var msg = "接口读取成功，但 \(totalCount) 个站点全部为 JAR 型（需 Android 运行时），iOS 无法加载。"
-                if livesCount > 0 { msg += "另有 \(livesCount) 路直播源可用。" }
-                msg += "\n建议换一个含 CMS / JS 站点的接口，或切回内置源。"
-                self.configNotice = msg
-            } else if droppedCount > 0 && usableCount > 0 {
-                self.configNotice = "已加载 \(usableCount) 个可用站点（另有 \(droppedCount) 个 JAR 型站点无法在 iOS 运行）。"
-            } else if usableCount > 0 {
-                self.configNotice = "已加载 \(usableCount) 个可用站点。"
-            }
-        } catch {
-            // 如果是默认 CatPaw 订阅源加载失败，使用 CatPawConfigBuilder 生成配置
-            if url == Self.defaultSubscriptionURL || CatPawConfigBuilder.isCatPawURL(url) {
-                do {
-                    let fallbackCfg = try await CatPawConfigBuilder.shared.buildConfig(baseURL: url)
-                    self.currentConfig = fallbackCfg
-                    if currentSite == nil, let first = fallbackCfg.sites?.first {
-                        self.currentSite = first
-                    }
-                    self.errorMessage = "原始接口为 Spider 模块，已自动使用基于 CatPawOpen 源码生成的内置源（\(fallbackCfg.sites?.count ?? 0) 个 CMS 源）。"
-                    return
-                } catch {}
-            }
-            self.errorMessage = error.localizedDescription
-            self.currentConfig = nil
-            self.availableRepos = []
-            self.activeRepoURL = nil
+        rebuildMergedConfig()
+        touchUpdated(enabled.map { $0.id })
+
+        if okCount == 0 {
+            errorMessage = "所有接口都没能加载成功，请检查地址是否可访问"
+        } else if siteTotal > 0 && usableSiteCount == 0 {
+            var msg = "接口读取成功，但 \(siteTotal) 个站点全部为 JAR 型（需 Android 运行时），iOS 无法加载。"
+            if livesTotal > 0 { msg += "另有 \(livesTotal) 路直播源可用。" }
+            msg += "\n建议换一个含 CMS / JS 站点的接口。"
+            configNotice = msg
+        } else if dropped > 0 {
+            configNotice = "已合并 \(okCount) 个接口 · \(usableSiteCount) 个可用站点（另有 \(dropped) 个 JAR 型站点无法在 iOS 运行）。"
+        } else {
+            configNotice = "已合并 \(okCount) 个接口 · \(usableSiteCount) 个可用站点。"
         }
     }
 
-    /// 多仓：手动切换到某个子仓库
+    /// 单独加载一个订阅并并入合并池（切换聚焦源时用）
+    func reloadSubscription(_ sub: Subscription) async {
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        if let item = await loadSubscriptionConfig(sub) {
+            let id = item.id
+            groups[id] = SourceGroup(
+                subscriptionId: id,
+                name: sub.name,
+                sites: item.config.sites ?? [],
+                lives: item.config.lives ?? [],
+                parses: item.config.parses ?? [],
+                flags: item.config.flags ?? [],
+                repos: item.repos,
+                stats: item.stats,
+                spider: item.config.spider,
+                ijk: item.config.ijk
+            )
+            for repo in item.repos { repoOwners[repo.url] = id }
+            rebuildMergedConfig()
+            touchUpdated([sub.id])
+        } else {
+            errorMessage = "「\(sub.name)」加载失败"
+        }
+    }
+
+    /// 开启 / 关闭某个订阅（关闭则从合并池里移除）
+    /// - 开启：调用方需随后调用 `loadConfig()` 重新拉取并合并
+    /// - 关闭：立即移出合并池并重建
+    func setEnabled(_ sub: Subscription, _ enabled: Bool) {
+        guard let idx = subscriptions.firstIndex(where: { $0.id == sub.id }) else { return }
+        guard subscriptions[idx].isEnabled != enabled else { return }
+        subscriptions[idx].isEnabled = enabled
+        saveSubscriptions()
+
+        if !enabled {
+            groups.removeValue(forKey: sub.id)
+            rebuildMergedConfig()
+        }
+    }
+
+    /// 加载单个订阅的原始配置（静态方法，便于在 TaskGroup 内并发调用）
+    ///
+    /// 必须是 `nonisolated`：本类是 `@MainActor`，静态方法默认也是主线程隔离，
+    /// 那样 TaskGroup 的每个子任务都要 hop 回主线程，多订阅并发加载会退化成串行。
+    private static func loadOne(
+        _ sub: Subscription
+    ) async -> LoadedSource? {
+        await loadSubscriptionConfig(sub)
+    }
+
+    private func touchUpdated(_ ids: [UUID]) {
+        for id in ids {
+            if let idx = subscriptions.firstIndex(where: { $0.id == id }) {
+                subscriptions[idx].lastUpdated = Date()
+            }
+        }
+        saveSubscriptions()
+    }
+
+    // MARK: - 合并站点池
+
+    /// 合并所有已启用订阅的站点 / 直播 / 解析器 / 标识
+    private func rebuildMergedConfig() {
+        var usedKeys = Set<String>()
+        var sites: [Site] = []
+        var sourceNames: [String: String] = [:]
+        var lives: [LiveSource] = []
+        var seenLive = Set<String>()
+        var parses: [ParseRule] = []
+        var seenParse = Set<String>()
+        var flags: [String] = []
+        var seenFlag = Set<String>()
+        var repos: [RepoLink] = []
+        var seenRepo = Set<String>()
+        var spider: String?
+        var ijk: [AnyCodable]?
+
+        for sub in subscriptions where sub.isEnabled {
+            guard let group = groups[sub.id] else { continue }
+            if spider == nil { spider = group.spider }
+            if ijk == nil { ijk = group.ijk }
+            for site in group.sites {
+                let unique = dedupeKey(site.key, used: &usedKeys)
+                let final = unique == site.key ? site : site.replacingKey(unique)
+                sites.append(final)
+                sourceNames[final.key] = sub.name
+            }
+            for live in group.lives {
+                let sig = "\(live.name)|\(live.url ?? "")"
+                if seenLive.insert(sig).inserted { lives.append(live) }
+            }
+            for parse in group.parses {
+                let sig = "\(parse.name)|\(parse.url ?? "")"
+                if seenParse.insert(sig).inserted { parses.append(parse) }
+            }
+            for flag in group.flags where !flag.isEmpty {
+                if seenFlag.insert(flag).inserted { flags.append(flag) }
+            }
+            for repo in group.repos where seenRepo.insert(repo.url).inserted {
+                repos.append(repo)
+            }
+        }
+
+        self.siteSourceNames = sourceNames
+        self.availableRepos = repos
+        self.currentConfig = TVBoxConfig(
+            spider: spider,
+            sites: sites,
+            lives: lives,
+            parses: parses,
+            flags: flags.isEmpty ? nil : flags,
+            ijk: ijk,
+            repos: repos
+        )
+
+        // 当前站点仍存在就保留，否则重新挑一个
+        if currentSite == nil || !sites.contains(where: { $0.key == currentSite?.key }) {
+            let preferred = sites.first { $0.type != 3 && ($0.api ?? "").hasPrefix("http") }
+            self.currentSite = preferred ?? sites.first
+        }
+    }
+
+    /// 生成池内唯一的站点 key
+    private func dedupeKey(_ key: String, used: inout Set<String>) -> String {
+        var candidate = key
+        var n = 2
+        while !used.insert(candidate).inserted {
+            candidate = "\(key)#\(n)"
+            n += 1
+        }
+        // Spider 站点按 key 索引模块代码，改名后要同步一份
+        if candidate != key,
+           let code = SpiderContextManager.shared.moduleCode(for: key) {
+            SpiderContextManager.shared.registerModuleCode(key: candidate, code: code)
+        }
+        return candidate
+    }
+
+    /// 合并池里可用于 CMS 搜索的站点数量
+    var usableSiteCount: Int {
+        CrossSiteResolver.usableSites(currentConfig?.sites ?? []).count
+    }
+
+    /// 合并池里的站点总数（含 JAR 型）
+    var totalSiteCount: Int {
+        currentConfig?.sites?.count ?? 0
+    }
+
+    /// 某个订阅贡献的站点数
+    func siteCount(for subscriptionId: UUID) -> Int {
+        groups[subscriptionId]?.sites.count ?? 0
+    }
+
+    /// 某个订阅贡献的可用站点数（排除 JAR 型）
+    func usableSiteCount(for subscriptionId: UUID) -> Int {
+        guard let sites = groups[subscriptionId]?.sites else { return 0 }
+        return CrossSiteResolver.usableSites(sites).count
+    }
+
+    // MARK: - 多仓
+
+    /// 多仓：手动切换到某个子仓库（只替换该仓库所属订阅的站点，其余订阅保持不变）
     func selectRepo(_ repo: RepoLink) async {
         isLoading = true
         errorMessage = nil
         configNotice = nil
         defer { isLoading = false }
         do {
-            let cfg = try await ConfigService.shared.loadRepoConfig(from: repo.url)
-            self.currentConfig = cfg
-            self.activeRepoURL = repo.url
-            let sites = cfg.sites ?? []
-            self.currentSite = sites.first
-            let usable = sites.count
-            let total = ConfigService.shared.lastStats?.totalSites ?? usable
-            let dropped = ConfigService.shared.lastStats?.droppedJarSites ?? 0
-            if usable == 0 {
-                self.configNotice = "仓库「\(repo.name)」共 \(total) 个站点，全部为 JAR 型，iOS 无法加载。"
-            } else if dropped > 0 {
-                self.configNotice = "仓库「\(repo.name)」已加载 \(usable) 个可用站点（另有 \(dropped) 个 JAR 型跳过）。"
+            let service = ConfigService()
+            let cfg = try await service.loadRepoConfig(from: repo.url)
+            let owner = repoOwners[repo.url]
+            if let owner, var group = groups[owner] {
+                group.sites = cfg.sites ?? []
+                group.lives = cfg.lives ?? []
+                group.parses = cfg.parses ?? []
+                group.flags = cfg.flags ?? []
+                groups[owner] = group
             } else {
-                self.configNotice = "仓库「\(repo.name)」已加载 \(usable) 个可用站点。"
+                // 找不到归属就当作一个独立来源并入
+                let id = UUID()
+                groups[id] = SourceGroup(
+                    subscriptionId: id,
+                    name: repo.name,
+                    sites: cfg.sites ?? [],
+                    lives: cfg.lives ?? [],
+                    parses: cfg.parses ?? [],
+                    flags: cfg.flags ?? [],
+                    repos: [],
+                    stats: service.lastStats ?? ConfigService.ConfigStats(),
+                    spider: cfg.spider,
+                    ijk: cfg.ijk
+                )
+            }
+            activeRepoURL = repo.url
+            rebuildMergedConfig()
+            let usable = usableSiteCount
+            if usable == 0 {
+                configNotice = "仓库「\(repo.name)」没有可用站点。"
+            } else {
+                configNotice = "已切换到仓库「\(repo.name)」· 合并池现有 \(usable) 个可用站点。"
             }
         } catch {
             self.errorMessage = "仓库加载失败：\(error.localizedDescription)"
         }
     }
+
+    // MARK: - 切换当前站点
 
     /// 切换当前站点
     func selectSite(_ site: Site) {

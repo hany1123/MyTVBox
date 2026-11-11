@@ -57,6 +57,16 @@ final class SubscriptionViewModel: ObservableObject {
         return subscriptions.first { $0.id == id }
     }
 
+    /// 已启用（参与合并）的订阅数
+    var enabledCount: Int {
+        subscriptions.filter { $0.isEnabled }.count
+    }
+
+    /// 合并池里的可用站点总数
+    var mergedSiteCount: Int {
+        appState?.usableSiteCount ?? 0
+    }
+
     // MARK: - CRUD
 
     /// 新增订阅；保存后自动尝试加载一次以验证可用性
@@ -75,13 +85,15 @@ final class SubscriptionViewModel: ObservableObject {
         }
 
         let displayName = trimmedName.isEmpty ? autoName(from: trimmedURL) : trimmedName
-        let sub = Subscription(name: displayName, url: trimmedURL)
+        let sub = Subscription(name: displayName, url: trimmedURL, isEnabled: true)
         appState.addSubscription(sub)
+        appState.setActive(sub.id)
 
-        // 自动测试可用性（首个订阅会被设置为 active）
+        // 自动测试可用性
         isLoading = true
-        let ok = await testSubscription(url: trimmedURL)
-        let stats = ConfigService.shared.lastStats
+        let service = ConfigService()
+        let ok = await testSubscription(url: trimmedURL, service: service)
+        let stats = service.lastStats
         isLoading = false
 
         if !ok {
@@ -89,10 +101,8 @@ final class SubscriptionViewModel: ObservableObject {
             return
         }
 
-        // 若添加完成后是激活源，则真正加载一次配置
-        if appState.activeSubscriptionId == sub.id {
-            await appState.loadConfig()
-        }
+        // 真正加载一次合并池（包含新加入的接口）
+        await appState.loadConfig()
 
         // 接口体检结果：明确告诉用户「有几个站、几个能用、为什么不能用」
         if let s = stats {
@@ -124,7 +134,7 @@ final class SubscriptionViewModel: ObservableObject {
         appState?.removeSubscription(subscription.id)
     }
 
-    /// 切换激活订阅，并立即加载其配置
+    /// 切换聚焦订阅，并立即加载其配置
     func activateSubscription(_ subscription: Subscription) async {
         guard let appState else { return }
         appState.setActive(subscription.id)
@@ -138,11 +148,60 @@ final class SubscriptionViewModel: ObservableObject {
         }
     }
 
+    /// 聚焦某个订阅（只高亮，不重新拉全池）
+    func focusSubscription(_ subscription: Subscription) {
+        appState?.setActive(subscription.id)
+    }
+
+    /// 开启 / 关闭某个订阅（多选）
+    /// - 开启：加入合并池并单独拉取该源
+    /// - 关闭：移出合并池
+    func setEnabled(_ subscription: Subscription, _ enabled: Bool) async {
+        guard let appState else { return }
+        isLoading = true
+        appState.setEnabled(subscription, enabled)
+        // 等该源加载完成（开启时 setEnabled 内部会触发 reloadSubscription）
+        if enabled {
+            await appState.loadConfig()
+        }
+        isLoading = false
+        if let notice = appState.configNotice {
+            presentNotice(notice)
+        }
+    }
+
+    /// 刷新全部已启用订阅
+    func refreshAll() async {
+        guard let appState else { return }
+        isLoading = true
+        await appState.loadConfig()
+        isLoading = false
+        if let err = appState.errorMessage {
+            present(error: err)
+        } else if let notice = appState.configNotice {
+            presentNotice(notice)
+        }
+    }
+
+    /// 刷新单个订阅（保留其它订阅的站点）
+    func refresh(_ subscription: Subscription) async {
+        guard let appState else { return }
+        isLoading = true
+        await appState.reloadSubscription(subscription)
+        isLoading = false
+        if let err = appState.errorMessage {
+            present(error: err)
+        } else if let notice = appState.configNotice {
+            presentNotice(notice)
+        }
+    }
+
     /// 验证一个 URL 是否能加载到合法配置
+    /// - service: 传入独立实例，避免与合并池的并发加载互相覆盖诊断数据
     @discardableResult
-    func testSubscription(url: String) async -> Bool {
+    func testSubscription(url: String, service: ConfigService = ConfigService()) async -> Bool {
         do {
-            _ = try await ConfigService.shared.loadConfig(from: url)
+            _ = try await service.loadConfig(from: url)
             return true
         } catch {
             // 默认 Spider 模块 URL 有内置 fallback，视为可用

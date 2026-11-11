@@ -98,7 +98,9 @@ private struct SettingsTab: View {
                             settingRow(
                                 icon: "antenna.radiowaves.left.and.right",
                                 title: "接口管理",
-                                subtitle: appState.activeSubscription?.name ?? "尚未配置",
+                                subtitle: appState.enabledSubscriptions.isEmpty
+                                    ? "尚未启用接口"
+                                    : "已启用 \(appState.enabledSubscriptions.count) 个接口 · \(appState.usableSiteCount) 个站点",
                                 badge: "\(appState.subscriptions.count)"
                             )
                         }

@@ -13,10 +13,13 @@ struct VideoDetailView: View {
     @EnvironmentObject private var appState: AppState
 
     @State private var detail: VideoDetail?
+    /// 本片所有可用线路：本片所在站点在前，其它站点的同片线路在后
     @State private var sources: [PlaySource] = []
     @State private var selectedSourceIndex: Int = 0
     @State private var isLoading = true
     @State private var errorMessage: String?
+    /// 正在从其它站点拉同片线路
+    @State private var isLoadingCrossSite = false
 
     @State private var isFavorite: Bool = false
     @State private var lastRecord: PlayHistoryManager.PlayRecord?
@@ -44,6 +47,16 @@ struct VideoDetailView: View {
     /// 本片实际取详情的站点：优先用结果携带的站点，否则退回当前站点
     private var resolvedSite: Site? { site ?? appState.currentSite }
     private var resolvedSiteKey: String? { resolvedSite?.key ?? appState.currentSite?.key }
+
+    /// 其它站点的同片线路
+    private var crossSiteSources: [PlaySource] {
+        sources.filter { $0.isCrossSite }
+    }
+
+    /// 跨站线路涉及的其它站点数量
+    private var crossSiteSiteCount: Int {
+        Set(crossSiteSources.compactMap { $0.siteKey }).count
+    }
 
     var body: some View {
         ZStack {
@@ -295,10 +308,19 @@ struct VideoDetailView: View {
                                 selectedSourceIndex = idx
                             } label: {
                                 HStack(spacing: 6) {
-                                    Image(systemName: "antenna.radiowaves.left.and.right")
+                                    Image(systemName: src.isCrossSite
+                                          ? "globe.badge.chevron.backward"
+                                          : "antenna.radiowaves.left.and.right")
                                         .font(.system(size: 10, weight: .bold))
                                     Text(src.name)
                                         .font(PlayerTheme.sans(13, weight: idx == selectedSourceIndex ? .heavy : .medium))
+                                    if let siteName = src.siteName {
+                                        Text(siteName)
+                                            .font(PlayerTheme.mono(9, weight: .bold))
+                                            .foregroundColor(idx == selectedSourceIndex
+                                                             ? PlayerTheme.ink.opacity(0.75)
+                                                             : PlayerTheme.textLow)
+                                    }
                                 }
                                 .foregroundColor(idx == selectedSourceIndex ? PlayerTheme.ink : PlayerTheme.textHigh)
                                 .padding(.horizontal, 14)
@@ -312,6 +334,28 @@ struct VideoDetailView: View {
                             .buttonStyle(.plain)
                         }
                     }
+                    .padding(.horizontal, 20)
+                }
+
+                // 跨站线路分组说明
+                if !crossSiteSources.isEmpty {
+                    HStack(spacing: 6) {
+                        Image(systemName: "square.stack.3d.up.fill")
+                            .font(.system(size: 9, weight: .bold))
+                        Text("含 \(crossSiteSiteCount) 个其它站点的同片线路（带站点名），播放卡顿时会自动切换")
+                            .font(PlayerTheme.mono(10))
+                            .lineLimit(2)
+                    }
+                    .foregroundColor(PlayerTheme.textLow)
+                    .padding(.horizontal, 20)
+                } else if isLoadingCrossSite {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini).tint(PlayerTheme.amber)
+                        Text("正在其它站点查找同片线路…")
+                            .font(PlayerTheme.mono(10))
+                            .lineLimit(2)
+                    }
+                    .foregroundColor(PlayerTheme.textLow)
                     .padding(.horizontal, 20)
                 }
             }
@@ -431,12 +475,54 @@ struct VideoDetailView: View {
                 let parsed = d.parsePlaySources()
                 self.sources = parsed
                 self.selectedSourceIndex = 0
+                // 后台加载其它站点的同片线路（不阻塞详情展示）
+                Task { await loadCrossSiteLines(title: d.vodName) }
             } else {
                 self.errorMessage = "未找到视频信息"
             }
         } catch {
             self.errorMessage = error.localizedDescription
         }
+    }
+
+    /// 从其它已启用站点找同片线路，让「片源可以在所有源里切换」
+    private func loadCrossSiteLines(title: String) async {
+        let key = resolvedSiteKey
+        let allSites = appState.currentConfig?.sites ?? []
+        guard !allSites.isEmpty else { return }
+        var excluding = Set<String>()
+        if let key { excluding.insert(key) }
+
+        isLoadingCrossSite = true
+        defer { isLoadingCrossSite = false }
+
+        let lines = await CrossSiteResolver.fetchCrossSiteLines(
+            title: title,
+            in: allSites,
+            excludingKeys: excluding,
+            maxSites: 8
+        )
+        guard !lines.isEmpty else { return }
+
+        // 只保留与本片线路不重复的（按线路名+首集地址去重）
+        var seen = Set<String>()
+        for src in sources {
+            if let first = src.episodes.first {
+                seen.insert("\(src.name)|\(first.url)")
+            }
+        }
+        var appended: [PlaySource] = []
+        for line in lines {
+            for src in line.sources {
+                guard let first = src.episodes.first else { continue }
+                let sig = "\(src.name)|\(first.url)"
+                if seen.insert(sig).inserted {
+                    appended.append(src)
+                }
+            }
+        }
+        guard !appended.isEmpty else { return }
+        sources.append(contentsOf: appended)
     }
 
     private func refreshLocalState() {

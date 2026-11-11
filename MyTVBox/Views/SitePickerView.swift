@@ -126,6 +126,17 @@ struct SitePickerView: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
+                    // 来源接口标注（多订阅合并后，同名站点要能区分来自哪个接口）
+                    if let source = appState.siteSourceNames[site.key], !source.isEmpty {
+                        HStack(spacing: 5) {
+                            Image(systemName: "square.stack.3d.up.fill")
+                                .font(.system(size: 8, weight: .bold))
+                            Text(source)
+                                .font(TVBoxTheme.mono(9, weight: .bold))
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(TVBoxTheme.accent.opacity(0.85))
+                    }
                 }
 
                 Spacer(minLength: 6)

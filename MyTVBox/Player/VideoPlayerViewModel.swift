@@ -102,10 +102,11 @@ final class VideoPlayerViewModel: ObservableObject {
     private let forwardBufferSeconds: Double = 6
     /// 超过这个时间还没 readyToPlay 就提示线路慢
     private let slowLineThreshold: Double = 12
-    /// 连续缓冲超过这个时间就自动换一条线路
-    private let bufferingSwitchThreshold: TimeInterval = 20
+    /// 连续缓冲超过这个时间就自动换一条线路（1.4.9 从 20s 收紧到 12s，
+    /// 「播放卡顿时自动切换源」要够快才有用）
+    private let bufferingSwitchThreshold: TimeInterval = 12
     /// 单次播放最多自动尝试几条线路
-    private let maxAutoSwitch = 8
+    private let maxAutoSwitch = 12
 
     // MARK: - Init
 
@@ -673,6 +674,9 @@ final class VideoPlayerViewModel: ObservableObject {
 
     /// 多源自动切换：当前线路失败 / 超时 / 卡住时，自动切到下一条可直连的线路。
     /// 保留当前集数与播放进度；已试过的线路不会重复尝试。
+    ///
+    /// 1.4.9：优先切到「不同站点」的线路 —— 同一站点的多条线路通常共用同一套后端，
+    /// 站点本身故障时换同站线路大概率还是黑屏；跨站线路才是真正的备用源。
     private func autoSwitchSource(reason: String) {
         guard sources.count > 1 else {
             slowLineHint = nil
@@ -687,8 +691,23 @@ final class VideoPlayerViewModel: ObservableObject {
         autoTriedSources.insert(currentSourceIndex)
 
         let count = sources.count
+        let currentSiteKey = currentSource?.siteKey
+
+        // 先找跨站线路，再退回同站线路
+        var order: [Int] = []
         for step in 1...count {
             let idx = (currentSourceIndex + step) % count
+            let key = sources[idx].siteKey
+            if key != nil && key != currentSiteKey {
+                order.append(idx)
+            }
+        }
+        for step in 1...count {
+            let idx = (currentSourceIndex + step) % count
+            if !order.contains(idx) { order.append(idx) }
+        }
+
+        for idx in order {
             if autoTriedSources.contains(idx) { continue }
             let eps = sources[idx].episodes
             let epIdx = eps.indices.contains(currentEpisodeIndex) ? currentEpisodeIndex : 0
@@ -700,7 +719,11 @@ final class VideoPlayerViewModel: ObservableObject {
             autoTriedSources.insert(idx)
             currentSourceIndex = idx
             currentEpisodeIndex = epIdx
-            autoSwitchHint = "自动切换线路 → \(sources[idx].name)"
+            let label = sources[idx].siteName.map { "\(sources[idx].name) · \($0)" } ?? sources[idx].name
+            autoSwitchHint = "自动切换线路 → \(label)"
+            if let s = sources[idx].siteName {
+                activeSiteName = s
+            }
             errorMessage = nil
             slowLineHint = nil
             loadAndPlay(url: url, restoreProgress: false, seekTo: resumeAt)
@@ -753,10 +776,26 @@ final class VideoPlayerViewModel: ObservableObject {
     }
 
     /// 用其它站点的详情整体替换播放上下文，保留集数与进度
+    ///
+    /// 1.4.9：不再「整池替换」，而是把新站点的线路**追加**到现有线路之后 ——
+    /// 这样用户可以在原站线路与跨站线路之间随时来回切，而不是被强制换掉。
     private func applyCrossSite(_ candidate: CrossSiteResolver.CrossSitePlayable) {
         videoDetail = candidate.detail
-        sources = candidate.sources
         activeSiteName = candidate.siteName
+
+        // 合并：以 candidate 的线路为基准，把原有线路中不重复的补在后面
+        var merged = candidate.sources
+        var seen = Set<String>()
+        for src in candidate.sources {
+            seen.insert(sourceSignature(src))
+        }
+        for src in sources {
+            if seen.insert(sourceSignature(src)).inserted {
+                merged.append(src)
+            }
+        }
+        sources = merged
+
         autoTriedSources = []
         bufferingSince = nil
         didRestoreProgress = false
@@ -772,6 +811,12 @@ final class VideoPlayerViewModel: ObservableObject {
         }
         autoSwitchHint = "已切到「\(candidate.siteName)」· 续播"
         loadAndPlay(url: url, restoreProgress: false, seekTo: candidate.seekTo)
+    }
+
+    /// 线路去重签名：线路名 + 首集地址
+    private func sourceSignature(_ src: PlaySource) -> String {
+        let first = src.episodes.first?.url ?? ""
+        return "\(src.siteKey ?? "")|\(src.name)|\(first)"
     }
 
     private func updateBufferedProgress() {

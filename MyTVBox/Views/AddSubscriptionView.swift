@@ -384,11 +384,11 @@ struct AddSubscriptionView: View {
             }
         }
 
-        let sub = Subscription(name: displayName, url: trimmedURL)
+        // 1.4.9：新接口默认加入合并池（可多选），并聚焦到它
+        let sub = Subscription(name: displayName, url: trimmedURL, isEnabled: true)
         appState.addSubscription(sub)
-        if appState.activeSubscriptionId == sub.id {
-            await appState.loadConfig()
-        }
+        appState.setActive(sub.id)
+        await appState.loadConfig()
 
         // 有体检结论就留在页面上把原因讲清楚，用户点「知道了」再关
         if let note = pendingNotice {

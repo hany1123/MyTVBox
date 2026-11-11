@@ -145,9 +145,15 @@ struct SubscriptionView: View {
                     SubscriptionRow(
                         subscription: sub,
                         isActive: vm.activeId == sub.id,
+                        siteCount: appState.siteCount(for: sub.id),
+                        usableCount: appState.usableSiteCount(for: sub.id),
+                        onToggle: { newValue in
+                            Task { await vm.setEnabled(sub, newValue) }
+                        },
                         onTap: {
                             Task {
-                                await vm.activateSubscription(sub)
+                                vm.focusSubscription(sub)
+                                await vm.refresh(sub)
                             }
                         }
                     )
@@ -166,10 +172,16 @@ struct SubscriptionView: View {
                     vm.deleteSubscription(at: offsets)
                 }
             } header: {
-                Text("订阅源")
-                    .font(TVBoxTheme.mono(11, weight: .heavy))
-                    .tracking(2)
-                    .foregroundStyle(TVBoxTheme.textSecondary)
+                HStack {
+                    Text("订阅源")
+                        .font(TVBoxTheme.mono(11, weight: .heavy))
+                        .tracking(2)
+                        .foregroundStyle(TVBoxTheme.textSecondary)
+                    Spacer()
+                    Text("已启用 \(vm.enabledCount) / \(vm.subscriptions.count)")
+                        .font(TVBoxTheme.mono(10, weight: .bold))
+                        .foregroundStyle(TVBoxTheme.accent)
+                }
             }
 
             if !appState.availableRepos.isEmpty {
@@ -215,10 +227,10 @@ struct SubscriptionView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Toggle(isOn: $adFilterEnabled) {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("智能过滤 m3u8 广告")
+                            Text("智能过滤 m3u8 棋牌广告")
                                 .font(TVBoxTheme.text(14, weight: .semibold))
                                 .foregroundStyle(TVBoxTheme.textPrimary)
-                            Text("按分片分组、域名、时长与广告路径识别插播片段")
+                            Text("按分片命名、分组、域名与时长识别插播的棋牌广告段")
                                 .font(TVBoxTheme.text(11))
                                 .foregroundStyle(TVBoxTheme.textMuted)
                         }
@@ -227,7 +239,7 @@ struct SubscriptionView: View {
 
                     Text(adFilterEnabled
                          ? "开启后由系统资源加载器清洗播放列表，分片仍直连源站；加载失败会自动退回直连。"
-                         : "默认关闭，播放直连原始 m3u8。开启后可过滤插播广告，失败会自动直连。")
+                         : "默认关闭，播放直连原始 m3u8。开启后可过滤棋牌等插播广告，失败会自动直连。")
                         .font(TVBoxTheme.mono(10))
                         .foregroundStyle(TVBoxTheme.textMuted)
                 }
@@ -242,7 +254,7 @@ struct SubscriptionView: View {
             }
 
             Section {
-                Text("提示：长按 / 左滑 可删除接口；点击切换激活")
+                Text("提示：开关决定该接口是否加入合并站点池（可同时开启多个）；点击行刷新该接口；左滑可删除")
                     .font(TVBoxTheme.mono(10))
                     .foregroundStyle(TVBoxTheme.textMuted)
                     .listRowBackground(Color.clear)
@@ -253,9 +265,7 @@ struct SubscriptionView: View {
         .background(Color.clear)
         .listStyle(.plain)
         .refreshable {
-            if let active = vm.activeSubscription {
-                await vm.activateSubscription(active)
-            }
+            await vm.refreshAll()
         }
         .overlay(alignment: .top) {
             if vm.isLoading {
@@ -268,25 +278,28 @@ struct SubscriptionView: View {
         }
     }
 
-    /// 顶部状态条：当前激活源信息
+    /// 顶部状态条：合并池概况
     private var statusBar: some View {
-        let active = vm.activeSubscription
+        let enabled = vm.enabledCount
+        let online = enabled > 0
         return HStack(spacing: 12) {
             ZStack {
                 Circle()
-                    .fill(active != nil ? TVBoxTheme.accent : TVBoxTheme.textMuted)
+                    .fill(online ? TVBoxTheme.accent : TVBoxTheme.textMuted)
                     .frame(width: 8, height: 8)
                 Circle()
-                    .stroke(active != nil ? TVBoxTheme.accent.opacity(0.4) : .clear, lineWidth: 1)
+                    .stroke(online ? TVBoxTheme.accent.opacity(0.4) : .clear, lineWidth: 1)
                     .frame(width: 16, height: 16)
             }
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(active != nil ? "ONLINE" : "OFFLINE")
+                Text(online ? "MERGED POOL" : "OFFLINE")
                     .font(TVBoxTheme.mono(10, weight: .bold))
                     .tracking(2)
-                    .foregroundStyle(active != nil ? TVBoxTheme.accent : TVBoxTheme.textMuted)
-                Text(active?.name ?? "未激活任何接口")
+                    .foregroundStyle(online ? TVBoxTheme.accent : TVBoxTheme.textMuted)
+                Text(online
+                     ? "已启用 \(enabled) 个接口 · 共 \(vm.mergedSiteCount) 个站点"
+                     : "未启用任何接口")
                     .font(TVBoxTheme.text(13, weight: .semibold))
                     .foregroundStyle(TVBoxTheme.textPrimary)
                     .lineLimit(1)
@@ -294,13 +307,15 @@ struct SubscriptionView: View {
 
             Spacer()
 
-            Text("\(vm.subscriptions.count)")
-                .font(TVBoxTheme.mono(20, weight: .heavy))
-                .foregroundStyle(TVBoxTheme.textPrimary)
-            Text("SRC")
-                .font(TVBoxTheme.mono(9, weight: .bold))
-                .tracking(1.5)
-                .foregroundStyle(TVBoxTheme.textMuted)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("\(vm.mergedSiteCount)")
+                    .font(TVBoxTheme.mono(20, weight: .heavy))
+                    .foregroundStyle(TVBoxTheme.textPrimary)
+                Text("SITES")
+                    .font(TVBoxTheme.mono(9, weight: .bold))
+                    .tracking(1.5)
+                    .foregroundStyle(TVBoxTheme.textMuted)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
@@ -320,94 +335,123 @@ struct SubscriptionView: View {
 private struct SubscriptionRow: View {
     let subscription: Subscription
     let isActive: Bool
+    /// 该源贡献的站点总数
+    let siteCount: Int
+    /// 该源贡献的可用站点数（排除 JAR 型）
+    let usableCount: Int
+    let onToggle: (Bool) -> Void
     let onTap: () -> Void
 
     var body: some View {
-        Button(action: onTap) {
-            HStack(alignment: .top, spacing: 12) {
-                // 左侧状态指示
-                VStack {
-                    ZStack {
-                        Circle()
-                            .stroke(isActive ? TVBoxTheme.accent : TVBoxTheme.strokeStrong, lineWidth: 1.5)
-                            .frame(width: 22, height: 22)
-                        if isActive {
+        HStack(alignment: .top, spacing: 12) {
+            // 左侧启用开关
+            Toggle("", isOn: Binding(
+                get: { subscription.isEnabled },
+                set: { onToggle($0) }
+            ))
+            .labelsHidden()
+            .tint(TVBoxTheme.accent)
+            .padding(.top, 2)
+
+            Button(action: onTap) {
+                HStack(alignment: .top, spacing: 12) {
+                    // 左侧状态指示
+                    VStack {
+                        ZStack {
                             Circle()
-                                .fill(TVBoxTheme.accent)
-                                .frame(width: 10, height: 10)
-                                .shadow(color: TVBoxTheme.accent.opacity(0.7), radius: 6)
+                                .stroke(isActive ? TVBoxTheme.accent : TVBoxTheme.strokeStrong, lineWidth: 1.5)
+                                .frame(width: 22, height: 22)
+                            if isActive {
+                                Circle()
+                                    .fill(TVBoxTheme.accent)
+                                    .frame(width: 10, height: 10)
+                                    .shadow(color: TVBoxTheme.accent.opacity(0.7), radius: 6)
+                            }
                         }
-                    }
-                    Spacer(minLength: 0)
-                }
-                .frame(width: 22)
-                .padding(.top, 2)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        Text(subscription.name)
-                            .font(TVBoxTheme.text(15, weight: .bold))
-                            .foregroundStyle(TVBoxTheme.textPrimary)
-                            .lineLimit(1)
-
-                        if isActive {
-                            Text("ACTIVE")
-                                .font(TVBoxTheme.mono(9, weight: .heavy))
-                                .tracking(1.5)
-                                .foregroundStyle(Color.black)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(TVBoxTheme.accent)
-                                .clipShape(Capsule())
-                        }
-
                         Spacer(minLength: 0)
                     }
-
-                    Text(subscription.url)
-                        .font(TVBoxTheme.mono(11))
-                        .foregroundStyle(TVBoxTheme.textSecondary)
-                        .lineLimit(2)
-                        .truncationMode(.middle)
-
-                    HStack(spacing: 10) {
-                        if let updated = subscription.lastUpdated {
-                            Label(updated.relativeShort, systemImage: "clock")
-                                .font(TVBoxTheme.mono(10))
-                                .foregroundStyle(TVBoxTheme.textMuted)
-                        } else {
-                            Label("尚未同步", systemImage: "clock.badge.questionmark")
-                                .font(TVBoxTheme.mono(10))
-                                .foregroundStyle(TVBoxTheme.textMuted)
-                        }
-                    }
+                    .frame(width: 22)
                     .padding(.top, 2)
-                }
 
-                Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(isActive ? TVBoxTheme.accent : TVBoxTheme.textMuted)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text(subscription.name)
+                                .font(TVBoxTheme.text(15, weight: .bold))
+                                .foregroundStyle(TVBoxTheme.textPrimary)
+                                .lineLimit(1)
+
+                            if isActive {
+                                Text("ACTIVE")
+                                    .font(TVBoxTheme.mono(9, weight: .heavy))
+                                    .tracking(1.5)
+                                    .foregroundStyle(Color.black)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(TVBoxTheme.accent)
+                                    .clipShape(Capsule())
+                            }
+
+                            Spacer(minLength: 0)
+                        }
+
+                        Text(subscription.url)
+                            .font(TVBoxTheme.mono(11))
+                            .foregroundStyle(TVBoxTheme.textSecondary)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+
+                        HStack(spacing: 10) {
+                            // 站点数统计
+                            if siteCount > 0 {
+                                Label("\(usableCount)/\(siteCount) 站点",
+                                      systemImage: "square.stack.3d.up.fill")
+                                    .font(TVBoxTheme.mono(10))
+                                    .foregroundStyle(usableCount > 0 ? TVBoxTheme.accent : TVBoxTheme.textMuted)
+                            } else {
+                                Label("未加载站点", systemImage: "square.stack.3d.up")
+                                    .font(TVBoxTheme.mono(10))
+                                    .foregroundStyle(TVBoxTheme.textMuted)
+                            }
+
+                            if let updated = subscription.lastUpdated {
+                                Label(updated.relativeShort, systemImage: "clock")
+                                    .font(TVBoxTheme.mono(10))
+                                    .foregroundStyle(TVBoxTheme.textMuted)
+                            } else {
+                                Label("尚未同步", systemImage: "clock.badge.questionmark")
+                                    .font(TVBoxTheme.mono(10))
+                                    .foregroundStyle(TVBoxTheme.textMuted)
+                            }
+                        }
+                        .padding(.top, 2)
+                    }
+
+                    Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(isActive ? TVBoxTheme.accent : TVBoxTheme.textMuted)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 14)
+                .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(isActive ? TVBoxTheme.surfaceRaised : TVBoxTheme.surface)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(
+                            isActive ? TVBoxTheme.accent.opacity(0.7) : TVBoxTheme.stroke,
+                            lineWidth: isActive ? 1.4 : 1
+                        )
+                )
+                .shadow(
+                    color: isActive ? TVBoxTheme.accent.opacity(0.20) : .clear,
+                    radius: isActive ? 14 : 0,
+                    x: 0, y: 4
+                )
+                .opacity(subscription.isEnabled ? 1 : 0.55)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 14)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(isActive ? TVBoxTheme.surfaceRaised : TVBoxTheme.surface)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(
-                        isActive ? TVBoxTheme.accent.opacity(0.7) : TVBoxTheme.stroke,
-                        lineWidth: isActive ? 1.4 : 1
-                    )
-            )
-            .shadow(
-                color: isActive ? TVBoxTheme.accent.opacity(0.20) : .clear,
-                radius: isActive ? 14 : 0,
-                x: 0, y: 4
-            )
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
     }
 }
 

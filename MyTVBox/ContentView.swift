@@ -19,7 +19,7 @@ struct ContentView: View {
         }
         .task {
             appState.loadSubscriptions()
-            if appState.hasActiveSubscription {
+            if appState.hasEnabledSubscription {
                 await appState.loadConfig()
             }
         }
