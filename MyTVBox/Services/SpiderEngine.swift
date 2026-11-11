@@ -67,11 +67,16 @@ final class SpiderEngine {
     func execute(jsCode: String, method: String, args: [String: Any], spiderKey: String? = nil) async -> [String: Any]? {
         let context = createContext()
 
-        // 注入 bundle。webpack 打包脚本常在缺模块时抛异常，但已经把部分 spider
+        // 1.5.6：iOS 16.3 的 JSC 不支持正则后行断言 (?<= / (?<!。
+        // 6.6MB 的 esbuild bundle 只要有一处，整份脚本在**解析阶段**就被拒，
+        // 一行都不会执行（真机诊断：SyntaxError: Invalid regular expression:
+        // invalid group specifier name，注册表全空、TARGET NOT FOUND）。
+        let (patched, fixes) = Self.downgradeForJSC(jsCode)
+        // webpack 打包脚本常在缺模块时抛异常，但已经把部分 spider
         // 注册到全局了 —— 不能一遇异常就整轮放弃，清掉异常继续尝试路由。
-        context.evaluateScript(jsCode)
+        context.evaluateScript(patched)
         if let exception = context.exception, !exception.isUndefined {
-            print("[SpiderEngine] bundle 注入告警: \(exception.toString() ?? "unknown")")
+            print("[SpiderEngine] bundle 注入告警 (降级 \(fixes) 处): \(exception.toString() ?? "unknown")")
             context.exception = nil
         }
 
@@ -129,6 +134,22 @@ final class SpiderEngine {
                 }
                 var single = look(G.__JS_SPIDER__);
                 if (single) return single;
+                // 1.5.6：esbuild bundle 常把 spider 挂到自定义 var 上，
+                // 已知注册表名单覆盖不到。扫一遍全局对象找带 spider 方法的那个。
+                try {
+                    var gk = Object.keys(G);
+                    var fallback = null;
+                    for (var gi = 0; gi < gk.length; gi++) {
+                        var go = G[gk[gi]];
+                        if (!go || (typeof go !== 'object' && typeof go !== 'function')) continue;
+                        if (key && go[key] && hasAnyFn(go[key])) return go[key];
+                        if (key && go[key]) fallback = fallback || go[key];
+                        if (!key && hasAnyFn(go)) return go;
+                        if (!fallback && go.default && hasAnyFn(go.default)) fallback = go.default;
+                        if (!fallback && hasAnyFn(go)) fallback = go;
+                    }
+                    if (fallback) return fallback;
+                } catch (e) {}
                 return G;   // 顶层函数兜底
             }
             var target = pickSpider();
@@ -206,13 +227,51 @@ final class SpiderEngine {
         return nil
     }
 
+    // MARK: - 1.5.6 JSC 语法兼容
+
+    /// iOS 16.3 的 JavaScriptCore 不支持正则后行断言 `(?<=` / `(?<!`。
+    /// 只要 bundle 里出现一处，整份脚本会在**解析阶段**被拒（一行都不执行），
+    /// 报 `SyntaxError: Invalid regular expression: invalid group specifier name`。
+    /// 这类正则大多来自 Node polyfill，spider 业务不依赖；降级成非捕获组
+    /// `(?:` 可让脚本完整加载。命名捕获组 `(?<name>` 不动（JSC 支持）。
+    static func downgradeForJSC(_ code: String) -> (String, Int) {
+        var out = code
+        var total = 0
+        for token in ["(?<=", "(?<!"] {
+            let n = out.components(separatedBy: token).count - 1
+            if n > 0 {
+                out = out.replacingOccurrences(of: token, with: "(?:")
+                total += n
+            }
+        }
+        return (out, total)
+    }
+
+    /// 把 JSC 异常的行列信息 + 出错行源码写进诊断报告
+    private func describeJSCException(_ e: JSValue, code: String, into out: inout [String]) {
+        let line = Int(e.objectForKeyedSubscript("line")?.toInt32() ?? 0)
+        let column = Int(e.objectForKeyedSubscript("column")?.toInt32() ?? 0)
+        out.append("  异常位置: line=\(line) column=\(column)")
+        let stack = e.objectForKeyedSubscript("stack")?.toString() ?? ""
+        if !stack.isEmpty, stack != "undefined" {
+            out.append("  stack: \(String(stack.prefix(400)))")
+        }
+        if line > 0 {
+            let lines = code.components(separatedBy: .newlines)
+            let idx = min(max(line - 1, 0), max(lines.count - 1, 0))
+            if lines.indices.contains(idx) {
+                out.append("  附近源码: \(String(lines[idx].prefix(400)))")
+            }
+        }
+    }
+
     // MARK: - 1.5.5 真机诊断
 
     /// 在后台线程同步执行，输出一段可直接复制给开发者的运行时事实。
     /// 不依赖网络抓包，也不需要 Xcode 控制台。
     func diagnoseSync(site: Site?) -> String {
         var out: [String] = []
-        out.append("=== MyTVBox 1.5.5 Spider 诊断 ===")
+        out.append("=== MyTVBox 1.5.6 Spider 诊断 ===")
         out.append("site.name     : \(site?.name ?? "nil")")
         out.append("site.key      : \(site?.key ?? "nil")")
         out.append("site.spiderKey: \(site?.spiderKey ?? "nil")")
@@ -248,14 +307,33 @@ final class SpiderEngine {
         }
 
         let key = site.spiderKey ?? ""
+
+        // 1) 原始注入：保留最原始的错误，便于对照
+        let rawContext = createContext()
+        rawContext.evaluateScript(code)
+        out.append("")
+        out.append("--- 原始注入 ---")
+        if let e = rawContext.exception, !e.isUndefined {
+            out.append("!! 原始注入异常: \(e.toString() ?? "unknown")")
+            describeJSCException(e, code: code, into: &out)
+            rawContext.exception = nil
+        } else {
+            out.append("原始注入: 成功")
+        }
+
+        // 2) 降级注入：与 App 实际执行路径完全一致
+        let (patched, fixes) = Self.downgradeForJSC(code)
+        out.append("")
+        out.append("--- 语法降级后注入（实际生效路径）---")
+        out.append("lookbehind 降级处数: \(fixes)")
         let context = createContext()
-        context.evaluateScript(code)
+        context.evaluateScript(patched)
         if let e = context.exception, !e.isUndefined {
-            out.append("")
-            out.append("!! bundle 注入异常: \(e.toString() ?? "unknown")")
+            out.append("!! 降级后仍有异常: \(e.toString() ?? "unknown")")
+            describeJSCException(e, code: patched, into: &out)
             context.exception = nil
         } else {
-            out.append("bundle 注入异常  : (none)")
+            out.append("降级后注入: 成功")
         }
 
         let probe = """
@@ -298,6 +376,47 @@ final class SpiderEngine {
             } catch (e) { lines.push('module.exports probe err: ' + e); }
             lines.push('GLOBAL fns=[' + fns(G).slice(0, 60).join(',') + ']');
             lines.push('GLOBAL spider-ish keys=[' + keys(G).filter(function(k){ return /spider|js_|catpaw/i.test(k); }).slice(0, 40).join(',') + ']');
+            // 1.5.6：注册名未知时，扫全部全局对象找带 spider 方法的候选
+            var spiderNames = ['home','homeContent','homeVod','category','categoryContent',
+                               'detail','detailContent','play','playerContent','search','searchContent'];
+            function looksSpider(o) {
+                if (!o) return false;
+                for (var si = 0; si < spiderNames.length; si++) {
+                    if (typeof o[spiderNames[si]] === 'function') return true;
+                }
+                return false;
+            }
+            var found = [];
+            try {
+                var gk = Object.keys(G);
+                for (var gi = 0; gi < gk.length && found.length < 24; gi++) {
+                    try {
+                        var go = G[gk[gi]];
+                        if (!go) continue;
+                        if (key && go[key] && looksSpider(go[key])) {
+                            found.push(gk[gi] + '[' + key + '] fns=[' + fns(go[key]).slice(0, 20).join(',') + ']');
+                            if (!hit) hit = go[key];
+                        }
+                        if (looksSpider(go)) {
+                            found.push(gk[gi] + ' fns=[' + fns(go).slice(0, 20).join(',') + ']');
+                            if (!hit && !key) hit = go;
+                        }
+                        if (go.default && looksSpider(go.default)) {
+                            found.push(gk[gi] + '.default fns=[' + fns(go.default).slice(0, 20).join(',') + ']');
+                            if (!hit) hit = go.default;
+                        }
+                        var sub = Object.keys(go).slice(0, 10);
+                        for (var bi = 0; bi < sub.length && found.length < 24; bi++) {
+                            if (looksSpider(go[sub[bi]])) {
+                                found.push(gk[gi] + '.' + sub[bi] + ' fns=[' + fns(go[sub[bi]]).slice(0, 15).join(',') + ']');
+                                if (!hit && key && sub[bi] === key) hit = go[sub[bi]];
+                            }
+                        }
+                    } catch (e2) {}
+                }
+            } catch (e3) { lines.push('global scan err: ' + e3); }
+            lines.push('GLOBAL spider candidates (' + found.length + '):');
+            for (var fi = 0; fi < found.length; fi++) lines.push('  ' + found[fi]);
             lines.push('TARGET: ' + (hit ? ('keys=[' + keys(hit).join(',') + '] fns=[' + fns(hit).join(',') + ']') : 'NOT FOUND'));
             if (hit) {
                 var f = hit.homeContent || hit.home || hit.homeVod;
