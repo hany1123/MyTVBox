@@ -14,6 +14,9 @@ struct SubscriptionView: View {
 
     @State private var showAddSheet: Bool = false
     @State private var pendingDelete: Subscription? = nil
+    /// m3u8 广告过滤开关（默认开）
+    @AppStorage("MyTVBox.adFilterEnabled")
+    private var adFilterEnabled: Bool = true
 
     var body: some View {
         ZStack {
@@ -206,6 +209,36 @@ struct SubscriptionView: View {
                         .tracking(2)
                         .foregroundStyle(TVBoxTheme.textSecondary)
                 }
+            }
+
+            Section {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(isOn: $adFilterEnabled) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("智能过滤 m3u8 广告")
+                                .font(TVBoxTheme.text(14, weight: .semibold))
+                                .foregroundStyle(TVBoxTheme.textPrimary)
+                            Text("按分片分组、域名、时长与广告路径识别插播片段")
+                                .font(TVBoxTheme.text(11))
+                                .foregroundStyle(TVBoxTheme.textMuted)
+                        }
+                    }
+                    .tint(TVBoxTheme.accent)
+
+                    Text(adFilterEnabled
+                         ? "播放列表经 App 内本地代理清洗，分片仍直连源站；个别源异常时可关闭。"
+                         : "已关闭，播放直连原始 m3u8（与 1.4.6 行为相同）。")
+                        .font(TVBoxTheme.mono(10))
+                        .foregroundStyle(TVBoxTheme.textMuted)
+                }
+                .padding(.vertical, 6)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            } header: {
+                Text("播放设置")
+                    .font(TVBoxTheme.mono(11, weight: .heavy))
+                    .tracking(2)
+                    .foregroundStyle(TVBoxTheme.textSecondary)
             }
 
             Section {

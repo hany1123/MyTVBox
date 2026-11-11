@@ -33,24 +33,31 @@ final class APIService {
     }
 
     /// 拉取单个视频详情
-    func fetchVideoDetail(site: Site, vodId: String) async throws -> VideoDetail? {
+    /// - timeout: 跨站点并发搜索时传 6 秒，避免一个慢站拖住整轮聚合
+    func fetchVideoDetail(site: Site, vodId: String,
+                          timeout: TimeInterval? = nil) async throws -> VideoDetail? {
         guard let api = site.api, !api.isEmpty else { return nil }
         let url = appendQuery(api, params: [
             "ac": "detail",
             "ids": vodId
         ])
-        let resp: VideoDetailResponse = try await network.decode(VideoDetailResponse.self, from: url)
+        let resp: VideoDetailResponse = try await network.decode(
+            VideoDetailResponse.self, from: url, timeout: timeout
+        )
         return resp.list?.first
     }
 
     /// 关键字搜索
-    func searchVideos(site: Site, keyword: String) async throws -> [VideoItem] {
+    func searchVideos(site: Site, keyword: String,
+                      timeout: TimeInterval? = nil) async throws -> [VideoItem] {
         guard let api = site.api, !api.isEmpty else { return [] }
         let url = appendQuery(api, params: [
             "ac": "detail",
             "wd": keyword
         ])
-        let resp: APIResponse = try await network.decode(APIResponse.self, from: url)
+        let resp: APIResponse = try await network.decode(
+            APIResponse.self, from: url, timeout: timeout
+        )
         return resp.list ?? []
     }
 

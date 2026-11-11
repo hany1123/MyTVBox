@@ -9,10 +9,16 @@ struct SearchView: View {
 
     @State private var keyword: String = ""
     @FocusState private var isSearchFocused: Bool
-    @State private var results: [VideoItem] = []
+    /// 1.4.7：结果带站点归属，跨站点同名片不再撞 ID
+    @State private var results: [CrossSiteResolver.SiteSearchResult] = []
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
     @State private var hasSearched: Bool = false   // 是否已发起过搜索
+    @State private var searchedSiteCount: Int = 0
+    /// 是否聚合当前配置的全部 CMS 站点（关掉则只搜当前站点）
+    @AppStorage("MyTVBox.aggregateSearch")
+    private var aggregateSearch: Bool = true
+    @State private var searchTask: Task<Void, Never>?
 
     // MARK: - 搜索历史
 
@@ -74,6 +80,10 @@ struct SearchView: View {
                             .padding(.horizontal, 16)
                             .padding(.top, 6)
 
+                        // 聚合开关
+                        aggregateBar
+                            .padding(.horizontal, 16)
+
                         if isLoading {
                             loadingState
                                 .padding(.top, 80)
@@ -102,7 +112,54 @@ struct SearchView: View {
                 VideoDetailView(vodId: item.vodId, previewItem: item)
                     .environmentObject(appState)
             }
+            .navigationDestination(for: CrossSiteResolver.SiteSearchResult.self) { result in
+                VideoDetailView(vodId: result.item.vodId,
+                                previewItem: result.item,
+                                site: result.site)
+                    .environmentObject(appState)
+            }
         }
+    }
+
+    // MARK: - 聚合开关
+
+    private var availableSiteCount: Int {
+        CrossSiteResolver.usableSites(appState.currentConfig?.sites ?? []).count
+    }
+
+    private var aggregateBar: some View {
+        HStack(spacing: 10) {
+            Toggle(isOn: $aggregateSearch) {
+                Text("聚合全部站点")
+                    .font(TVBoxTheme.text(12, weight: .medium))
+                    .foregroundStyle(TVBoxTheme.textSecondary)
+            }
+            .tint(TVBoxTheme.accent)
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
+            Spacer()
+
+            if aggregateSearch, availableSiteCount > 0 {
+                Text("\(availableSiteCount) 个站点并发")
+                    .font(TVBoxTheme.mono(10, weight: .medium))
+                    .foregroundStyle(TVBoxTheme.textMuted)
+            } else if let name = appState.currentSite?.name {
+                Text("仅 \(name)")
+                    .font(TVBoxTheme.mono(10, weight: .medium))
+                    .foregroundStyle(TVBoxTheme.textMuted)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(TVBoxTheme.surface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(TVBoxTheme.stroke, lineWidth: 1)
+        )
     }
 
     // MARK: - 搜索框
@@ -306,6 +363,11 @@ struct SearchView: View {
                 Text(String(format: "// %02d", results.count))
                     .font(TVBoxTheme.mono(10, weight: .medium))
                     .foregroundStyle(TVBoxTheme.textMuted)
+                if searchedSiteCount > 0 {
+                    Text("· \(searchedSiteCount) 站")
+                        .font(TVBoxTheme.mono(10, weight: .medium))
+                        .foregroundStyle(TVBoxTheme.accent.opacity(0.75))
+                }
                 Text("「\(keyword)」")
                     .font(TVBoxTheme.text(12))
                     .foregroundStyle(TVBoxTheme.accent.opacity(0.7))
@@ -316,13 +378,23 @@ struct SearchView: View {
             .padding(.horizontal, 16)
             .padding(.top, 4)
 
-            // 结果网格
+            // 结果网格：角标显示该结果来自哪个站点
             LazyVGrid(columns: columns, spacing: 14) {
-                ForEach(Array(results.enumerated()), id: \.element.id) { idx, item in
+                ForEach(Array(results.enumerated()), id: \.element.id) { idx, result in
                     Button {
-                        path.append(item)
+                        path.append(result)
                     } label: {
-                        VideoCardView(item: item, index: idx + 1)
+                        VideoCardView(item: result.item, index: idx + 1)
+                            .overlay(alignment: .topTrailing) {
+                                Text(result.siteName)
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 3)
+                                    .background(Capsule().fill(TVBoxTheme.accent.opacity(0.88)))
+                                    .padding(5)
+                            }
                     }
                     .buttonStyle(CardPressStyle())
                 }
@@ -397,29 +469,41 @@ struct SearchView: View {
     private func performSearch() {
         let trimmed = keyword.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
-        guard let site = appState.currentSite else { return }
 
         isSearchFocused = false
         saveSearchHistory(trimmed)
         keyword = trimmed
 
+        searchTask?.cancel()
         isLoading = true
         errorMessage = nil
         hasSearched = true
+        results = []
 
-        Task {
-            do {
-                let items = try await APIService.shared.searchVideos(site: site, keyword: trimmed)
-                await MainActor.run {
-                    self.results = items
-                    self.isLoading = false
-                }
-            } catch {
-                await MainActor.run {
-                    self.errorMessage = error.localizedDescription
-                    self.isLoading = false
-                }
+        // 快照当前配置，避免搜索过程中切站导致结果错位
+        let useAll = aggregateSearch
+        let allSites = appState.currentConfig?.sites ?? []
+        let current = appState.currentSite
+        let preferred = current?.key
+
+        searchTask = Task { @MainActor in
+            let sites: [Site] = useAll ? allSites : (current.map { [$0] } ?? [])
+            let usable = CrossSiteResolver.usableSites(sites)
+            guard !usable.isEmpty else {
+                self.errorMessage = "当前配置没有可用于搜索的 CMS 站点，建议切回内置源"
+                self.searchedSiteCount = 0
+                self.isLoading = false
+                return
             }
+            let found = await CrossSiteResolver.search(
+                keyword: trimmed,
+                in: usable,
+                preferredSiteKey: preferred
+            )
+            guard !Task.isCancelled else { return }
+            self.searchedSiteCount = usable.count
+            self.results = found
+            self.isLoading = false
         }
     }
 }

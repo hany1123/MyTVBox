@@ -28,6 +28,10 @@ final class VideoPlayerViewModel: ObservableObject {
     @Published var slowLineHint: String?
     /// 自动切换线路时的提示（如「正在切到 XX」）
     @Published var autoSwitchHint: String?
+    /// 站点级换源成功后的站点名
+    @Published var activeSiteName: String?
+    /// m3u8 广告过滤结果（短暂显示）
+    @Published var adFilterHint: String?
 
     /// 中心按钮该转圈吗
     var isStalling: Bool { isLoading || isBuffering }
@@ -38,8 +42,12 @@ final class VideoPlayerViewModel: ObservableObject {
 
     // MARK: - Context
 
-    let videoDetail: VideoDetail
-    private(set) var sources: [PlaySource]
+    /// 站点级换源后会整体替换，故为 var
+    var videoDetail: VideoDetail
+    var sources: [PlaySource]
+
+    /// 进度记录用的原始影片 ID：跨站点换源后仍归到同一条记录，避免进度散落
+    private let progressKey: String
 
     var currentSource: PlaySource? {
         guard sources.indices.contains(currentSourceIndex) else { return nil }
@@ -70,6 +78,14 @@ final class VideoPlayerViewModel: ObservableObject {
 
     /// 自动换源状态：本次播放已试过的线路下标
     private var autoTriedSources: Set<Int> = []
+    /// 跨站点换源已经试过的站点（含当前站点），避免来回切同一个坏站
+    private var triedSiteKeys: Set<String> = []
+    /// 本片所属站点，换源时作为第一排除项
+    var originSiteKey: String?
+    /// 是否正在跨站点搜索（防止多个失败回调并发触发多次换源）
+    private var isCrossSiteSwitching = false
+    /// 线路全部耗尽时的兜底：片名 / 集序号 / 进度 / 排除站点 → 可播放候选
+    var onCrossSiteFallback: (@MainActor (String, Int, Double, Set<String>) async -> CrossSitePlayable?)?
     /// 连续处在缓冲状态的时间起点
     private var bufferingSince: Date?
 
@@ -97,6 +113,7 @@ final class VideoPlayerViewModel: ObservableObject {
          initialEpisodeIndex: Int = 0) {
         self.videoDetail = videoDetail
         self.sources = sources
+        self.progressKey = videoDetail.vodId
         self.currentSourceIndex = max(0, min(initialSourceIndex, max(sources.count - 1, 0)))
         let epCount = sources.indices.contains(self.currentSourceIndex)
             ? sources[self.currentSourceIndex].episodes.count : 0
@@ -157,7 +174,8 @@ final class VideoPlayerViewModel: ObservableObject {
                 return
             }
         }
-        errorMessage = "所有线路都需要解析器\n当前版本只能播放 M3U8 直链"
+        // 一条直链都没有：交给站点级换源，别直接把用户晾在错误页
+        attemptCrossSite(reason: "所有线路都需要解析器")
     }
 
     /// 返回第一条含可直连地址的线路下标
@@ -282,7 +300,7 @@ final class VideoPlayerViewModel: ObservableObject {
         guard duration > 0, currentTime > 3 else { return }
         let epName = currentEpisode?.name ?? "第\(currentEpisodeIndex + 1)集"
         let record = PlayHistoryManager.PlayRecord(
-            vodId: videoDetail.vodId,
+            vodId: progressKey,
             vodName: videoDetail.vodName,
             vodPic: videoDetail.vodPic,
             episodeName: epName,
@@ -296,7 +314,7 @@ final class VideoPlayerViewModel: ObservableObject {
     }
 
     func loadProgress() -> Double? {
-        guard let rec = PlayHistoryManager.shared.getRecord(vodId: videoDetail.vodId),
+        guard let rec = PlayHistoryManager.shared.getRecord(vodId: progressKey),
               rec.sourceIndex == currentSourceIndex,
               rec.episodeIndex == currentEpisodeIndex,
               rec.progress > 5,
@@ -351,9 +369,23 @@ final class VideoPlayerViewModel: ObservableObject {
 
     // MARK: - Asset / Item 构造
 
+    /// 只对 HLS 走本地代理；mp4 / 其它直链与 1.4.6 行为完全一致。
+    /// 代理启动失败或用户关闭开关时，自动退回原直连地址。
+    private static func applyAdProxy(to url: URL) -> URL {
+        let lower = url.absoluteString.lowercased()
+        guard lower.contains(".m3u8") || lower.contains("/hls/"),
+              LocalPlaylistProxy.isEnabled,
+              let proxied = LocalPlaylistProxy.shared.proxyURL(for: url) else {
+            return url
+        }
+        return proxied
+    }
+
     /// 采集站 CDN 普遍做 UA / Referer 校验：默认的 AppleCoreMedia UA 常被降速甚至限流。
     /// 换成 Safari UA + 站点根域 Referer，能明显改善拉流速度。
-    private func makeAsset(for url: URL) -> AVURLAsset {
+    private func makeAsset(for originalURL: URL) -> AVURLAsset {
+        // 1.4.7：m3u8 先经本地代理清洗广告分片；其它格式保持直连
+        let url = Self.applyAdProxy(to: originalURL)
         let key = url.absoluteString
         if let cached = assetCache[key] {
             return cached
@@ -365,7 +397,8 @@ final class VideoPlayerViewModel: ObservableObject {
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9"
         ]
-        if let scheme = url.scheme, let host = url.host {
+        // 走代理时 asset 的 host 是 127.0.0.1，防盗链头必须仍按原始资源站计算
+        if let scheme = originalURL.scheme, let host = originalURL.host {
             headers["Referer"] = "\(scheme)://\(host)/"
             headers["Origin"] = "\(scheme)://\(host)"
         }
@@ -462,6 +495,21 @@ final class VideoPlayerViewModel: ObservableObject {
         observe(item: item, restoreProgress: restoreProgress, seekTo: seekTo)
         observeEnd(of: item)
         startSlowLineWatchdog()
+        scheduleAdFilterSummary()
+    }
+
+    /// 代理拉到 playlist 并清洗后，短暂提示「过滤了几段广告」
+    private func scheduleAdFilterSummary() {
+        guard LocalPlaylistProxy.isEnabled else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            guard let self = self,
+                  let summary = LocalPlaylistProxy.shared.consumeSummary() else { return }
+            self.adFilterHint = summary
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            if self.adFilterHint == summary { self.adFilterHint = nil }
+        }
     }
 
     private func observe(item: AVPlayerItem, restoreProgress: Bool, seekTo: Double?) {
@@ -605,13 +653,13 @@ final class VideoPlayerViewModel: ObservableObject {
     /// 保留当前集数与播放进度；已试过的线路不会重复尝试。
     private func autoSwitchSource(reason: String) {
         guard sources.count > 1 else {
-            errorMessage = "\(reason)\n该片只有一条线路，建议换一个站点搜索"
             slowLineHint = nil
+            attemptCrossSite(reason: reason)
             return
         }
         guard autoTriedSources.count < maxAutoSwitch else {
-            errorMessage = "\(reason)\n已自动尝试多条线路均失败，建议切换站点"
             slowLineHint = nil
+            attemptCrossSite(reason: reason)
             return
         }
         autoTriedSources.insert(currentSourceIndex)
@@ -636,8 +684,72 @@ final class VideoPlayerViewModel: ObservableObject {
             loadAndPlay(url: url, restoreProgress: false, seekTo: resumeAt)
             return
         }
-        errorMessage = "\(reason)\n所有线路都不可用，建议切换站点"
         slowLineHint = nil
+        attemptCrossSite(reason: reason)
+    }
+
+    // MARK: - 站点级自动换源
+
+    /// 一部片的所有线路都不可用时，去其它站点搜同名片并续播
+    private func attemptCrossSite(reason: String) {
+        guard !isCrossSiteSwitching else { return }
+        guard let provider = onCrossSiteFallback else {
+            errorMessage = "\(reason)\n所有线路均不可用，建议手动切换站点"
+            slowLineHint = nil
+            return
+        }
+
+        var excluded = triedSiteKeys
+        if let origin = originSiteKey { excluded.insert(origin) }
+        guard excluded.count < 24 else {
+            errorMessage = "\(reason)\n已尝试多个站点均不可用，建议换一部片或切换订阅"
+            slowLineHint = nil
+            return
+        }
+
+        let title = videoDetail.vodName
+        let epIdx = currentEpisodeIndex
+        let seek = currentTime
+        isCrossSiteSwitching = true
+        autoSwitchHint = "正在其它站点搜索「\(title)」…"
+        errorMessage = nil
+        slowLineHint = nil
+
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            let candidate = await provider(title, epIdx, seek, excluded)
+            guard let candidate = candidate else {
+                self.isCrossSiteSwitching = false
+                self.autoSwitchHint = nil
+                self.errorMessage = "\(reason)\n所有线路及跨站点搜索均不可用，建议切换站点"
+                return
+            }
+            self.triedSiteKeys.insert(candidate.siteKey)
+            self.applyCrossSite(candidate)
+            self.isCrossSiteSwitching = false
+        }
+    }
+
+    /// 用其它站点的详情整体替换播放上下文，保留集数与进度
+    private func applyCrossSite(_ candidate: CrossSitePlayable) {
+        videoDetail = candidate.detail
+        sources = candidate.sources
+        activeSiteName = candidate.siteName
+        autoTriedSources = []
+        bufferingSince = nil
+        didRestoreProgress = false
+        currentSourceIndex = max(0, min(candidate.sourceIndex, max(sources.count - 1, 0)))
+        let epCount = currentSource?.episodes.count ?? 0
+        currentEpisodeIndex = max(0, min(candidate.episodeIndex, max(epCount - 1, 0)))
+
+        guard let ep = currentEpisode,
+              let url = URL(string: ep.url) else {
+            errorMessage = "跨站点未找到可播放的直链"
+            autoSwitchHint = nil
+            return
+        }
+        autoSwitchHint = "已切到「\(candidate.siteName)」· 续播"
+        loadAndPlay(url: url, restoreProgress: false, seekTo: candidate.seekTo)
     }
 
     private func updateBufferedProgress() {

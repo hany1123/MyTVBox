@@ -32,9 +32,12 @@ struct VideoPlayerView: View {
     let playSource: PlaySource
     let allSources: [PlaySource]
     let videoDetail: VideoDetail
+    /// 本片所属站点 key —— 跨站点换源时作为第一排除项
+    let originSiteKey: String?
 
     @StateObject private var viewModel: VideoPlayerViewModel
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appState: AppState
 
     @State private var controlsVisible = true
     @State private var episodesVisible = true
@@ -44,10 +47,12 @@ struct VideoPlayerView: View {
     init(playSource: PlaySource,
          allSources: [PlaySource],
          videoDetail: VideoDetail,
-         initialEpisodeIndex: Int = 0) {
+         initialEpisodeIndex: Int = 0,
+         originSiteKey: String? = nil) {
         self.playSource = playSource
         self.allSources = allSources
         self.videoDetail = videoDetail
+        self.originSiteKey = originSiteKey
         let srcIdx = allSources.firstIndex(where: { $0.id == playSource.id }) ?? 0
         _viewModel = StateObject(wrappedValue: VideoPlayerViewModel(
             videoDetail: videoDetail,
@@ -124,6 +129,23 @@ struct VideoPlayerView: View {
                 .allowsHitTesting(true)
             }
 
+            // 顶部状态角标：站点级换源 / m3u8 广告过滤结果
+            if controlsVisible && (viewModel.activeSiteName != nil || viewModel.adFilterHint != nil) {
+                VStack(spacing: 6) {
+                    if let site = viewModel.activeSiteName {
+                        statusBadge("自动换源 · \(site)")
+                    }
+                    if let ad = viewModel.adFilterHint {
+                        statusBadge(ad)
+                    }
+                    Spacer()
+                }
+                .padding(.top, 14)
+                .frame(maxWidth: .infinity)
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
+
             // 缓冲浮层 —— 控制层自动隐藏后，卡缓冲仍然能看见状态
             PlayerBufferingOverlay(viewModel: viewModel)
                 .opacity(controlsVisible ? 0 : 1)
@@ -161,6 +183,20 @@ struct VideoPlayerView: View {
             }
         }
         .onAppear {
+            // 注入站点级换源：线路全部耗尽时，去当前配置的其它 CMS 站点找同名片
+            let state = appState
+            viewModel.originSiteKey = originSiteKey
+            viewModel.onCrossSiteFallback = { title, epIdx, progress, excluded in
+                let sites = state.currentConfig?.sites ?? []
+                return await CrossSiteResolver.findAlternative(
+                    title: title,
+                    in: sites,
+                    excludingKeys: excluded,
+                    episodeIndex: epIdx,
+                    progress: progress,
+                    preferredSiteKey: state.currentSite?.key
+                )
+            }
             viewModel.start()
             scheduleAutoHide()
             TabBarVisibility.setHidden(true)
@@ -170,6 +206,18 @@ struct VideoPlayerView: View {
             hideTask?.cancel()
             TabBarVisibility.setHidden(false)
         }
+    }
+
+    // MARK: - 顶部状态角标
+
+    private func statusBadge(_ text: String) -> some View {
+        Text(text)
+            .font(PlayerTheme.mono(10, weight: .heavy))
+            .foregroundColor(PlayerTheme.ink)
+            .lineLimit(1)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Capsule().fill(PlayerTheme.amber.opacity(0.9)))
     }
 
     // MARK: - 控制层显隐

@@ -7,6 +7,8 @@ struct VideoDetailView: View {
     let vodId: String
     /// 列表项作为占位封面/标题
     let previewItem: VideoItem?
+    /// 结果所属站点。搜索聚合结果会带站点；首页/分类/收藏传 nil，用当前站点
+    let site: Site?
 
     @EnvironmentObject private var appState: AppState
 
@@ -33,10 +35,15 @@ struct VideoDetailView: View {
         isPlayerActive = true
     }
 
-    init(vodId: String, previewItem: VideoItem? = nil) {
+    init(vodId: String, previewItem: VideoItem? = nil, site: Site? = nil) {
         self.vodId = vodId
         self.previewItem = previewItem
+        self.site = site
     }
+
+    /// 本片实际取详情的站点：优先用结果携带的站点，否则退回当前站点
+    private var resolvedSite: Site? { site ?? appState.currentSite }
+    private var resolvedSiteKey: String? { resolvedSite?.key ?? appState.currentSite?.key }
 
     var body: some View {
         ZStack {
@@ -80,7 +87,8 @@ struct VideoDetailView: View {
                     playSource: sources[target.sourceIndex],
                     allSources: sources,
                     videoDetail: detail,
-                    initialEpisodeIndex: target.episodeIndex
+                    initialEpisodeIndex: target.episodeIndex,
+                    originSiteKey: resolvedSiteKey
                 )
             }
         }
@@ -172,6 +180,9 @@ struct VideoDetailView: View {
 
     private var metaSection: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let siteName = resolvedSite?.name {
+                metaLine(label: "SOURCE", value: siteName)
+            }
             if let d = detail?.vodDirector, !d.isEmpty {
                 metaLine(label: "DIRECTOR", value: d)
             }
@@ -410,7 +421,7 @@ struct VideoDetailView: View {
         errorMessage = nil
         defer { isLoading = false }
 
-        guard let site = appState.currentSite else {
+        guard let site = resolvedSite else {
             errorMessage = "未选择站点"
             return
         }
