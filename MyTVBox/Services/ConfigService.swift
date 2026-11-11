@@ -150,13 +150,17 @@ final class ConfigService {
     // MARK: - 解码增强
 
     /// 解码 JSON，支持 base64 编码兜底 + 数组格式 [{api,name}] 兼容
-    /// 解析配置并滤掉 iOS 无法执行的站点（type 3 = JAR 爬虫，需要 JVM）
+    /// 1.5.1：JAR 型 type=3 仍不可用，但已实现原生客户端的内置 mddcloud
+    /// 站点（api 前缀 mytvbox://mddcloud）会放行，其余 type=3 照旧过滤。
     private func decodeWithExtras(_ data: Data) throws -> TVBoxConfig {
         let cfg = try _decodeWithExtras(data)
         let repos = Self.extractRepos(from: data)
         lastRepos = repos
         let all = cfg.sites ?? []
-        let usable = all.filter { [0, 1, 4].contains($0.type) }
+        let usable = all.filter { site in
+            if [0, 1, 4].contains(site.type) { return true }
+            return site.type == 3 && MddCloudService.isMddSite(site)
+        }
         lastStats = ConfigStats(
             totalSites: all.count,
             usableSites: usable.count,

@@ -323,6 +323,19 @@ struct APIResponse: Codable {
         self.categories = try c.decodeIfPresent([VideoCategory].self, forKey: .categories)
     }
 
+    init(code: Int? = nil, msg: String? = nil, page: Int? = nil,
+         pagecount: Int? = nil, limit: Int? = nil, total: Int? = nil,
+         list: [VideoItem]? = nil, categories: [VideoCategory]? = nil) {
+        self.code = code
+        self.msg = msg
+        self.page = page
+        self.pagecount = pagecount
+        self.limit = limit
+        self.total = total
+        self.list = list
+        self.categories = categories
+    }
+
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encodeIfPresent(code, forKey: .code)

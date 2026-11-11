@@ -21,6 +21,26 @@ final class ParseResolver: NSObject {
         "https://api.wwgz.cn:520/webcloud/relay.php?url="
     ]
 
+    /// 1.5.1 内置 JSON 解析规则：来自 iBox 2.5.1 真机解密出的 `parsing` 表，
+    /// 4 条已实测能返回 `{"code":200,"url":"...m3u8"}`。订阅没配规则时作为兜底。
+    static let builtinJSONParseRules: [ParseRule] = [
+        ParseRule(name: "非凡去广告", type: 1,
+                  url: "https://api.hxmp4.com/api/parsing.Fjx/index?url=",
+                  playKeys: ["ffm3u8"]),
+        ParseRule(name: "优质去广告解析", type: 1,
+                  url: "https://api.hxmp4.com/api/parsing.Yzjx/index?url=",
+                  playKeys: ["1080zyk"]),
+        ParseRule(name: "人人视频解析", type: 1,
+                  url: "https://parsing.hxmp4.com/api/parsing.Rrmj/index?url=",
+                  playKeys: ["selfrrmj"]),
+        ParseRule(name: "毒舌电影", type: 1,
+                  url: "https://parsing.hxmp4.com/api/parsing.Dushe/index?url=",
+                  playKeys: ["selfdushe"]),
+    ]
+
+    /// 云端去广告接口：输入 m3u8 → 输出过滤掉插播广告后的 m3u8
+    private static let cloudAdCleanBase = "https://api.hxmp4.com/api/parsing.Fjx/index?url="
+
     private let handlerName = "mytvboxm3u8"
     private var webView: WKWebView?
     private var bridge: ScriptBridge?
@@ -132,34 +152,122 @@ final class ParseResolver: NSObject {
 
     // MARK: - 公开入口
 
-    /// 依次尝试解析规则，返回第一个拿到的 m3u8 直链。
-    /// - Parameters:
-    ///   - original: 原始（非直链）播放地址
-    ///   - rules: 订阅配置里的 `parses`
-    ///   - timeout: 每条规则的等待上限
+    /// 依次尝试解析规则，返回第一个拿到的播放直链。
+    ///
+    /// 1.5.1 增强：
+    /// - `type == 1` 走 **JSON 直解**（直接 GET 接口 → 解析 JSON 里的 url），
+    ///   比隐藏 WebView 更快更可靠，适配真机抓到的 `{"code":200,"url":"…m3u8"}`；
+    /// - `flag`（线路名 / `vod_play_from`）优先命中声明了对应 `play_key` 的规则；
+    /// - 其余规则仍走 WKWebView 页面脚本拦截。
     func resolve(original: String,
                  rules: [ParseRule],
+                 flag: String? = nil,
                  timeout: TimeInterval = 12) async -> URL? {
         await waitTurn()
         defer { releaseTurn() }
 
-        var candidates: [String] = []
-        for rule in rules {
-            guard let u = rule.url, !u.isEmpty, !candidates.contains(u) else { continue }
-            candidates.append(u)
+        var ordered: [ParseRule] = []
+        var seenRules = Set<String>()
+        for rule in rules + Self.builtinJSONParseRules {
+            guard let u = rule.url, !u.isEmpty, seenRules.insert(u).inserted else { continue }
+            ordered.append(rule)
         }
-        for u in Self.builtinParseURLs where !candidates.contains(u) {
-            candidates.append(u)
+        if let f = flag, !f.isEmpty {
+            let hit = ordered.filter { $0.matches(flag: f) }
+            let rest = ordered.filter { !$0.matches(flag: f) }
+            ordered = hit + rest
         }
-        guard !candidates.isEmpty else { return nil }
 
-        for base in candidates {
-            guard let target = makeURL(base: base, original: original) else { continue }
-            if let found = await tryOne(target, timeout: timeout) {
+        for rule in ordered {
+            guard let base = rule.url,
+                  let target = makeURL(base: base, original: original) else { continue }
+            if rule.type == 1 {
+                if let found = await resolveJSON(target, timeout: min(timeout, 8)) {
+                    return found
+                }
+            } else if let found = await tryOne(target, timeout: timeout) {
                 return found
             }
         }
+
+        // 内置网页型兜底
+        for u in Self.builtinParseURLs {
+            guard let target = makeURL(base: u, original: original) else { continue }
+            if let found = await tryOne(target, timeout: timeout) { return found }
+        }
         return nil
+    }
+
+    /// 云端去广告：把 m3u8 送进服务端换成过滤后的播放列表。
+    /// 不走 waitTurn 闸门（避免与 resolve 互相等待）；失败返回 nil，调用方静默退回直连。
+    func cleanM3U8(original: String, timeout: TimeInterval = 8) async -> URL? {
+        guard original.lowercased().contains(".m3u8"), isPlayable(original) else { return nil }
+        guard let target = makeURL(base: Self.cloudAdCleanBase, original: original) else {
+            return nil
+        }
+        return await resolveJSON(target, timeout: timeout)
+    }
+
+    /// type=1 规则：直接请求接口并从响应里取播放地址
+    private func resolveJSON(_ urlString: String, timeout: TimeInterval) async -> URL? {
+        guard let url = URL(string: urlString) else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: timeout)
+        req.setValue("okhttp/4.9.0", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode) else { return nil }
+            return extractMediaURL(from: data)
+        } catch {
+            return nil
+        }
+    }
+
+    private func extractMediaURL(from data: Data) -> URL? {
+        if let obj = try? JSONSerialization.jsonObject(with: data),
+           let found = findMediaURL(in: obj, depth: 0) {
+            return found
+        }
+        if let text = String(data: data, encoding: .utf8) {
+            for raw in text.components(separatedBy: .newlines) {
+                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if isPlayable(line), let u = URL(string: line) { return u }
+            }
+        }
+        return nil
+    }
+
+    /// 递归找第一个可播放地址；优先常见字段，避免把 code / msg 之类误当地址
+    private func findMediaURL(in any: Any?, depth: Int) -> URL? {
+        guard depth < 6, let any else { return nil }
+        if let s = any as? String {
+            let clean = s.replacingOccurrences(of: "\\/", with: "/")
+            guard isPlayable(clean) else { return nil }
+            return URL(string: clean)
+        }
+        if let arr = any as? [Any] {
+            for x in arr {
+                if let u = findMediaURL(in: x, depth: depth + 1) { return u }
+            }
+        }
+        if let d = any as? [String: Any] {
+            for k in ["url", "m3u8", "mp4", "playUrl", "data"] {
+                if let v = d[k], let u = findMediaURL(in: v, depth: depth + 1) { return u }
+            }
+            for (_, v) in d {
+                if let u = findMediaURL(in: v, depth: depth + 1) { return u }
+            }
+        }
+        return nil
+    }
+
+    private func isPlayable(_ s: String) -> Bool {
+        let t = s.replacingOccurrences(of: "\\/", with: "/")
+        guard t.hasPrefix("http://") || t.hasPrefix("https://") else { return false }
+        let lower = t.lowercased()
+        return lower.contains(".m3u8") || lower.contains(".mp4") ||
+               lower.contains("/hls/") || lower.contains(".flv")
     }
 
     /// 解析规则一般是 `https://host/?url=` 直接拼接；带 `$` 的复杂模板暂不支持。

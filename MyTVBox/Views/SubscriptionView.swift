@@ -17,6 +17,9 @@ struct SubscriptionView: View {
     /// m3u8 广告过滤开关（默认关，保证升级后播放行为与 1.4.6 一致）
     @AppStorage("MyTVBox.adFilterEnabled")
     private var adFilterEnabled: Bool = false
+    /// 1.5.1 云端去广告（默认关；服务失败会自动退回直连）
+    @AppStorage("MyTVBox.cloudAdFilterEnabled")
+    private var cloudAdFilterEnabled: Bool = false
 
     var body: some View {
         ZStack {
@@ -240,6 +243,28 @@ struct SubscriptionView: View {
                     Text(adFilterEnabled
                          ? "开启后由系统资源加载器清洗播放列表，分片仍直连源站；加载失败会自动退回直连。"
                          : "默认关闭，播放直连原始 m3u8。开启后可过滤棋牌等插播广告，失败会自动直连。")
+                        .font(TVBoxTheme.mono(10))
+                        .foregroundStyle(TVBoxTheme.textMuted)
+
+                    Divider()
+                        .background(TVBoxTheme.textMuted.opacity(0.35))
+                        .padding(.vertical, 2)
+
+                    Toggle(isOn: $cloudAdFilterEnabled) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("云端 m3u8 去广告")
+                                .font(TVBoxTheme.text(14, weight: .semibold))
+                                .foregroundStyle(TVBoxTheme.textPrimary)
+                            Text("把播放列表交给服务端清洗后再播，真机实测可用")
+                                .font(TVBoxTheme.text(11))
+                                .foregroundStyle(TVBoxTheme.textMuted)
+                        }
+                    }
+                    .tint(TVBoxTheme.accent)
+
+                    Text(cloudAdFilterEnabled
+                         ? "仅对 m3u8 直链生效；服务不可用或返回异常时自动直连原始地址，不会导致播不了。"
+                         : "默认关闭。与上面的本地过滤可同时开启，云端优先。")
                         .font(TVBoxTheme.mono(10))
                         .foregroundStyle(TVBoxTheme.textMuted)
                 }

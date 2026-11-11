@@ -461,6 +461,62 @@ final class VideoPlayerViewModel: ObservableObject {
         let epoch = playEpoch
         let urlString = url.absoluteString
 
+        // 1.5.1：mddcloud 内置源的剧集用自定义 scheme 占位，播放前先换真实 m3u8。
+        if allowResolve, urlString.hasPrefix(MddCloudService.playScheme) {
+            isLoading = true
+            isBuffering = false
+            errorMessage = nil
+            autoSwitchHint = "正在获取播放地址…"
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let real = await MddCloudService.shared.resolvePlayURL(urlString)
+                guard self.playEpoch == epoch else { return }
+                guard let real else {
+                    self.autoSwitchHint = nil
+                    self.errorMessage = "该线路暂时无法获取播放地址"
+                    self.autoSwitchSource(reason: "取流失败")
+                    return
+                }
+                self.autoSwitchHint = "取流成功 · 开始播放"
+                self.loadAndPlay(url: real,
+                                 restoreProgress: restoreProgress,
+                                 seekTo: seekTo,
+                                 allowResolve: false,
+                                 bump: false)
+            }
+            return
+        }
+
+        // 1.5.1：云端去广告（默认关）。只对 m3u8 直链生效，失败静默退回原地址，
+        // 绝不因为清洗失败导致播不了。
+        if allowResolve,
+           urlString.lowercased().contains(".m3u8"),
+           UserDefaults.standard.bool(forKey: "MyTVBox.cloudAdFilterEnabled") {
+            isLoading = true
+            autoSwitchHint = "正在云端去广告…"
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let cleaned = await ParseResolver.shared.cleanM3U8(original: urlString)
+                guard self.playEpoch == epoch else { return }
+                if let cleaned {
+                    self.autoSwitchHint = "云端去广告已生效"
+                    self.loadAndPlay(url: cleaned,
+                                     restoreProgress: restoreProgress,
+                                     seekTo: seekTo,
+                                     allowResolve: false,
+                                     bump: false)
+                } else {
+                    self.autoSwitchHint = nil
+                    self.loadAndPlay(url: url,
+                                     restoreProgress: restoreProgress,
+                                     seekTo: seekTo,
+                                     allowResolve: false,
+                                     bump: false)
+                }
+            }
+            return
+        }
+
         // 官源 / 分享页这类非直链：先交给解析层换出 m3u8，再走正常播放。
         // allowResolve=false 防止解析结果又被当普通网页递归解析。
         if allowResolve, !PlayURL.isDirectPlayable(url: urlString) {
@@ -472,7 +528,8 @@ final class VideoPlayerViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let resolved = await ParseResolver.shared.resolve(
-                    original: urlString, rules: rules, timeout: 12)
+                    original: urlString, rules: rules,
+                    flag: self.currentSource?.name, timeout: 12)
                 // 解析期间用户已切集 / 换源 / 自动切线路 → 丢弃这次结果
                 guard self.playEpoch == epoch else { return }
                 guard let resolved else {

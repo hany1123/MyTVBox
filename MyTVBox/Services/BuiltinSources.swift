@@ -71,6 +71,12 @@ enum BuiltinSources {
             Site(key: "tpzy", name: "淘片采集",
                  type: 1, api: "https://taopianapi.com/cjapi/mc/vod/json.html",
                  searchable: 1, quickSearch: 1, filterable: 1),
+            // 1.5.1：真机明文里挖到的 mddcloud 源，走 Swift 原生签名客户端。
+            // type=3 只放行这一个已实现的站点（见 ConfigService）。
+            Site(key: "mddcloud", name: "mdd云·剧集",
+                 type: 3, api: MddCloudService.siteScheme,
+                 searchable: 1, quickSearch: 1, filterable: 0,
+                 categories: ["剧集", "电影", "综艺"]),
         ]
 
         let lives: [LiveSource] = [
@@ -79,7 +85,27 @@ enum BuiltinSources {
                        url: "https://gh-proxy.com/https://raw.githubusercontent.com/Kimentanm/aptv/master/m3u/iptv.m3u"),
         ]
 
+        // 1.5.1：真机实测可用的解析规则（内置兜底，用户没配订阅也能用）。
+        // type=1 = 直接 GET 接口并解析 JSON 里的 url；play_keys = 线路名路由。
+        let parses: [ParseRule] = [
+            ParseRule(name: "非凡去广告", type: 1,
+                      url: "https://api.hxmp4.com/api/parsing.Fjx/index?url=",
+                      playKeys: ["ffm3u8"]),
+            ParseRule(name: "优质去广告解析", type: 1,
+                      url: "https://api.hxmp4.com/api/parsing.Yzjx/index?url=",
+                      playKeys: ["1080zyk"]),
+            ParseRule(name: "人人视频解析", type: 1,
+                      url: "https://parsing.hxmp4.com/api/parsing.Rrmj/index?url=",
+                      playKeys: ["selfrrmj"]),
+            ParseRule(name: "毒舌电影", type: 1,
+                      url: "https://parsing.hxmp4.com/api/parsing.Dushe/index?url=",
+                      playKeys: ["selfdushe"]),
+        ]
+
+        // 需要走解析的线路标识（标准 TVBox 语义；MyTVBox 用 play_keys 精确路由）
+        let flags: [String] = ["ffm3u8", "1080zyk", "selfrrmj", "selfdushe"]
+
         return TVBoxConfig(spider: nil, sites: sites, lives: lives,
-                           parses: nil, flags: nil, ijk: nil)
+                           parses: parses, flags: flags, ijk: nil)
     }
 }
