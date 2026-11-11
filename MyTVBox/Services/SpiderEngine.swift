@@ -100,6 +100,71 @@ final class SpiderEngine {
                 }
                 return hasMethod(o, 'init') || hasMethod(o, 'getName');
             }
+            // 1.5.8：真机报告显示这份 esbuild 包顶层 module.exports 是
+            // fastify/avvio 服务端 (start/stop)，真 spider 藏在 q() 惰性模块里。
+            // 猫爪 iOS (CatVodSpiderios) 的 spider 是工厂函数，返回
+            // { meta:{key,name,type}, init, home, category, detail, play, search }。
+            function metaOf(o) {
+                try { return (o && o.meta && typeof o.meta === 'object') ? o.meta : null; }
+                catch (e) { return null; }
+            }
+            function metaKey(o) {
+                var m = metaOf(o);
+                try { return m ? String(m.key || '') : ''; } catch (e) { return ''; }
+            }
+            function materialize(o) {
+                if (!o || o === __mtv_stub__) return o;
+                if (typeof o !== 'function') return o;
+                if (metaKey(o) || hasAnyFn(o)) return o;
+                var forms = [
+                    function(){ return o({}); },
+                    function(){ return new o(); },
+                    function(){ return o(); }
+                ];
+                for (var i = 0; i < forms.length; i++) {
+                    try {
+                        var r = forms[i]();
+                        if (r && r !== o && (metaKey(r) || hasAnyFn(r))) return r;
+                    } catch (e) {}
+                }
+                return o;
+            }
+            var __mtv_mod_cache__ = null;
+            function moduleSpiders() {
+                if (__mtv_mod_cache__) return __mtv_mod_cache__;
+                var out = [], seen = [], mk = [];
+                try { mk = Object.keys(G); } catch (e) { __mtv_mod_cache__ = out; return out; }
+                var deadline = Date.now() + 6000;
+                for (var i = 0; i < mk.length && i < 500 && out.length < 80 && Date.now() < deadline; i++) {
+                    var mn = mk[i];
+                    if (!/^[A-Za-z_$][A-Za-z0-9_$]{0,6}$/.test(mn)) continue;
+                    var mf = null;
+                    try { mf = G[mn]; } catch (e) { continue; }
+                    if (typeof mf !== 'function' || mf === __mtv_stub__) continue;
+                    var mr = null;
+                    try { mr = mf(); } catch (e) { continue; }
+                    if (!mr || mr === __mtv_stub__) continue;
+                    var cands = [mr], subs = [];
+                    try { subs = Object.keys(mr).slice(0, 20); } catch (e) {}
+                    for (var s = 0; s < subs.length; s++) {
+                        try { cands.push(mr[subs[s]]); } catch (e) {}
+                    }
+                    for (var c = 0; c < cands.length && out.length < 80; c++) {
+                        var raw = cands[c];
+                        if (!raw || raw === __mtv_stub__) continue;
+                        if (typeof raw !== 'object' && typeof raw !== 'function') continue;
+                        var built = materialize(raw);
+                        if (!built || built === __mtv_stub__) continue;
+                        if (!metaKey(built) && !hasAnyFn(built)) continue;
+                        var sig = metaKey(built);
+                        if (sig && seen.indexOf(sig) >= 0) continue;
+                        if (sig) seen.push(sig);
+                        out.push(built);
+                    }
+                }
+                __mtv_mod_cache__ = out;
+                return out;
+            }
             function pickSpider() {
                 // 1.5.4：多 spider bundle 会把各模块挂到注册表里，按 key 精确取
                 var regs = ['__JS_SPIDER__', '__SPIDERS__', 'spiders', '__spiders__',
@@ -132,6 +197,19 @@ final class SpiderEngine {
                         if (look(ex.default) && hasAnyFn(ex.default)) return ex.default;
                     }
                 }
+                // 1.5.8：模块表才是这份 esbuild 包里唯一可靠的 spider 来源。
+                // 必须放在全局扫描之前 —— 万能 Proxy stub 的任意属性会让
+                // go[key] 命中，把 fallback 污染成一个没有任何方法的空函数。
+                var modsMid = moduleSpiders();
+                if (key) {
+                    for (var mm2 = 0; mm2 < modsMid.length; mm2++) {
+                        if (metaKey(modsMid[mm2]) === key) return modsMid[mm2];
+                    }
+                }
+                for (var mm3 = 0; mm3 < modsMid.length; mm3++) {
+                    if (hasMethod(modsMid[mm3], 'home') || hasMethod(modsMid[mm3], 'homeContent')) return modsMid[mm3];
+                }
+                if (modsMid.length) return modsMid[0];
                 var single = look(G.__JS_SPIDER__);
                 if (single) return single;
                 // 1.5.6：esbuild bundle 常把 spider 挂到自定义 var 上，
@@ -141,7 +219,7 @@ final class SpiderEngine {
                     var fallback = null;
                     for (var gi = 0; gi < gk.length; gi++) {
                         var go = G[gk[gi]];
-                        if (!go || (typeof go !== 'object' && typeof go !== 'function')) continue;
+                        if (!go || go === __mtv_stub__ || (typeof go !== 'object' && typeof go !== 'function')) continue;
                         if (key && go[key] && hasAnyFn(go[key])) return go[key];
                         if (key && go[key]) fallback = fallback || go[key];
                         if (!key && hasAnyFn(go)) return go;
@@ -178,9 +256,11 @@ final class SpiderEngine {
             }
             function init() {
                 try {
-                    if (target !== G && typeof target.init === 'function') target.init();
-                    else if (typeof G.init === 'function') G.init();
+                    var arg = { body: {}, extend: {}, ext: {} };
+                    if (target !== G && typeof target.init === 'function') return target.init(arg);
+                    if (typeof G.init === 'function') return G.init(arg);
                 } catch (e) {}
+                return null;
             }
             return { invoke: invoke, init: init };
         })()
@@ -191,7 +271,11 @@ final class SpiderEngine {
             print("[SpiderEngine] 路由器创建失败")
             return nil
         }
-        _ = router.objectForKeyedSubscript("init")?.call(withArguments: [])
+        // 1.5.8：猫爪 iOS spider 的 init 是 async 且吃 {body} 参数；
+        // 不落地会让后续 home/category 拿不到 extend / filters。
+        if let initRaw = router.objectForKeyedSubscript("init")?.call(withArguments: []) {
+            _ = resolvePromiseLike(initRaw, context: context)
+        }
 
         // 位置参数优先；不同 Spider 约定不一致时再退回「单个参数对象」。
         // 两种都试，避免把 (tid, pg) 写成 ({id:tid,pg:pg}) 就永远拿不到数据。
@@ -209,9 +293,18 @@ final class SpiderEngine {
             addAttempt([[id]])
             addAttempt([id])
         }
-        if !args.isEmpty { addAttempt([args]) }
+        if !args.isEmpty {
+            // 1.5.8：CatVodSpiderios 是单对象参数，业务字段在
+            // o.body.id / o.body.pg / o.extend，不是 TVBox 的位置参数。
+            addAttempt([args])
+            addAttempt([["body": args] as [String: Any]])
+            var mixed: [String: Any] = ["body": args, "extend": [:], "ext": [:]]
+            for (k, v) in args { mixed[k] = v }
+            addAttempt([mixed])
+        }
         if attempts.isEmpty { addAttempt([]) }
 
+        var weakResult: [String: Any]?
         for attempt in attempts {
             guard let jsArr = context.evaluateScript("(\(jsArgsJSON(attempt)))"),
                   !jsArr.isUndefined else { continue }
@@ -222,9 +315,11 @@ final class SpiderEngine {
                 print("[SpiderEngine] \(method) 抛错: \(err)")
                 continue
             }
-            return dict
+            // 参数形态不对时 spider 常返回 {} / {list:[]}，不能当成成功提前返回
+            if hasPayload(dict) { return dict }
+            if weakResult == nil { weakResult = dict }
         }
-        return nil
+        return weakResult
     }
 
     // MARK: - 1.5.6 JSC 语法兼容
@@ -436,7 +531,7 @@ final class SpiderEngine {
                     lines.push('  >> module.exports.default keys=[' + keys(ex.default).join(',') + '] fns=[' + fns(ex.default).join(',') + ']');
                     if (!hit) hit = ex.default;
                 }
-                if (!hit && ex && fns(ex).length > 0) hit = ex;
+                if (!hit && ex && (ex.homeContent || ex.home || ex.homeVod || ex.categoryContent || ex.category)) hit = ex;
             } catch (e) { lines.push('module.exports probe err: ' + e); }
             lines.push('GLOBAL fns=[' + fns(G).slice(0, 60).join(',') + ']');
             lines.push('GLOBAL spider-ish keys=[' + keys(G).filter(function(k){ return /spider|js_|catpaw/i.test(k); }).slice(0, 40).join(',') + ']');
@@ -496,7 +591,9 @@ final class SpiderEngine {
                         var mr = mf();
                         if (!mr) continue;
                         if (looksSpider(mr)) {
-                            probed.push(mk[mi] + ' fns=[' + fns(mr).slice(0, 20).join(',') + ']');
+                            var mm = '';
+                            try { mm = mr.meta ? JSON.stringify(mr.meta) : ''; } catch (e) {}
+                            probed.push(mk[mi] + ' meta=' + (mm || '-') + ' fns=[' + fns(mr).slice(0, 20).join(',') + ']');
                             if (!hit) hit = mr;
                         }
                         try {
@@ -513,12 +610,46 @@ final class SpiderEngine {
             } catch (e6) { lines.push('module probe err: ' + e6); }
             lines.push('MODULE PROBE (' + probed.length + '):');
             for (var pi = 0; pi < probed.length; pi++) lines.push('  ' + probed[pi]);
+            // 1.5.8：列出模块表里所有 meta.key，并按正式 execute 的规则路由一次
+            var __route_keys__ = [], __route_hit__ = null;
+            try {
+                var rk = Object.keys(G);
+                var __r_deadline__ = Date.now() + 5000;
+                for (var ri = 0; ri < rk.length && ri < 500 && Date.now() < __r_deadline__; ri++) {
+                    var rn = rk[ri];
+                    if (!/^[A-Za-z_$][A-Za-z0-9_$]{0,6}$/.test(rn)) continue;
+                    var rf = null;
+                    try { rf = G[rn]; } catch (e) { continue; }
+                    if (typeof rf !== 'function' || rf === __mtv_stub__) continue;
+                    try {
+                        var rr = rf();
+                        if (!rr) continue;
+                        var rlist = [rr];
+                        try { var rs = Object.keys(rr).slice(0, 15); for (var rj = 0; rj < rs.length; rj++) rlist.push(rr[rs[rj]]); } catch (e) {}
+                        for (var rc = 0; rc < rlist.length; rc++) {
+                            var ro = rlist[rc];
+                            if (!ro || (typeof ro !== 'object' && typeof ro !== 'function')) continue;
+                            var rmeta = null;
+                            try { rmeta = ro.meta; } catch (e) {}
+                            if (!rmeta) continue;
+                            var rkey = '';
+                            try { rkey = String(rmeta.key || ''); } catch (e) {}
+                            if (!rkey) continue;
+                            if (__route_keys__.indexOf(rkey) < 0) __route_keys__.push(rkey);
+                            if (key && rkey === key && !__route_hit__) __route_hit__ = ro;
+                        }
+                    } catch (e) {}
+                }
+            } catch (e) { lines.push('META ROUTE err: ' + e); }
+            lines.push('META ROUTE keys (' + __route_keys__.length + '): [' + __route_keys__.slice(0, 60).join(',') + ']');
+            lines.push('META ROUTE hit for key=' + key + ': ' + (__route_hit__ ? 'YES' : 'NO'));
+            if (__route_hit__) hit = __route_hit__;
             lines.push('TARGET: ' + (hit ? ('keys=[' + keys(hit).join(',') + '] fns=[' + fns(hit).join(',') + ']') : 'NOT FOUND'));
             if (hit) {
                 var f = hit.homeContent || hit.home || hit.homeVod;
                 if (typeof f === 'function') {
                     try {
-                        var v = f.call(hit);
+                        var v = f.call(hit, { body: {}, extend: {} });
                         if (v && typeof v.then === 'function') lines.push('HOME_RESULT: Promise');
                         else lines.push('HOME_RESULT: ' + String(JSON.stringify(v)).slice(0, 500));
                     } catch (e) { lines.push('HOME_RESULT ERROR: ' + e); }
@@ -674,6 +805,19 @@ final class SpiderEngine {
         return out
     }
 
+    /// 1.5.8：多参数形态依次试时，`{}` / `{list:[]}` 这类空壳不能算成功，
+    /// 否则真正对的那次调用永远轮不到。
+    private func hasPayload(_ dict: [String: Any]) -> Bool {
+        for (k, v) in dict {
+            if k == "__mtv_error__" { continue }
+            if let a = v as? [Any], !a.isEmpty { return true }
+            if let d = v as? [String: Any], !d.isEmpty { return true }
+            if let s = v as? String, !s.isEmpty { return true }
+            if let n = v as? NSNumber, n.intValue != 0 { return true }
+        }
+        return false
+    }
+
     // MARK: - 内部工具
 
     /// 将 Swift 字典转为 JSON 字符串（JS 中使用）
@@ -760,7 +904,7 @@ final class SpiderEngine {
             "var __MTV_G__ = (function(){ return this; })();",
             "var module = { exports: {} }; var exports = module.exports;",
             "var window = __MTV_G__; var self = __MTV_G__; var global = __MTV_G__;",
-            "var process = { env: {}, platform: 'ios', version: '1.0', argv: [] };",
+            "var process = { env: {}, platform: 'ios', version: 'v18.0.0', argv: [], pid: 1, ppid: 1, nextTick: function(f){ try { if (typeof f === 'function') f(); } catch(e){} }, hrtime: (function(){ var h = function(){ return [0, 0]; }; h.bigint = function(){ try { return BigInt(Date.now()) * BigInt(1000000); } catch(e) { return Date.now() * 1000000; } }; return h; })(), cpuUsage: function(){ return { user: 0, system: 0 }; }, memoryUsage: function(){ return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }; }, cwd: function(){ return '/'; }, uptime: function(){ return 0; }, on: function(){}, once: function(){}, exit: function(){}, versions: { node: '18.0.0' }, stdout: { write: function(){} }, stderr: { write: function(){} } };",
             "var __mtv_stub__ = (function(){",
             "  var f = function(){ return __mtv_stub__; };",
             "  if (typeof Proxy === 'undefined') return f;",
@@ -786,6 +930,11 @@ final class SpiderEngine {
             "__mtv_EE__.prototype.off = __mtv_EE__.prototype.removeListener = function(){ return this; };",
             "__mtv_EE__.prototype.emit = function(k){ var a=this._h[k]||[], args=[].slice.call(arguments,1); for(var i=0;i<a.length;i++){ try{a[i].apply(null,args);}catch(e){} } return a.length>0; };",
             "__mtv_EE__.prototype.removeAllListeners = function(){ this._h={}; return this; };",
+            "var __mtv_ALS__ = function(){ this._s = {}; };",
+            "__mtv_ALS__.prototype.getStore = function(){ return this._s; };",
+            "__mtv_ALS__.prototype.run = function(s, f){ var o=this._s; this._s=s||{}; try { return f ? f() : undefined; } finally { this._s=o; } };",
+            "__mtv_ALS__.prototype.enterWith = function(s){ this._s = s || {}; };",
+            "__mtv_ALS__.prototype.disable = function(){ this._s = {}; };",
             "var require = function(name) {",
             "  name = String(name || '');",
             "  if (name === 'dayjs') return (typeof dayjs !== 'undefined') ? dayjs : __mtv_stub__;",
@@ -801,6 +950,8 @@ final class SpiderEngine {
             "  if (name === 'axios' || name === 'node-fetch' || name === 'undici' || name === 'cross-fetch') return { get: function(u){ return Promise.resolve({status:200,data:nativeReq(String(u),'GET',null,null)}); }, post: function(u,b){ return Promise.resolve({status:200,data:nativeReq(String(u),'POST',null,String(b))}); }, request: function(){ return Promise.resolve({status:200,data:{}}); }, create: function(){ return this; }, default: fetch };",
             "  if (name === 'fs' || name === 'node:fs') return { readFileSync: function(){ return ''; }, existsSync: function(){ return false; }, promises: {} };",
             "  if (name === 'os' || name === 'node:os') return { platform: function(){ return 'ios'; }, tmpdir: function(){ return '/tmp'; }, EOL: String.fromCharCode(10), cpus: function(){ return []; } };",
+            "  if (name === 'async_hooks' || name === 'node:async_hooks') return { AsyncLocalStorage: __mtv_ALS__, AsyncResource: __mtv_EE__, createHook: function(){ return { enable: function(){}, disable: function(){} }; }, executionAsyncId: function(){ return 0; }, triggerAsyncId: function(){ return 0; } };",
+            "  if (name === 'perf_hooks' || name === 'node:perf_hooks') return { performance: { now: function(){ return Date.now(); } }, PerformanceObserver: function(){} };",
             "  return __mtv_stub__;",
             "};",
             "var __mtv_store__ = {};",
