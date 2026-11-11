@@ -101,7 +101,8 @@ struct VideoDetailView: View {
                     allSources: sources,
                     videoDetail: detail,
                     initialEpisodeIndex: target.episodeIndex,
-                    originSiteKey: resolvedSiteKey
+                    originSiteKey: resolvedSiteKey,
+                    site: resolvedSite
                 )
             }
         }

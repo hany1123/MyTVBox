@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// 站点切换选择器
-/// - 仅展示 type != 3 的站点（iOS 不支持 Spider/JAR）
+/// - 1.5.4：JAR 站仍隐藏，但 JS Spider 站（有 bundle / spiderKey）可显示
 /// - 当前站点高亮 + 状态指示
 struct SitePickerView: View {
 
@@ -10,7 +10,7 @@ struct SitePickerView: View {
 
     private var availableSites: [Site] {
         (appState.currentConfig?.sites ?? []).filter {
-            $0.type != 3 || $0.spiderKey != nil
+            $0.type != 3 || $0.spiderKey != nil || SpiderEngine.isSpiderSite($0)
         }
     }
 

@@ -151,7 +151,9 @@ final class ConfigService {
 
     /// 解码 JSON，支持 base64 编码兜底 + 数组格式 [{api,name}] 兼容
     /// 1.5.1：JAR 型 type=3 仍不可用，但已实现原生客户端的内置 mddcloud
-    /// 站点（api 前缀 mytvbox://mddcloud）会放行，其余 type=3 照旧过滤。
+    /// 站点（api 前缀 mytvbox://mddcloud）会放行。
+    /// 1.5.4：带 bundle / spiderKey 的 **JS Spider** 站点也放行；
+    /// 带 jar 字段的 Java 站点继续挡，避免 123 个跑不了的站涌进列表。
     private func decodeWithExtras(_ data: Data) throws -> TVBoxConfig {
         let cfg = try _decodeWithExtras(data)
         let repos = Self.extractRepos(from: data)
@@ -159,7 +161,13 @@ final class ConfigService {
         let all = cfg.sites ?? []
         let usable = all.filter { site in
             if [0, 1, 4].contains(site.type) { return true }
-            return site.type == 3 && MddCloudService.isMddSite(site)
+            guard site.type == 3 else { return false }
+            if MddCloudService.isMddSite(site) { return true }
+            if site.jar == nil,
+               site.spiderKey != nil || SpiderEngine.isSpiderSite(site) {
+                return true
+            }
+            return false
         }
         lastStats = ConfigStats(
             totalSites: all.count,

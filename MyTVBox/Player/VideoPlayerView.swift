@@ -34,6 +34,8 @@ struct VideoPlayerView: View {
     let videoDetail: VideoDetail
     /// 本片所属站点 key —— 跨站点换源时作为第一排除项
     let originSiteKey: String?
+    /// 1.5.4：详情所属站点（JS Spider 取流用）
+    let site: Site?
 
     @StateObject private var viewModel: VideoPlayerViewModel
     @Environment(\.dismiss) private var dismiss
@@ -48,11 +50,13 @@ struct VideoPlayerView: View {
          allSources: [PlaySource],
          videoDetail: VideoDetail,
          initialEpisodeIndex: Int = 0,
-         originSiteKey: String? = nil) {
+         originSiteKey: String? = nil,
+         site: Site? = nil) {
         self.playSource = playSource
         self.allSources = allSources
         self.videoDetail = videoDetail
         self.originSiteKey = originSiteKey
+        self.site = site
         let srcIdx = allSources.firstIndex(where: { $0.id == playSource.id }) ?? 0
         _viewModel = StateObject(wrappedValue: VideoPlayerViewModel(
             videoDetail: videoDetail,
@@ -191,6 +195,8 @@ struct VideoPlayerView: View {
             model.originSiteKey = originSiteKey
             // 网页型线路（官源 / 分享页）靠这些解析规则兑换 m3u8
             model.parseRules = state.currentConfig?.parses ?? []
+            // JS Spider 站点的集地址要先过 play()
+            model.spiderSite = site ?? state.currentSite
             model.onCrossSiteFallback = { title, epIdx, progress, excluded in
                 let sites = state.currentConfig?.sites ?? []
                 return await CrossSiteResolver.findAlternative(

@@ -48,6 +48,8 @@ final class VideoPlayerViewModel: ObservableObject {
 
     /// 当前配置里的解析规则（由 View 注入）；非直链线路靠它兑换 m3u8
     var parseRules: [ParseRule] = []
+    /// 1.5.4：本片所属站点；JS Spider 站点的集地址要先调 play() 换真实地址
+    var spiderSite: Site?
 
     /// 进度记录用的原始影片 ID：跨站点换源后仍归到同一条记录，避免进度散落
     private let progressKey: String
@@ -129,6 +131,8 @@ final class VideoPlayerViewModel: ObservableObject {
     }
     /// 云端清洗失败过一次后，本次会话不再重复等待，避免每条线路都卡 3.5 秒
     private var cloudCleanFailed = false
+    /// Spider play() 返回的自定义请求头（Referer / UA 等）
+    private var spiderHeaders: [String: String] = [:]
 
     // MARK: - Init
 
@@ -413,6 +417,10 @@ final class VideoPlayerViewModel: ObservableObject {
             headers["Referer"] = "\(scheme)://\(host)/"
             headers["Origin"] = "\(scheme)://\(host)"
         }
+        // 1.5.4：Spider play() 指定的头优先（它比我们猜的防盗链更准）
+        if !spiderHeaders.isEmpty {
+            headers.merge(spiderHeaders) { _, new in new }
+        }
 
         let options: [String: Any] = [
             "AVURLAssetHTTPHeaderFieldsKey": headers,
@@ -467,6 +475,38 @@ final class VideoPlayerViewModel: ObservableObject {
     private func cancelPrewarm() {
         prewarmTask?.cancel()
         prewarmTask = nil
+    }
+
+    // MARK: - 1.5.4 Spider play() 结果解析
+
+    /// Spider 的 play() 可能返回 {url}、{data:{url}}，也可能返回 JSON 字符串
+    private static func extractPlayURL(from dict: [String: Any]) -> String? {
+        for k in ["url", "playUrl", "play_url", "m3u8", "data"] {
+            if let s = dict[k] as? String, s.lowercased().hasPrefix("http") { return s }
+            if let d = dict[k] as? [String: Any],
+               let s = d["url"] as? String, s.lowercased().hasPrefix("http") { return s }
+        }
+        for (_, v) in dict {
+            guard let s = v as? String, s.contains("http"),
+                  let data = s.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data),
+                  let j = obj as? [String: Any],
+                  let u = j["url"] as? String else { continue }
+            return u
+        }
+        return nil
+    }
+
+    private static func extractHeaders(from dict: [String: Any]) -> [String: String] {
+        for k in ["header", "headers"] {
+            if let h = dict[k] as? [String: String] { return h }
+            if let h = dict[k] as? [String: Any] {
+                var out: [String: String] = [:]
+                for (key, value) in h { out[key] = "\(value)" }
+                return out
+            }
+        }
+        return [:]
     }
 
     // MARK: - 1.5.2 提示时长 / 稳健续播
@@ -603,6 +643,42 @@ final class VideoPlayerViewModel: ObservableObject {
                 }
                 self.showHint("取流成功 · 开始播放", hold: 2.0)
                 self.loadAndPlay(url: real,
+                                 restoreProgress: restoreProgress,
+                                 seekTo: seekTo,
+                                 allowResolve: false,
+                                 bump: false)
+            }
+            return
+        }
+
+        // 1.5.4：JS Spider 站点的集地址往往是内部 id，要先调 play() 换真实地址。
+        // 必须排在网页解析之前，否则 ParseResolver 会把 id 当 URL 去解析。
+        if allowResolve,
+           let site = spiderSite,
+           SpiderEngine.isSpiderSite(site),
+           !PlayURL.isDirectPlayable(url: urlString) {
+            isLoading = true
+            isBuffering = false
+            errorMessage = nil
+            showHint("正在获取播放地址…", hold: nil)
+            let flag = currentSource?.name ?? ""
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let r = await SpiderEngine.shared.call(
+                    site: site, method: "play",
+                    args: ["flag": flag, "id": urlString])
+                guard self.playEpoch == epoch else { return }
+                guard let r,
+                      let real = Self.extractPlayURL(from: r),
+                      let url = URL(string: real) else {
+                    self.showHint(nil)
+                    self.errorMessage = "该线路暂时无法获取播放地址"
+                    self.autoSwitchSource(reason: "取流失败")
+                    return
+                }
+                self.spiderHeaders = Self.extractHeaders(from: r)
+                self.showHint("取流成功 · 开始播放", hold: 2.0)
+                self.loadAndPlay(url: url,
                                  restoreProgress: restoreProgress,
                                  seekTo: seekTo,
                                  allowResolve: false,
