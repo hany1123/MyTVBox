@@ -20,6 +20,9 @@ struct SubscriptionView: View {
     /// 1.5.1 云端去广告（默认关；服务失败会自动退回直连）
     @AppStorage("MyTVBox.cloudAdFilterEnabled")
     private var cloudAdFilterEnabled: Bool = false
+    /// 1.5.2 自动换源总开关（默认开；关闭后只提示，不擅自切线路）
+    @AppStorage("MyTVBox.autoSwitchEnabled")
+    private var autoSwitchEnabled: Bool = true
 
     var body: some View {
         ZStack {
@@ -265,6 +268,28 @@ struct SubscriptionView: View {
                     Text(cloudAdFilterEnabled
                          ? "仅对 m3u8 直链生效；服务不可用或返回异常时自动直连原始地址，不会导致播不了。"
                          : "默认关闭。与上面的本地过滤可同时开启，云端优先。")
+                        .font(TVBoxTheme.mono(10))
+                        .foregroundStyle(TVBoxTheme.textMuted)
+
+                    Divider()
+                        .background(TVBoxTheme.textMuted.opacity(0.35))
+                        .padding(.vertical, 2)
+
+                    Toggle(isOn: $autoSwitchEnabled) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("播放卡顿时自动换源")
+                                .font(TVBoxTheme.text(14, weight: .semibold))
+                                .foregroundStyle(TVBoxTheme.textPrimary)
+                            Text("失败或卡住时自动切线路，并从已播放位置续播")
+                                .font(TVBoxTheme.text(11))
+                                .foregroundStyle(TVBoxTheme.textMuted)
+                        }
+                    }
+                    .tint(TVBoxTheme.accent)
+
+                    Text(autoSwitchEnabled
+                         ? "已开启：优先切不同站点的线路，换源后自动回到刚才的进度。"
+                         : "已关闭：线路失败只提示，需要手动切换线路或站点。")
                         .font(TVBoxTheme.mono(10))
                         .foregroundStyle(TVBoxTheme.textMuted)
                 }

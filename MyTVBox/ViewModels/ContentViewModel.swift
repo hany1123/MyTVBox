@@ -31,11 +31,34 @@ final class ContentViewModel: ObservableObject {
     private var loadedSiteKey: String?
     private var loadTask: Task<Void, Never>?
     private var requestSeq = 0
+    /// 1.5.2 分类请求序号：切站点时作废旧响应，避免旧站分类覆盖新站
+    private var categoriesSeq = 0
 
     /// 站点首页缓存：site.key|typeId -> 列表
     private static var firstPageCache: [String: [VideoItem]] = [:]
     private static var cacheOrder: [String] = []
     private static let cacheLimit = 32
+
+    /// 1.5.2 分类缓存（站点 key → 分类 + 写入时间），10 分钟内复用，
+    /// 切回看过的站点分类条瞬间出现，不再重跑一次 ac=class。
+    private struct CategoryCacheEntry {
+        let list: [VideoCategory]
+        let date: Date
+    }
+    private static var categoryCache: [String: CategoryCacheEntry] = [:]
+    private static let categoryTTL: TimeInterval = 600
+
+    static func cachedCategories(for site: Site) -> [VideoCategory]? {
+        guard let e = categoryCache[site.key],
+              Date().timeIntervalSince(e.date) < categoryTTL,
+              !e.list.isEmpty else { return nil }
+        return e.list
+    }
+
+    private static func cacheCategories(_ key: String, _ list: [VideoCategory]) {
+        guard !list.isEmpty else { return }
+        categoryCache[key] = CategoryCacheEntry(list: list, date: Date())
+    }
 
     // MARK: - 缓存
 
@@ -58,21 +81,22 @@ final class ContentViewModel: ObservableObject {
         }
     }
 
-    /// 后台预热若干站点的首页（顺序拉取，避免一次性并发太多）
-    /// 静态方法：站点选择器里也能直接调用，不依赖某个 ViewModel 实例
+    /// 后台预热相邻站点首页。
+    /// 1.5.2 从「逐个串行」改成最多 3 路并发 —— 原来往往还没轮到目标站点，
+    /// 用户就已经切过去了，预热等于白做。
     static func prefetch(sites: [Site]) {
-        let pending = sites.filter { cacheGet(cacheKey($0, nil)) == nil && $0.api != nil }
+        let pending = Array(sites.filter {
+            cacheGet(cacheKey($0, nil)) == nil && $0.api != nil
+        }.prefix(3))
         guard !pending.isEmpty else { return }
-        Task {
-            for site in pending {
-                if Task.isCancelled { return }
-                do {
-                    let resp = try await APIService.shared.fetchVideoList(site: site, categoryId: "", page: 1)
-                    if let list = resp.list, !list.isEmpty {
-                        cachePut(cacheKey(site, nil), list)
-                    }
-                } catch {
-                    // 预热失败无需打扰用户
+        for site in pending {
+            Task { @MainActor in
+                let key = cacheKey(site, nil)
+                guard cacheGet(key) == nil else { return }
+                if let resp = try? await APIService.shared.fetchVideoList(
+                    site: site, categoryId: "", page: 1),
+                   let list = resp.list, !list.isEmpty {
+                    cachePut(key, list)
                 }
             }
         }
@@ -83,28 +107,70 @@ final class ContentViewModel: ObservableObject {
 
     // MARK: - 接口
 
-    func loadCategories(site: Site) async {
-        errorMessage = nil
+    /// 1.5.2 带缓存 + 短超时的分类加载。
+    /// 失败时**保留**已显示的分类条（旧实现直接清空，慢站一超时整条栏就闪没）。
+    @discardableResult
+    func loadCategories(site: Site, allowCache: Bool = true) async -> Bool {
+        let siteKey = site.key
+        categoriesSeq += 1
+        let seq = categoriesSeq
+        if allowCache, let cached = Self.cachedCategories(for: site) {
+            self.categories = cached
+        }
         do {
+            var result: [VideoCategory] = []
             if site.type == 3, let code = SpiderContextManager.shared.moduleCode(for: site.key) {
-                let result = await SpiderEngine.shared.execute(jsCode: code, method: "home", args: [:], spiderKey: site.spiderKey)
-                if let classList = result?["class"] as? [[String: Any]] {
-                    self.categories = classList.compactMap { dict in
+                let r = await SpiderEngine.shared.execute(
+                    jsCode: code, method: "home", args: [:], spiderKey: site.spiderKey)
+                if let classList = r?["class"] as? [[String: Any]] {
+                    result = classList.compactMap { dict in
                         guard let typeId = dict["type_id"] as? String ?? (dict["type_id"] as? Int).map(String.init),
                               let typeName = dict["type_name"] as? String else { return nil }
                         return VideoCategory(typeId: typeId, typeName: typeName)
                     }
                 }
             } else {
-                let cats = try await apiService.fetchCategories(site: site)
-                self.categories = cats
+                result = try await apiService.fetchCategories(site: site, timeout: 8)
             }
+            guard seq == categoriesSeq else { return false }
+            guard !result.isEmpty else { return false }
+            self.categories = result
+            Self.cacheCategories(siteKey, result)
+            return true
         } catch {
-            if !Self.isCancellation(error) {
+            guard seq == categoriesSeq, !Self.isCancellation(error) else { return false }
+            if self.categories.isEmpty {
                 self.errorMessage = error.localizedDescription
             }
-            self.categories = []
+            return false
         }
+    }
+
+    /// 1.5.2 分类页首屏：分类与内容**并发**发起。
+    /// 旧实现是 `await 分类` 再 `await 列表`，两次网络往返相加，慢站能到 20~40 秒；
+    /// 现在首屏时间 = 两者中较慢的一次，且两者都有缓存可先出图。
+    /// 默认展示「最新」(category=nil)，分类回来后由用户点选，不会出现
+    /// 「条上高亮电影、内容却是最新」的错配。
+    func loadInitial(site: Site) async {
+        loadTask?.cancel()
+        categoriesSeq += 1
+        requestSeq += 1
+        errorMessage = nil
+
+        if let cached = Self.cachedCategories(for: site), !cached.isEmpty {
+            self.categories = cached
+        }
+        self.currentCategory = nil
+
+        let catTask = Task { @MainActor [weak self] in
+            _ = await self?.loadCategories(site: site, allowCache: true)
+        }
+        let listTask = Task { @MainActor [weak self] in
+            _ = await self?.loadVideoList(site: site, category: nil,
+                                          allowCache: true, preserveList: false)
+        }
+        await catTask.value
+        await listTask.value
     }
 
     /// 发起一次「首页/分类首页」加载。

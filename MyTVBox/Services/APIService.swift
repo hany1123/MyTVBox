@@ -14,13 +14,16 @@ final class APIService {
     // MARK: - 接口
 
     /// 拉取分类
-    func fetchCategories(site: Site) async throws -> [VideoCategory] {
+    /// 1.5.2 单独用 8 秒短超时：分类接口慢不该把整个首屏拖到 20 秒。
+    func fetchCategories(site: Site, timeout: TimeInterval? = 8) async throws -> [VideoCategory] {
         if MddCloudService.isMddSite(site) {
             return MddCloudService.shared.categories()
         }
         guard let api = site.api, !api.isEmpty else { return [] }
         let url = appendQuery(api, params: ["ac": "class"])
-        let resp: APIResponse = try await network.decode(APIResponse.self, from: url)
+        let resp: APIResponse = try await network.decode(
+            APIResponse.self, from: url, timeout: timeout
+        )
         return resp.categories ?? []
     }
 

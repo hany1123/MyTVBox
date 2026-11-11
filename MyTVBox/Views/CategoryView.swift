@@ -33,15 +33,8 @@ struct CategoryView: View {
         }
         .task(id: appState.currentSite?.key) {
             guard let site = appState.currentSite else { return }
-            await viewModel.loadCategories(site: site)
-            // 默认选中第一个分类并加载内容
-            if !viewModel.categories.isEmpty {
-                let first = viewModel.categories.first
-                await viewModel.loadVideoList(site: site, category: first)
-            } else if viewModel.errorMessage == nil {
-                // 没有分类，至少展示最新内容
-                await viewModel.loadVideoList(site: site, category: nil)
-            }
+            // 1.5.2 分类与内容并发拉取，首屏从「两次往返相加」变成「取较慢的一次」
+            await viewModel.loadInitial(site: site)
         }
     }
 
@@ -53,6 +46,24 @@ struct CategoryView: View {
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
+                        // 默认「最新」：分类还没回来也能先看到内容并随时切回
+                        Button {
+                            guard let site = appState.currentSite else { return }
+                            guard viewModel.currentCategory != nil else { return }
+                            Task { await viewModel.loadVideoList(site: site, category: nil) }
+                        } label: {
+                            Text("最新")
+                                .font(TVBoxTheme.text(13, weight: viewModel.currentCategory == nil ? .heavy : .medium))
+                                .foregroundStyle(viewModel.currentCategory == nil ? .black : TVBoxTheme.textPrimary)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(
+                                    Capsule().fill(viewModel.currentCategory == nil
+                                                   ? TVBoxTheme.accent : TVBoxTheme.surfaceRaised)
+                                )
+                        }
+                        .buttonStyle(.plain)
+
                         ForEach(Array(viewModel.categories.enumerated()), id: \.element.id) { idx, cat in
                             categoryPill(cat: cat, index: idx)
                                 .id(cat.id)
@@ -69,7 +80,7 @@ struct CategoryView: View {
                 }
             }
             .background(TVBoxTheme.surface.opacity(0.6))
-        } else if viewModel.isLoading {
+        } else if viewModel.isLoading && viewModel.videoList.isEmpty {
             HStack(spacing: 8) {
                 ProgressView()
                     .tint(TVBoxTheme.accent)

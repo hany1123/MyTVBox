@@ -76,6 +76,14 @@ final class VideoPlayerViewModel: ObservableObject {
     private var fgObserver: NSObjectProtocol?
     private var didRestoreProgress = false
     private var currentURLString: String?
+    /// 1.5.2 本次播放会话「最后确认过的真实播放位置」。
+    /// loadAndPlay 重建 item 会把 currentTime 归零；自动换源若发生在首帧之前
+    /// 就会拿到 0。这个锚点不会被清零，连续多次换源也不会丢进度。
+    private var sessionResumeAnchor: Double = 0
+    /// 正在执行续播 seek：期间 timeObserver 不得用播放器旧时间覆盖进度
+    private var isApplyingSeek = false
+    /// 提示自动消失的计时任务（1.5.2 统一控制停留时长）
+    private var hintClearTask: Task<Void, Never>?
     private var slowTimer: Task<Void, Never>?
     private var prewarmTask: Task<Void, Never>?
     /// 每次「主动发起播放」自增；异步解析回来后用它判断是否已经切集/换源，
@@ -113,6 +121,14 @@ final class VideoPlayerViewModel: ObservableObject {
     private let bufferingSwitchThreshold: TimeInterval = 12
     /// 单次播放最多自动尝试几条线路
     private let maxAutoSwitch = 12
+
+    /// 1.5.2 自动换源总开关（默认开）。用 object(forKey:) 判空，
+    /// 避免 UserDefaults 尚未写入时 bool(forKey:) 返回 false 把默认行为改成关闭。
+    private var autoSwitchEnabled: Bool {
+        (UserDefaults.standard.object(forKey: "MyTVBox.autoSwitchEnabled") as? Bool) ?? true
+    }
+    /// 云端清洗失败过一次后，本次会话不再重复等待，避免每条线路都卡 3.5 秒
+    private var cloudCleanFailed = false
 
     // MARK: - Init
 
@@ -205,8 +221,10 @@ final class VideoPlayerViewModel: ObservableObject {
     func playEpisode(at index: Int) {
         guard let src = currentSource, src.episodes.indices.contains(index) else { return }
         saveProgress()
+        // 换集必须清掉上一集的锚点，否则自动换源会续到上一集的位置
+        resetResumeAnchor()
         autoTriedSources.removeAll()
-        autoSwitchHint = nil
+        showHint(nil)
         currentEpisodeIndex = index
         let ep = src.episodes[index]
         guard let url = URL(string: ep.url) else {
@@ -222,8 +240,8 @@ final class VideoPlayerViewModel: ObservableObject {
         saveProgress()
         // 用户手动选线路 → 重置自动切换记录
         autoTriedSources.removeAll()
-        autoSwitchHint = nil
-        let preservedTime = currentTime
+        showHint(nil)
+        let preservedTime = max(currentTime, sessionResumeAnchor)
         currentSourceIndex = index
         // 集数索引超界则回 0
         let epCount = sources[index].episodes.count
@@ -268,6 +286,8 @@ final class VideoPlayerViewModel: ObservableObject {
             player.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance)
         }
         currentTime = seconds
+        // 1.5.2 手动拖动也算新的续播锚点
+        sessionResumeAnchor = seconds
     }
 
     func skip(by delta: Double) {
@@ -287,7 +307,8 @@ final class VideoPlayerViewModel: ObservableObject {
     // MARK: - Progress Persistence
 
     func saveProgress() {
-        guard duration > 0, currentTime > 3 else { return }
+        let at = max(currentTime, sessionResumeAnchor)
+        guard duration > 0, at > 3 else { return }
         let epName = currentEpisode?.name ?? "第\(currentEpisodeIndex + 1)集"
         let record = PlayHistoryManager.PlayRecord(
             vodId: progressKey,
@@ -296,7 +317,7 @@ final class VideoPlayerViewModel: ObservableObject {
             episodeName: epName,
             sourceIndex: currentSourceIndex,
             episodeIndex: currentEpisodeIndex,
-            progress: currentTime,
+            progress: at,
             duration: duration,
             timestamp: Date()
         )
@@ -448,6 +469,109 @@ final class VideoPlayerViewModel: ObservableObject {
         prewarmTask = nil
     }
 
+    // MARK: - 1.5.2 提示时长 / 稳健续播
+
+    /// 统一控制「正在切线路 / 解析 / 去广告」这类提示的停留时长。
+    /// hold=nil 表示粘性提示（等后续状态覆盖），否则到点自动消失。
+    /// 旧实现只在 readyToPlay 后固定等 4 秒才清，云端清洗又要等 8 秒，
+    /// 叠加起来转圈浮层能挡十几秒，观感上像卡死。
+    private func showHint(_ text: String?, hold: TimeInterval? = 2.0) {
+        hintClearTask?.cancel()
+        hintClearTask = nil
+        autoSwitchHint = text
+        guard let text, let hold, hold > 0 else { return }
+        hintClearTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(hold * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            guard let self, self.autoSwitchHint == text else { return }
+            self.autoSwitchHint = nil
+        }
+    }
+
+    /// 换集时清空上一集的续播状态
+    private func resetResumeAnchor() {
+        sessionResumeAnchor = 0
+        isApplyingSeek = false
+        didRestoreProgress = false
+        hintClearTask?.cancel()
+        hintClearTask = nil
+    }
+
+    /// 1.5.2 稳健续播。
+    ///
+    /// 旧实现只在 readyToPlay 里一次性 seek(to:)，有三个坑：
+    /// 1. HLS 刚 ready 时 seekableTimeRanges 常常还是空的，seek 被静默丢弃 → 从头播；
+    /// 2. 没有 completion 校验，失败也不知道；
+    /// 3. timeObserver 每 0.5s 用播放器旧时间覆盖 currentTime，把续播锚点冲掉。
+    /// 现在改成：等待可 seek 区间 → 带 completion 的宽容差 seek → 失败重试，
+    /// 期间用 isApplyingSeek 挡住 timeObserver，并用 sessionResumeAnchor 兜住连续换源。
+    private func applyResume(restore: Bool,
+                             seekTo: Double?,
+                             epoch: UInt64,
+                             attempt: Int = 0) {
+        guard playEpoch == epoch, player.currentItem != nil else { return }
+
+        var target: Double?
+        if let s = seekTo, s > 1 {
+            target = s
+        } else if restore, !didRestoreProgress, let p = loadProgress() {
+            target = p
+        } else if sessionResumeAnchor > 3 {
+            target = sessionResumeAnchor
+        }
+        guard let raw = target, raw > 1 else { return }
+
+        // 时长已知时别 seek 到片尾，避免直接触发下一集
+        var seconds = raw
+        if duration > 5, duration.isFinite {
+            seconds = min(seconds, max(0, duration - 3))
+        }
+        guard seconds > 1 else { return }
+
+        let item = player.currentItem!
+        if item.seekableTimeRanges.isEmpty {
+            guard attempt < 6 else {
+                // 直播型 / 不可 seek 的流：明确告知，别让人以为又坏了
+                isApplyingSeek = false
+                showHint("该源不支持续播，已从头播放", hold: 2.0)
+                return
+            }
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled else { return }
+                self?.applyResume(restore: restore, seekTo: seekTo,
+                                  epoch: epoch, attempt: attempt + 1)
+            }
+            return
+        }
+
+        isApplyingSeek = true
+        let cmTime = CMTime(seconds: seconds, preferredTimescale: 600)
+        let tolerance = CMTime(seconds: 2, preferredTimescale: 600)
+        player.seek(to: cmTime,
+                    toleranceBefore: tolerance,
+                    toleranceAfter: tolerance) { [weak self] finished in
+            Task { @MainActor [weak self] in
+                guard let self, self.playEpoch == epoch else { return }
+                if finished {
+                    self.currentTime = seconds
+                    self.sessionResumeAnchor = seconds
+                    self.didRestoreProgress = true
+                    self.isApplyingSeek = false
+                } else if attempt < 6 {
+                    self.isApplyingSeek = false
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    guard !Task.isCancelled else { return }
+                    self.applyResume(restore: restore, seekTo: seekTo,
+                                     epoch: epoch, attempt: attempt + 1)
+                } else {
+                    self.isApplyingSeek = false
+                    self.showHint("该源不支持续播，已从头播放", hold: 2.0)
+                }
+            }
+        }
+    }
+
     // MARK: - 加载与播放
 
     private func loadAndPlay(url: URL,
@@ -466,18 +590,18 @@ final class VideoPlayerViewModel: ObservableObject {
             isLoading = true
             isBuffering = false
             errorMessage = nil
-            autoSwitchHint = "正在获取播放地址…"
+            showHint("正在获取播放地址…", hold: nil)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let real = await MddCloudService.shared.resolvePlayURL(urlString)
                 guard self.playEpoch == epoch else { return }
                 guard let real else {
-                    self.autoSwitchHint = nil
+                    self.showHint(nil)
                     self.errorMessage = "该线路暂时无法获取播放地址"
                     self.autoSwitchSource(reason: "取流失败")
                     return
                 }
-                self.autoSwitchHint = "取流成功 · 开始播放"
+                self.showHint("取流成功 · 开始播放", hold: 2.0)
                 self.loadAndPlay(url: real,
                                  restoreProgress: restoreProgress,
                                  seekTo: seekTo,
@@ -490,23 +614,28 @@ final class VideoPlayerViewModel: ObservableObject {
         // 1.5.1：云端去广告（默认关）。只对 m3u8 直链生效，失败静默退回原地址，
         // 绝不因为清洗失败导致播不了。
         if allowResolve,
+           !cloudCleanFailed,
            urlString.lowercased().contains(".m3u8"),
            UserDefaults.standard.bool(forKey: "MyTVBox.cloudAdFilterEnabled") {
             isLoading = true
-            autoSwitchHint = "正在云端去广告…"
+            showHint("正在云端去广告…", hold: nil)
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let cleaned = await ParseResolver.shared.cleanM3U8(original: urlString)
+                // 1.5.2 最多等 3.5 秒，服务慢就直接播原地址，别让转圈一直挡着画面
+                let cleaned = await ParseResolver.shared.cleanM3U8(original: urlString, timeout: 3.5)
                 guard self.playEpoch == epoch else { return }
                 if let cleaned {
-                    self.autoSwitchHint = "云端去广告已生效"
+                    // 成功提示只停 1 秒（原来统一 4 秒，观感上像卡住）
+                    self.showHint("云端去广告已生效", hold: 1.0)
                     self.loadAndPlay(url: cleaned,
                                      restoreProgress: restoreProgress,
                                      seekTo: seekTo,
                                      allowResolve: false,
                                      bump: false)
                 } else {
-                    self.autoSwitchHint = nil
+                    // 本次会话后续线路不再重复等待同一个失效服务
+                    self.cloudCleanFailed = true
+                    self.showHint(nil)
                     self.loadAndPlay(url: url,
                                      restoreProgress: restoreProgress,
                                      seekTo: seekTo,
@@ -523,7 +652,7 @@ final class VideoPlayerViewModel: ObservableObject {
             isLoading = true
             isBuffering = false
             errorMessage = nil
-            autoSwitchHint = "正在解析播放地址…"
+            showHint("正在解析播放地址…", hold: nil)
             let rules = parseRules
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -533,12 +662,12 @@ final class VideoPlayerViewModel: ObservableObject {
                 // 解析期间用户已切集 / 换源 / 自动切线路 → 丢弃这次结果
                 guard self.playEpoch == epoch else { return }
                 guard let resolved else {
-                    self.autoSwitchHint = nil
+                    self.showHint(nil)
                     self.errorMessage = "该线路需要解析，但解析服务不可用"
                     self.autoSwitchSource(reason: "解析失败")
                     return
                 }
-                self.autoSwitchHint = "解析成功 · 开始播放"
+                self.showHint("解析成功 · 开始播放", hold: 2.0)
                 self.loadAndPlay(url: resolved,
                                  restoreProgress: restoreProgress,
                                  seekTo: seekTo,
@@ -553,12 +682,7 @@ final class VideoPlayerViewModel: ObservableObject {
         // 同一地址重入（比如误触重播）：只 seek，不重建 item，避免整轮重新缓冲
         if urlString == currentURLString,
            let item = player.currentItem, item.status == .readyToPlay {
-            if let s = seekTo, s > 0 {
-                seek(to: s)
-            } else if restoreProgress, !didRestoreProgress, let p = loadProgress() {
-                didRestoreProgress = true
-                seek(to: p)
-            }
+            applyResume(restore: restoreProgress, seekTo: seekTo, epoch: epoch)
             player.play()
             player.rate = playbackRate
             return
@@ -613,22 +737,13 @@ final class VideoPlayerViewModel: ObservableObject {
                     self.slowTimer?.cancel()
                     let dur = item.duration.seconds
                     if dur.isFinite { self.duration = dur }
-                    // 续播：宽容差定位，避免精确 seek 触发重新拉整段分片
-                    if restoreProgress, !self.didRestoreProgress, let p = self.loadProgress() {
-                        self.didRestoreProgress = true
-                        self.seek(to: p)
-                    } else if let s = seekTo, s > 0 {
-                        self.seek(to: s)
-                    }
+                    // 1.5.2 稳健续播：等可 seek 区间就绪、带 completion 校验、失败重试
+                    self.applyResume(restore: restoreProgress, seekTo: seekTo, epoch: self.playEpoch)
                     self.player.play()
                     self.player.rate = self.playbackRate
-                    // 稳定播放几秒后撤掉「正在切换」提示
-                    Task { [weak self] in
-                        try? await Task.sleep(nanoseconds: 4_000_000_000)
-                        guard !Task.isCancelled else { return }
-                        await MainActor.run { [weak self] in
-                            self?.autoSwitchHint = nil
-                        }
+                    // 兜底：若仍停在「正在…」类粘性提示，起播后给它一个短计时
+                    if let h = self.autoSwitchHint, h.hasPrefix("正在"), self.hintClearTask == nil {
+                        self.showHint(h, hold: 1.2)
                     }
                     // 起播稳定后再预热下一集，避免和当前流抢带宽
                     Task { [weak self] in
@@ -654,7 +769,7 @@ final class VideoPlayerViewModel: ObservableObject {
                         self.errorMessage = nil
                         self.adFilterHint = "过滤加载失败，已自动改为直连"
                         self.loadAndPlay(url: raw, restoreProgress: false,
-                                         seekTo: self.currentTime)
+                                         seekTo: max(self.currentTime, self.sessionResumeAnchor))
                         return
                     }
                     // 不直接报错，先自动换下一条线路
@@ -716,12 +831,14 @@ final class VideoPlayerViewModel: ObservableObject {
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 guard let self = self, self.isLoading else { return }
-                self.slowLineHint = "当前线路较慢，正在准备切换…"
+                self.slowLineHint = self.autoSwitchEnabled
+                    ? "当前线路较慢，正在准备切换…"
+                    : "当前线路较慢，可手动切换线路"
             }
             try? await Task.sleep(nanoseconds: UInt64(switchDelay * 1_000_000_000))
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
-                guard let self = self, self.isLoading else { return }
+                guard let self = self, self.isLoading, self.autoSwitchEnabled else { return }
                 self.autoSwitchSource(reason: "线路连接超时")
             }
         }
@@ -761,6 +878,14 @@ final class VideoPlayerViewModel: ObservableObject {
     /// 1.4.9：优先切到「不同站点」的线路 —— 同一站点的多条线路通常共用同一套后端，
     /// 站点本身故障时换同站线路大概率还是黑屏；跨站线路才是真正的备用源。
     private func autoSwitchSource(reason: String) {
+        // 1.5.2 总开关关闭时只给提示，不擅自换线路
+        guard autoSwitchEnabled else {
+            slowLineHint = nil
+            isBuffering = false
+            bufferingSince = nil
+            showHint("\(reason) · 自动换源已关闭，请手动切换线路", hold: 3.0)
+            return
+        }
         guard sources.count > 1 else {
             slowLineHint = nil
             attemptCrossSite(reason: reason)
@@ -798,12 +923,13 @@ final class VideoPlayerViewModel: ObservableObject {
                   PlayURL.isDirectPlayable(url: eps[epIdx].url),
                   let url = URL(string: eps[epIdx].url) else { continue }
 
-            let resumeAt = currentTime
+            // 优先用真实播放时间，首帧前换源则退回会话锚点
+            let resumeAt = max(currentTime, sessionResumeAnchor)
             autoTriedSources.insert(idx)
             currentSourceIndex = idx
             currentEpisodeIndex = epIdx
             let label = sources[idx].siteName.map { "\(sources[idx].name) · \($0)" } ?? sources[idx].name
-            autoSwitchHint = "自动切换线路 → \(label)"
+            showHint("自动切换线路 → \(label)", hold: 2.5)
             if let s = sources[idx].siteName {
                 activeSiteName = s
             }
@@ -820,6 +946,14 @@ final class VideoPlayerViewModel: ObservableObject {
 
     /// 一部片的所有线路都不可用时，去其它站点搜同名片并续播
     private func attemptCrossSite(reason: String) {
+        // 线路不足时会直接走到这里，所以两个入口都要拦
+        guard autoSwitchEnabled else {
+            slowLineHint = nil
+            isBuffering = false
+            bufferingSince = nil
+            showHint("\(reason) · 自动换源已关闭，请手动切换线路", hold: 3.0)
+            return
+        }
         guard !isCrossSiteSwitching else { return }
         guard let provider = onCrossSiteFallback else {
             errorMessage = "\(reason)\n所有线路均不可用，建议手动切换站点"
@@ -837,9 +971,9 @@ final class VideoPlayerViewModel: ObservableObject {
 
         let title = videoDetail.vodName
         let epIdx = currentEpisodeIndex
-        let seek = currentTime
+        let seek = max(currentTime, sessionResumeAnchor)
         isCrossSiteSwitching = true
-        autoSwitchHint = "正在其它站点搜索「\(title)」…"
+        showHint("正在其它站点搜索「\(title)」…", hold: nil)
         errorMessage = nil
         slowLineHint = nil
 
@@ -848,7 +982,7 @@ final class VideoPlayerViewModel: ObservableObject {
             let candidate = await provider(title, epIdx, seek, excluded)
             guard let candidate = candidate else {
                 self.isCrossSiteSwitching = false
-                self.autoSwitchHint = nil
+                self.showHint(nil)
                 self.errorMessage = "\(reason)\n所有线路及跨站点搜索均不可用，建议切换站点"
                 return
             }
@@ -889,10 +1023,10 @@ final class VideoPlayerViewModel: ObservableObject {
         guard let ep = currentEpisode,
               let url = URL(string: ep.url) else {
             errorMessage = "跨站点未找到可播放的直链"
-            autoSwitchHint = nil
+            showHint(nil)
             return
         }
-        autoSwitchHint = "已切到「\(candidate.siteName)」· 续播"
+        showHint("已切到「\(candidate.siteName)」· 续播", hold: 2.5)
         loadAndPlay(url: url, restoreProgress: false, seekTo: candidate.seekTo)
     }
 
@@ -931,14 +1065,20 @@ final class VideoPlayerViewModel: ObservableObject {
         timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                self.currentTime = time.seconds.isFinite ? time.seconds : 0
+                if !self.isApplyingSeek {
+                    let t = time.seconds.isFinite ? max(0, time.seconds) : 0
+                    self.currentTime = t
+                    // 1.5.2 会话锚点只记真实播放位置，重建 item 不会丢
+                    if t > 1 { self.sessionResumeAnchor = t }
+                }
                 if self.duration <= 0,
                    let dur = self.player.currentItem?.duration.seconds,
                    dur.isFinite {
                     self.duration = dur
                 }
                 self.updateBufferedProgress()
-                self.checkBufferingTimeout()
+                // 续播 seek 期间不判缓冲超时，避免刚 seek 完又被换源
+                if !self.isApplyingSeek { self.checkBufferingTimeout() }
             }
         }
         // Rate / playing / waiting

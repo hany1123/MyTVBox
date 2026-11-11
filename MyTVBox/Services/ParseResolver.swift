@@ -200,7 +200,7 @@ final class ParseResolver: NSObject {
 
     /// 云端去广告：把 m3u8 送进服务端换成过滤后的播放列表。
     /// 不走 waitTurn 闸门（避免与 resolve 互相等待）；失败返回 nil，调用方静默退回直连。
-    func cleanM3U8(original: String, timeout: TimeInterval = 8) async -> URL? {
+    func cleanM3U8(original: String, timeout: TimeInterval = 4) async -> URL? {
         guard original.lowercased().contains(".m3u8"), isPlayable(original) else { return nil }
         guard let target = makeURL(base: Self.cloudAdCleanBase, original: original) else {
             return nil
