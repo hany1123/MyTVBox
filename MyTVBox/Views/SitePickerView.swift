@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// 站点切换选择器
 /// - 1.5.4：JAR 站仍隐藏，但 JS Spider 站（有 bundle / spiderKey）可显示
@@ -7,6 +8,11 @@ struct SitePickerView: View {
 
     @EnvironmentObject var appState: AppState
     @Binding var isPresented: Bool
+
+    // 1.5.5：真机 Spider 诊断（后台跑 JS，结果可一键复制）
+    @State private var showDiagnose = false
+    @State private var diagnoseText = ""
+    @State private var isDiagnosing = false
 
     private var availableSites: [Site] {
         (appState.currentConfig?.sites ?? []).filter {
@@ -44,6 +50,16 @@ struct SitePickerView: View {
             .navigationTitle("CHANNEL")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        runDiagnose()
+                    } label: {
+                        Text(isDiagnosing ? "诊断中…" : "SPIDER 诊断")
+                            .font(TVBoxTheme.mono(10, weight: .semibold))
+                            .foregroundStyle(TVBoxTheme.accent)
+                    }
+                    .disabled(isDiagnosing)
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         isPresented = false
@@ -59,9 +75,59 @@ struct SitePickerView: View {
             .toolbarColorScheme(.dark, for: .navigationBar)
         }
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showDiagnose) {
+            NavigationStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(diagnoseText)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(TVBoxTheme.textPrimary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(14)
+                }
+                .background(TVBoxTheme.bg)
+                .navigationTitle("SPIDER 诊断")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("关闭") { showDiagnose = false }
+                            .foregroundStyle(TVBoxTheme.accent)
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button {
+                            UIPasteboard.general.string = diagnoseText
+                        } label: {
+                            Label("复制报告", systemImage: "doc.on.doc")
+                        }
+                        .foregroundStyle(TVBoxTheme.accent)
+                    }
+                }
+            }
+            .preferredColorScheme(.dark)
+        }
         .task {
             // 打开选择器时后台预热各站点首页，选定后立刻有画面
             ContentViewModel.prefetch(sites: availableSites)
+        }
+    }
+
+    // MARK: - 1.5.5 诊断
+
+    /// 诊断要在后台线程跑：bundle 执行 + home() 可能发同步网络请求，
+    /// 放主线程会把整个界面冻住。
+    private func runDiagnose() {
+        guard !isDiagnosing else { return }
+        isDiagnosing = true
+        let site = appState.currentSite
+        DispatchQueue.global(qos: .userInitiated).async {
+            let report = SpiderEngine.shared.diagnoseSync(site: site)
+            DispatchQueue.main.async {
+                self.diagnoseText = report
+                self.isDiagnosing = false
+                self.showDiagnose = true
+            }
         }
     }
 

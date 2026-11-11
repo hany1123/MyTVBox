@@ -85,6 +85,16 @@ final class SpiderEngine {
                 return (o && (typeof o === 'object' || typeof o === 'function')) ? o : null;
             }
             function hasMethod(o, m) { return !!(o && typeof o[m] === 'function'); }
+            function hasAnyFn(o) {
+                if (!o) return false;
+                for (var k in aliases) {
+                    var ns = aliases[k] || [];
+                    for (var i = 0; i < ns.length; i++) {
+                        if (typeof o[ns[i]] === 'function') return true;
+                    }
+                }
+                return hasMethod(o, 'init') || hasMethod(o, 'getName');
+            }
             function pickSpider() {
                 // 1.5.4：多 spider bundle 会把各模块挂到注册表里，按 key 精确取
                 var regs = ['__JS_SPIDER__', '__SPIDERS__', 'spiders', '__spiders__',
@@ -98,8 +108,11 @@ final class SpiderEngine {
                         var hit = look(reg[key]);
                         if (hit) return hit;
                     }
-                    if (hasMethod(reg, 'home') || hasMethod(reg, 'category')) {
+                    if (hasAnyFn(reg)) {
                         if (!key) return reg;
+                    }
+                    if (look(reg.default) && hasAnyFn(reg.default)) {
+                        if (!key) return reg.default;
                     }
                 }
                 if (key) {
@@ -110,7 +123,8 @@ final class SpiderEngine {
                     var ex = look(module.exports);
                     if (ex) {
                         if (key && look(ex[key])) return ex[key];
-                        if (hasMethod(ex, 'home') || hasMethod(ex, 'category')) return ex;
+                        if (hasAnyFn(ex)) return ex;
+                        if (look(ex.default) && hasAnyFn(ex.default)) return ex.default;
                     }
                 }
                 var single = look(G.__JS_SPIDER__);
@@ -118,6 +132,14 @@ final class SpiderEngine {
                 return G;   // 顶层函数兜底
             }
             var target = pickSpider();
+            // 有些 bundle 注册的是构造函数（class / prototype 方法），
+            // 直接调 target.homeContent 会是 undefined，要实例化一次。
+            if (typeof target === 'function' && !hasAnyFn(target)) {
+                try { var inst = new target(); if (hasAnyFn(inst)) target = inst; } catch (e) {}
+            }
+            if (target && target.default && !hasAnyFn(target)) {
+                try { if (hasAnyFn(target.default)) target = target.default; } catch (e) {}
+            }
             function invoke(m, a) {
                 var names = (aliases && aliases[m]) ? aliases[m] : [m];
                 var lastErr = null;
@@ -182,6 +204,130 @@ final class SpiderEngine {
             return dict
         }
         return nil
+    }
+
+    // MARK: - 1.5.5 真机诊断
+
+    /// 在后台线程同步执行，输出一段可直接复制给开发者的运行时事实。
+    /// 不依赖网络抓包，也不需要 Xcode 控制台。
+    func diagnoseSync(site: Site?) -> String {
+        var out: [String] = []
+        out.append("=== MyTVBox 1.5.5 Spider 诊断 ===")
+        out.append("site.name     : \(site?.name ?? "nil")")
+        out.append("site.key      : \(site?.key ?? "nil")")
+        out.append("site.spiderKey: \(site?.spiderKey ?? "nil")")
+        let typeText = site.map { String($0.type) } ?? "nil"
+        out.append("site.type     : \(typeText)")
+        let keys = SpiderContextManager.shared.registeredKeys()
+        out.append("moduleCode 注册数: \(keys.count)")
+        out.append("moduleCode keys  : \(keys.prefix(24).joined(separator: ", "))")
+
+        guard let site,
+              let code = SpiderContextManager.shared.moduleCode(for: site.key) else {
+            out.append("")
+            out.append("!! 该站点没有注册 bundle（moduleCode）。")
+            out.append("若上面的 keys 里有相近 key，说明合并池改名后没同步。")
+            return out.joined(separator: "\n")
+        }
+
+        out.append("bundle 字节数    : \(code.utf8.count)")
+        out.append("")
+        out.append("--- bundle HEAD (1200) ---")
+        out.append(String(code.prefix(1200)))
+        out.append("--- bundle TAIL (600) ---")
+        out.append(String(code.suffix(600)))
+        out.append("")
+        out.append("--- 源码关键字出现次数 ---")
+        for n in ["home", "homeContent", "homeVod", "category", "categoryContent",
+                  "detail", "detailContent", "play", "playerContent", "search",
+                  "searchContent", "init", "class Spider", "__JS_SPIDER__",
+                  "module.exports", "exports.", "globalThis", "window.", "require(",
+                  "document", "navigator", "axios", "fetch"] {
+            let c = code.components(separatedBy: n).count - 1
+            if c > 0 { out.append("  \(n) x\(c)") }
+        }
+
+        let key = site.spiderKey ?? ""
+        let context = createContext()
+        context.evaluateScript(code)
+        if let e = context.exception, !e.isUndefined {
+            out.append("")
+            out.append("!! bundle 注入异常: \(e.toString() ?? "unknown")")
+            context.exception = nil
+        } else {
+            out.append("bundle 注入异常  : (none)")
+        }
+
+        let probe = """
+        (function() {
+            var G = (typeof __MTV_G__ !== 'undefined') ? __MTV_G__ : (function(){ return this; })();
+            var key = \(jsonString(key));
+            var regs = ['__JS_SPIDER__','__SPIDERS__','spiders','__spiders__','modules',
+                        '__MODULES__','spiderMap','SPIDERS','JS_SPIDER','__jsSpiders__',
+                        'jsSpiders','__SPIDER__','SPIDER','spider','spiderList','__catSpiders__'];
+            var lines = [];
+            function fns(o) {
+                var a = [];
+                if (!o) return a;
+                try { for (var k in o) { if (typeof o[k] === 'function') a.push(k); } } catch (e) {}
+                return a.slice(0, 40);
+            }
+            function keys(o) {
+                try { return Object.keys(o).slice(0, 30); } catch (e) { return []; }
+            }
+            var hit = null;
+            for (var i = 0; i < regs.length; i++) {
+                var o = G[regs[i]];
+                if (o === undefined || o === null) continue;
+                lines.push(regs[i] + ' type=' + (typeof o) + ' keys=[' + keys(o).join(',') + '] fns=[' + fns(o).join(',') + ']');
+                if (key && o[key]) {
+                    hit = o[key];
+                    lines.push('  >> HIT [' + key + '] keys=[' + keys(hit).join(',') + '] fns=[' + fns(hit).join(',') + ']');
+                }
+                if (o.default) lines.push('  >> default keys=[' + keys(o.default).join(',') + '] fns=[' + fns(o.default).join(',') + ']');
+            }
+            try {
+                var ex = module.exports;
+                lines.push('module.exports type=' + (typeof ex) + ' keys=[' + keys(ex).join(',') + '] fns=[' + fns(ex).join(',') + ']');
+                if (!hit && key && ex && ex[key]) hit = ex[key];
+                if (ex && ex.default) {
+                    lines.push('  >> module.exports.default keys=[' + keys(ex.default).join(',') + '] fns=[' + fns(ex.default).join(',') + ']');
+                    if (!hit) hit = ex.default;
+                }
+                if (!hit && ex && fns(ex).length > 0) hit = ex;
+            } catch (e) { lines.push('module.exports probe err: ' + e); }
+            lines.push('GLOBAL fns=[' + fns(G).slice(0, 60).join(',') + ']');
+            lines.push('GLOBAL spider-ish keys=[' + keys(G).filter(function(k){ return /spider|js_|catpaw/i.test(k); }).slice(0, 40).join(',') + ']');
+            lines.push('TARGET: ' + (hit ? ('keys=[' + keys(hit).join(',') + '] fns=[' + fns(hit).join(',') + ']') : 'NOT FOUND'));
+            if (hit) {
+                var f = hit.homeContent || hit.home || hit.homeVod;
+                if (typeof f === 'function') {
+                    try {
+                        var v = f.call(hit);
+                        if (v && typeof v.then === 'function') lines.push('HOME_RESULT: Promise');
+                        else lines.push('HOME_RESULT: ' + String(JSON.stringify(v)).slice(0, 500));
+                    } catch (e) { lines.push('HOME_RESULT ERROR: ' + e); }
+                } else {
+                    lines.push('HOME_RESULT: no home fn; target fns=[' + fns(hit).join(',') + ']');
+                }
+            }
+            return lines;
+        })()
+        """
+        let arr = (context.evaluateScript(probe)?.toArray() as? [String]) ?? []
+        out.append("")
+        out.append("--- 运行时结构 ---")
+        out.append(contentsOf: arr)
+        if let e = context.exception, !e.isUndefined {
+            out.append("!! probe 异常: \(e.toString() ?? "unknown")")
+            context.exception = nil
+        }
+
+        let logs = context.objectForKeyedSubscript("__mtv_logs__")?.toArray() ?? []
+        out.append("")
+        out.append("--- console 日志 (\(logs.count)) ---")
+        for l in logs.prefix(40) { out.append("  \(l)") }
+        return out.joined(separator: "\n")
     }
 
     // MARK: - 1.5.4 运行时补充
@@ -286,12 +432,31 @@ final class SpiderEngine {
     /// JSValue → 字典；兼容 spider 返回 JSON 字符串（如 play() 的 JSON.stringify）
     private func resultToDict(_ value: JSValue?) -> [String: Any]? {
         guard let value, !value.isUndefined, !value.isNull else { return nil }
-        if let dict = value.toObject() as? [String: Any] { return dict }
-        guard let str = value.toString(), let data = str.data(using: .utf8) else { return nil }
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            return json
+        if let dict = value.toObject() as? [String: Any] { return normalizeSpiderDict(dict) }
+        guard let str = value.toString(), let data = str.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let json = obj as? [String: Any] else { return nil }
+        return normalizeSpiderDict(json)
+    }
+
+    /// 各家 Spider 字段名不统一：class/classes/types、list/data/vodlist …
+    private func normalizeSpiderDict(_ dict: [String: Any]) -> [String: Any] {
+        var out = dict
+        if out["class"] == nil {
+            for k in ["classes", "types", "cate", "filters"] {
+                if let v = dict[k] { out["class"] = v; break }
+            }
         }
-        return nil
+        if out["list"] == nil {
+            for k in ["data", "vodlist", "videos", "items", "result"] {
+                if let v = dict[k], v is [[String: Any]] { out["list"] = v; break }
+            }
+            if out["list"] == nil, let nested = dict["data"] as? [String: Any] {
+                if let v = nested["list"] { out["list"] = v }
+                if out["class"] == nil, let v = nested["class"] { out["class"] = v }
+            }
+        }
+        return out
     }
 
     // MARK: - 内部工具
@@ -418,6 +583,17 @@ final class SpiderEngine {
             "  return Promise.resolve(resp);",
             "}",
             "function print(x){ try { console.log(String(x)); } catch(e){} }",
+            "var document = { cookie: '', title: '', referrer: '',",
+            "  getElementById: function(){ return null; },",
+            "  querySelector: function(){ return null; },",
+            "  querySelectorAll: function(){ return []; },",
+            "  createElement: function(){ return { style: {}, setAttribute: function(){}, appendChild: function(){} }; },",
+            "  addEventListener: function(){}, head: { appendChild: function(){} }, body: { appendChild: function(){} } };",
+            "var navigator = { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X) AppleWebKit/605.1.15', platform: 'iPhone', language: 'zh-CN', appVersion: '16.3' };",
+            "var location = { href: '', protocol: 'https:', host: '', hostname: '', pathname: '/', search: '' };",
+            "var screen = { width: 1170, height: 2532 };",
+            "var TextEncoder = function(){}; TextEncoder.prototype.encode = function(s){ try { return Array.from(unescape(encodeURIComponent(String(s))), function(c){ return c.charCodeAt(0); }); } catch(e) { return []; } };",
+            "var TextDecoder = function(){}; TextDecoder.prototype.decode = function(a){ try { return decodeURIComponent(escape(String.fromCharCode.apply(null, a))); } catch(e) { return ''; } };",
         ]
         context.evaluateScript(lines.joined(separator: "\n"))
     }
@@ -425,11 +601,23 @@ final class SpiderEngine {
 
     private func setupConsole(context: JSContext) {
         context.evaluateScript("""
+        var __mtv_logs__ = [];
+        function __mtv_log__(level, args) {
+            try {
+                var s = [];
+                for (var i = 0; i < args.length; i++) {
+                    try { s.push((typeof args[i] === 'object') ? JSON.stringify(args[i]) : String(args[i])); }
+                    catch (e) { s.push(String(args[i])); }
+                }
+                if (__mtv_logs__.length < 200) __mtv_logs__.push(level + ': ' + s.join(' ').slice(0, 400));
+            } catch (e) {}
+        }
         var console = {
-            log: function() {},
-            warn: function() {},
-            error: function() {},
-            info: function() {}
+            log: function(){ __mtv_log__('log', arguments); },
+            warn: function(){ __mtv_log__('warn', arguments); },
+            error: function(){ __mtv_log__('error', arguments); },
+            info: function(){ __mtv_log__('info', arguments); },
+            debug: function(){ __mtv_log__('debug', arguments); }
         };
         """)
     }
@@ -667,25 +855,37 @@ final class SpiderContextManager {
     static let shared = SpiderContextManager()
     private var contexts: [String: JSContext] = [:]
     private var moduleCodes: [String: String] = [:]
+    // 多订阅并发加载 + 后台诊断会同时读写字典，之前是无锁的
+    private let lock = NSLock()
     private init() {}
 
     func register(key: String, context: JSContext) {
+        lock.lock(); defer { lock.unlock() }
         contexts[key] = context
     }
 
     func context(for key: String) -> JSContext? {
-        contexts[key]
+        lock.lock(); defer { lock.unlock() }
+        return contexts[key]
     }
 
     func registerModuleCode(key: String, code: String) {
+        lock.lock(); defer { lock.unlock() }
         moduleCodes[key] = code
     }
 
     func moduleCode(for key: String) -> String? {
-        moduleCodes[key]
+        lock.lock(); defer { lock.unlock() }
+        return moduleCodes[key]
+    }
+
+    func registeredKeys() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(moduleCodes.keys).sorted()
     }
 
     func remove(key: String) {
+        lock.lock(); defer { lock.unlock() }
         contexts.removeValue(forKey: key)
         moduleCodes.removeValue(forKey: key)
     }
