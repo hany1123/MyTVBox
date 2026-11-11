@@ -1,85 +1,72 @@
 import Foundation
-import Darwin
+import AVFoundation
 
-// MARK: - 本地 m3u8 代理（1.4.7）
+// MARK: - m3u8 广告过滤路由（1.4.7.1）
 //
-// AVPlayer 无法在播放过程中跳过某个分片，唯一可行的去广告时机是「拿到 playlist 之前」。
-// 这里在 App 进程内起一个只监听 127.0.0.1 的极简 HTTP/1.1 服务：
-//   AVPlayer → /playlist?u=<base64url(原始 m3u8)> → 本代理拉原始 playlist
-//            → M3U8AdFilter 剔除广告段、把分片改成绝对地址 → 回吐给 AVPlayer
-// 分片仍由 AVPlayer 直连 CDN，不经过本进程转发，因此没有额外带宽/解码开销。
+// 1.4.7 初版用「App 内 127.0.0.1 socket 服务」代理 playlist，真机上全军覆没：
+// HLS 请求由系统媒体进程发起，跨进程 loopback 在 iOS 上不可靠。
+// 这里改用 Apple 官方的 AVAssetResourceLoader + 自定义 scheme：
+//   · 不需要监听端口，不存在 socket / ATS / loopback 问题
+//   · 只有 playlist 请求进 delegate，分片仍是绝对 http(s) 地址，由 AVPlayer 直连 CDN
+//   · 上游拉取失败时通过 loadingRequest.redirect 直接退回原始 m3u8
 //
-// 端口由系统分配（bind port=0），不占用固定端口，也不会和宝盒那类 9978 本地服务冲突。
+// 开关默认关闭：保证升级后播放行为与 1.4.6 完全一致，验证过再手动开启。
 
-final class LocalPlaylistProxy {
-
-    static let shared = LocalPlaylistProxy()
+enum LocalPlaylistProxy {
 
     static let enabledKey = "MyTVBox.adFilterEnabled"
+    static let scheme = "mytvboxhls"
 
-    /// 默认开启；用户在「接口管理 → 播放设置」里可一键关掉，关掉后完全退回 1.4.6 直连路径
+    /// 默认关闭；1.4.8 首次启动强制关一次，避免 1.4.7 残留设置继续拖垮播放。
+    /// 之后完全尊重用户在「接口管理 → 播放设置」里的选择。
     static var isEnabled: Bool {
-        guard let value = UserDefaults.standard.object(forKey: enabledKey) else {
-            return true
+        let defaults = UserDefaults.standard
+        let migratedKey = "MyTVBox.adFilterMigrated148"
+        if !defaults.bool(forKey: migratedKey) {
+            defaults.set(false, forKey: enabledKey)
+            defaults.set(true, forKey: migratedKey)
+            return false
+        }
+        guard let value = defaults.object(forKey: enabledKey) else {
+            return false
         }
         if let flag = value as? Bool { return flag }
         if let number = value as? NSNumber { return number.boolValue }
-        return true
+        return false
     }
 
-    private static let safariUA =
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X) "
-        + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Mobile/15E148 Safari/604.1"
-
-    private var listenFD: Int32 = -1
-    private var port: Int = 0
-    private var running = false
-    private let stateLock = NSLock()
-    private let summaryLock = NSLock()
-    private var pendingSummary: String?
-    private let session: URLSession
-
-    private init() {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 12
-        cfg.timeoutIntervalForResource = 20
-        cfg.httpAdditionalHeaders = ["User-Agent": Self.safariUA]
-        session = URLSession(configuration: cfg)
+    static func isProxied(_ url: URL) -> Bool {
+        url.scheme?.lowercased() == scheme
     }
 
-    // MARK: - 对外
-
-    /// 生成本地代理地址；启动失败时返回 nil（调用方自动退回直连）
-    func proxyURL(for original: URL) -> URL? {
-        guard ensureStarted(), port > 0 else { return nil }
-        return URL(string: encodedProxyURL(for: original.absoluteString))
+    /// 把原始 m3u8 包装成自定义 scheme，交给 AVAssetResourceLoader
+    static func proxiedURL(for original: URL) -> URL? {
+        URL(string: encodedURLString(for: original.absoluteString))
     }
 
-    /// 取一次最近一次过滤结果（读完即清空），供播放器短暂提示
-    func consumeSummary() -> String? {
-        summaryLock.lock()
-        defer { summaryLock.unlock() }
-        let value = pendingSummary
-        pendingSummary = nil
-        return value
-    }
-
-    private func storeSummary(_ value: String) {
-        summaryLock.lock()
-        pendingSummary = value
-        summaryLock.unlock()
-    }
-
-    private func encodedProxyURL(for absolute: String) -> String {
-        guard port > 0, let data = absolute.data(using: .utf8) else { return absolute }
+    static func encodedURLString(for absolute: String) -> String {
+        guard let data = absolute.data(using: .utf8) else { return absolute }
         let encoded = data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
-        return "http://127.0.0.1:\(port)/playlist?u=\(encoded)"
+        return "\(scheme)://playlist?u=\(encoded)"
     }
 
-    private func decodeOriginal(_ encoded: String) -> URL? {
+    static func originalURL(from proxied: URL) -> URL? {
+        var raw: String?
+        if let comps = URLComponents(url: proxied, resolvingAgainstBaseURL: false) {
+            raw = comps.queryItems?.first(where: { $0.name == "u" })?.value
+        }
+        if raw == nil {
+            let text = proxied.absoluteString
+            if let range = text.range(of: "?u=") {
+                raw = String(text[range.upperBound...])
+            }
+        }
+        guard let encoded = raw?.split(separator: "&").first.map(String.init) else {
+            return nil
+        }
         var base64 = encoded
             .replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
@@ -90,201 +77,111 @@ final class LocalPlaylistProxy {
         return URLNormalizer.url(text) ?? URL(string: text)
     }
 
-    // MARK: - Socket 启动
+    // MARK: - 过滤结果提示
 
-    private func ensureStarted() -> Bool {
-        stateLock.lock()
-        let already = running
-        stateLock.unlock()
-        if already { return true }
+    private static let summaryLock = NSLock()
+    private static var pendingSummary: String?
 
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
+    static func storeSummary(_ value: String) {
+        summaryLock.lock()
+        pendingSummary = value
+        summaryLock.unlock()
+    }
 
-        var reuse: Int32 = 1
-        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
-                       &reuse, socklen_t(MemoryLayout<Int32>.size))
-        // SO_NOSIGPIPE：客户端提前断开时不让 send() 触发 SIGPIPE 杀进程
-        var noSigPipe: Int32 = 1
-        _ = setsockopt(fd, SOL_SOCKET, 0x1022,
-                       &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+    /// 取一次最近一次过滤结果（读完即清空）
+    static func consumeSummary() -> String? {
+        summaryLock.lock()
+        defer { summaryLock.unlock() }
+        let value = pendingSummary
+        pendingSummary = nil
+        return value
+    }
+}
 
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0                       // 由系统分配空闲端口
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+// MARK: - AVAssetResourceLoader 实现
 
-        let bindResult = withUnsafePointer(to: &addr) { pointer -> Int32 in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPointer in
-                bind(fd, sockPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bindResult == 0 else {
-            close(fd)
+final class HLSPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
+
+    static let shared = HLSPlaylistLoader()
+
+    private static let safariUA =
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X) "
+        + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Mobile/15E148 Safari/604.1"
+
+    private let session: URLSession
+    private let loaderQueue = DispatchQueue(label: "mytvbox.hls.playlist")
+
+    private override init() {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 12
+        cfg.timeoutIntervalForResource = 20
+        cfg.httpAdditionalHeaders = ["User-Agent": Self.safariUA]
+        session = URLSession(configuration: cfg)
+        super.init()
+    }
+
+    /// 把自定义 scheme 的 asset 绑定到本 delegate。delegate 不被 asset 强持有，故用单例。
+    func attach(to asset: AVURLAsset) {
+        asset.resourceLoader.setDelegate(self, queue: loaderQueue)
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
+    ) -> Bool {
+        guard let url = loadingRequest.request.url,
+              LocalPlaylistProxy.isProxied(url),
+              let original = LocalPlaylistProxy.originalURL(from: url) else {
             return false
         }
 
-        var bound = sockaddr_in()
-        var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &bound) { pointer -> Int32 in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPointer in
-                getsockname(fd, sockPointer, &boundLength)
-            }
-        }
-        guard nameResult == 0, listen(fd, 16) == 0 else {
-            close(fd)
-            return false
-        }
-        let actualPort = Int(UInt16(bigEndian: bound.sin_port))
-
-        stateLock.lock()
-        if running {
-            stateLock.unlock()
-            close(fd)
-            return true
-        }
-        listenFD = fd
-        port = actualPort
-        running = true
-        stateLock.unlock()
-
-        let socketFD = fd
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.acceptLoop(fd: socketFD)
-        }
-        return true
-    }
-
-    private func acceptLoop(fd: Int32) {
-        while true {
-            stateLock.lock()
-            let alive = running
-            stateLock.unlock()
-            if !alive { break }
-
-            let client = accept(fd, nil, nil)
-            if client < 0 { continue }
-            var noSigPipe: Int32 = 1
-            _ = setsockopt(client, SOL_SOCKET, 0x1022,
-                           &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-            let clientFD = client
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                self?.handle(client: clientFD)
-            }
-        }
-        close(fd)
-    }
-
-    // MARK: - 请求处理
-
-    private func handle(client: Int32) {
-        defer { close(client) }
-
-        var buffer = [UInt8](repeating: 0, count: 16_384)
-        let capacity = buffer.count
-        var total = 0
-        while total < capacity {
-            let read: Int = buffer.withUnsafeMutableBytes { raw -> Int in
-                guard let base = raw.baseAddress else { return -1 }
-                return recv(client, base.advanced(by: total), capacity - total, 0)
-            }
-            if read <= 0 { break }
-            total += read
-            if total >= 4,
-               let text = String(bytes: buffer[0..<total], encoding: .utf8),
-               text.contains("\r\n\r\n") { break }
-        }
-        guard total > 0,
-              let request = String(bytes: buffer[0..<total], encoding: .utf8),
-              let firstLine = request.split(separator: "\n").first else { return }
-
-        let parts = firstLine.split(separator: " ")
-        guard parts.count >= 2 else { return }
-        let target = String(parts[1])
-        let prefix = "/playlist?u="
-        guard target.hasPrefix(prefix) else {
-            writeResponse(client, status: "404 Not Found", type: "text/plain",
-                          body: Data("not found".utf8))
-            return
-        }
-        let encoded = String(target.dropFirst(prefix.count))
-            .split(separator: "&").first.map(String.init) ?? ""
-        guard let original = decodeOriginal(encoded) else {
-            writeResponse(client, status: "400 Bad Request", type: "text/plain",
-                          body: Data("bad url".utf8))
-            return
-        }
-        guard let fetched = fetchPlaylist(original) else {
-            writeResponse(client, status: "502 Bad Gateway", type: "text/plain",
-                          body: Data("upstream failed".utf8))
-            return
-        }
-
-        let text = decodeText(fetched.data)
-        let cleaned = M3U8AdFilter.clean(text, baseURL: fetched.finalURL) { [weak self] absolute in
-            self?.encodedProxyURL(for: absolute) ?? absolute
-        }
-        if let summary = cleaned.stats.summary {
-            storeSummary(summary)
-        }
-        writeResponse(client,
-                      status: "200 OK",
-                      type: "application/vnd.apple.mpegurl",
-                      body: Data(cleaned.text.utf8))
-    }
-
-    // MARK: - 上游拉取 / 响应写回
-
-    private func fetchPlaylist(_ url: URL) -> (data: Data, finalURL: URL)? {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: original)
         request.timeoutInterval = 12
         request.setValue(Self.safariUA, forHTTPHeaderField: "User-Agent")
         request.setValue("*/*", forHTTPHeaderField: "Accept")
-        if let scheme = url.scheme, let host = url.host {
+        if let scheme = original.scheme, let host = original.host {
             request.setValue("\(scheme)://\(host)/", forHTTPHeaderField: "Referer")
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        var payload: Data?
-        var finalURL: URL?
         let task = session.dataTask(with: request) { data, response, error in
-            if error == nil, let data = data {
-                payload = data
-                finalURL = response?.url
+            DispatchQueue.main.async {
+                guard let data = data, error == nil else {
+                    // 上游失败：直接让 AVFoundation 重定向回原始 m3u8，播放不受影响
+                    loadingRequest.redirect = URLRequest(url: original)
+                    loadingRequest.finishLoading()
+                    return
+                }
+                let text = Self.decodeText(data)
+                let finalURL = response?.url ?? original
+                // master playlist 只做 URI 绝对化：variant 保持 http(s) 直连，
+                // 不改写为自定义 scheme，避免 AVFoundation 在解析阶段拒绝
+                let cleaned = M3U8AdFilter.clean(text, baseURL: finalURL)
+                if let summary = cleaned.stats.summary {
+                    LocalPlaylistProxy.storeSummary(summary)
+                }
+                let payload = Data(cleaned.text.utf8)
+                loadingRequest.contentInformationRequest?.contentType =
+                    "application/vnd.apple.mpegurl"
+                loadingRequest.contentInformationRequest?.isByteRangeAccessSupported = false
+                loadingRequest.contentInformationRequest?.contentLength = Int64(payload.count)
+                loadingRequest.dataRequest?.respond(with: payload)
+                loadingRequest.finishLoading()
             }
-            semaphore.signal()
         }
         task.resume()
-        _ = semaphore.wait(timeout: .now() + 13)
-        guard let data = payload else { return nil }
-        return (data, finalURL ?? url)
+        return true
     }
 
-    private func decodeText(_ data: Data) -> String {
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        shouldWaitForRenewalOfRequestedResource renewalRequest: AVAssetResourceRenewalRequest
+    ) -> Bool {
+        false
+    }
+
+    private static func decodeText(_ data: Data) -> String {
         if let s = String(data: data, encoding: .utf8) { return s }
         if let s = String(data: data, encoding: .isoLatin1) { return s }
         return String(decoding: data, as: UTF8.self)
-    }
-
-    private func writeResponse(_ fd: Int32, status: String, type: String, body: Data) {
-        let header = "HTTP/1.1 \(status)\r\n"
-            + "Content-Type: \(type)\r\n"
-            + "Content-Length: \(body.count)\r\n"
-            + "Cache-Control: no-store, no-cache, must-revalidate\r\n"
-            + "Access-Control-Allow-Origin: *\r\n"
-            + "Connection: close\r\n\r\n"
-        var bytes = Data(header.utf8)
-        bytes.append(body)
-        let count = bytes.count
-        bytes.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            var sent = 0
-            while sent < count {
-                let written = send(fd, base.advanced(by: sent), count - sent, 0)
-                if written <= 0 { break }
-                sent += written
-            }
-        }
     }
 }

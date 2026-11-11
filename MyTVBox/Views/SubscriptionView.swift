@@ -14,9 +14,9 @@ struct SubscriptionView: View {
 
     @State private var showAddSheet: Bool = false
     @State private var pendingDelete: Subscription? = nil
-    /// m3u8 广告过滤开关（默认开）
+    /// m3u8 广告过滤开关（默认关，保证升级后播放行为与 1.4.6 一致）
     @AppStorage("MyTVBox.adFilterEnabled")
-    private var adFilterEnabled: Bool = true
+    private var adFilterEnabled: Bool = false
 
     var body: some View {
         ZStack {
@@ -226,8 +226,8 @@ struct SubscriptionView: View {
                     .tint(TVBoxTheme.accent)
 
                     Text(adFilterEnabled
-                         ? "播放列表经 App 内本地代理清洗，分片仍直连源站；个别源异常时可关闭。"
-                         : "已关闭，播放直连原始 m3u8（与 1.4.6 行为相同）。")
+                         ? "开启后由系统资源加载器清洗播放列表，分片仍直连源站；加载失败会自动退回直连。"
+                         : "默认关闭，播放直连原始 m3u8。开启后可过滤插播广告，失败会自动直连。")
                         .font(TVBoxTheme.mono(10))
                         .foregroundStyle(TVBoxTheme.textMuted)
                 }

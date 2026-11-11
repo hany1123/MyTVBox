@@ -78,6 +78,8 @@ final class VideoPlayerViewModel: ObservableObject {
 
     /// 自动换源状态：本次播放已试过的线路下标
     private var autoTriedSources: Set<Int> = []
+    /// 本次运行内一旦自定义 scheme 加载失败，就永久退回直连，不再尝试过滤
+    private var adProxyBypassed = false
     /// 跨站点换源已经试过的站点（含当前站点），避免来回切同一个坏站
     private var triedSiteKeys: Set<String> = []
     /// 本片所属站点，换源时作为第一排除项
@@ -369,13 +371,14 @@ final class VideoPlayerViewModel: ObservableObject {
 
     // MARK: - Asset / Item 构造
 
-    /// 只对 HLS 走本地代理；mp4 / 其它直链与 1.4.6 行为完全一致。
-    /// 代理启动失败或用户关闭开关时，自动退回原直连地址。
-    private static func applyAdProxy(to url: URL) -> URL {
+    /// 只对 HLS 走自定义 scheme 由 AVAssetResourceLoader 清洗广告；mp4 等保持直连。
+    /// 开关关闭、或本次运行已判定过滤不可用时，完全退回 1.4.6 的直连地址。
+    private func applyAdProxy(to url: URL) -> URL {
         let lower = url.absoluteString.lowercased()
-        guard lower.contains(".m3u8") || lower.contains("/hls/"),
+        guard !adProxyBypassed,
               LocalPlaylistProxy.isEnabled,
-              let proxied = LocalPlaylistProxy.shared.proxyURL(for: url) else {
+              lower.contains(".m3u8") || lower.contains("/hls/"),
+              let proxied = LocalPlaylistProxy.proxiedURL(for: url) else {
             return url
         }
         return proxied
@@ -384,8 +387,7 @@ final class VideoPlayerViewModel: ObservableObject {
     /// 采集站 CDN 普遍做 UA / Referer 校验：默认的 AppleCoreMedia UA 常被降速甚至限流。
     /// 换成 Safari UA + 站点根域 Referer，能明显改善拉流速度。
     private func makeAsset(for originalURL: URL) -> AVURLAsset {
-        // 1.4.7：m3u8 先经本地代理清洗广告分片；其它格式保持直连
-        let url = Self.applyAdProxy(to: originalURL)
+        let url = applyAdProxy(to: originalURL)
         let key = url.absoluteString
         if let cached = assetCache[key] {
             return cached
@@ -397,7 +399,7 @@ final class VideoPlayerViewModel: ObservableObject {
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9"
         ]
-        // 走代理时 asset 的 host 是 127.0.0.1，防盗链头必须仍按原始资源站计算
+        // 走自定义 scheme 时防盗链头必须仍按原始资源站计算
         if let scheme = originalURL.scheme, let host = originalURL.host {
             headers["Referer"] = "\(scheme)://\(host)/"
             headers["Origin"] = "\(scheme)://\(host)"
@@ -409,6 +411,9 @@ final class VideoPlayerViewModel: ObservableObject {
             "AVURLAssetAllowsCellularAccess": true
         ]
         let asset = AVURLAsset(url: url, options: options)
+        if LocalPlaylistProxy.isProxied(url) {
+            HLSPlaylistLoader.shared.attach(to: asset)
+        }
 
         assetCache[key] = asset
         assetOrder.removeAll { $0 == key }
@@ -504,7 +509,7 @@ final class VideoPlayerViewModel: ObservableObject {
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_800_000_000)
             guard let self = self,
-                  let summary = LocalPlaylistProxy.shared.consumeSummary() else { return }
+                  let summary = LocalPlaylistProxy.consumeSummary() else { return }
             self.adFilterHint = summary
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             guard !Task.isCancelled else { return }
@@ -551,6 +556,23 @@ final class VideoPlayerViewModel: ObservableObject {
                     self.isLoading = false
                     self.isBuffering = false
                     self.slowTimer?.cancel()
+                    // 自定义 scheme 加载失败：整轮关掉过滤并用原始地址重建，
+                    // 绝不让「去广告」把正常播放拖垮（1.4.7 回归的最终兜底）
+                    if !self.adProxyBypassed,
+                       LocalPlaylistProxy.isEnabled,
+                       let rawString = self.currentURLString,
+                       let raw = URL(string: rawString),
+                       rawString.lowercased().contains(".m3u8") {
+                        self.adProxyBypassed = true
+                        self.assetCache.removeAll()
+                        self.assetOrder.removeAll()
+                        self.autoTriedSources = []
+                        self.errorMessage = nil
+                        self.adFilterHint = "过滤加载失败，已自动改为直连"
+                        self.loadAndPlay(url: raw, restoreProgress: false,
+                                         seekTo: self.currentTime)
+                        return
+                    }
                     // 不直接报错，先自动换下一条线路
                     self.autoSwitchSource(reason: "当前线路播放失败")
                 default:
