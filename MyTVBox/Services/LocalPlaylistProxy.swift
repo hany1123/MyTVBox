@@ -19,7 +19,12 @@ final class LocalPlaylistProxy {
 
     /// 默认开启；用户在「接口管理 → 播放设置」里可一键关掉，关掉后完全退回 1.4.6 直连路径
     static var isEnabled: Bool {
-        UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
+        guard let value = UserDefaults.standard.object(forKey: enabledKey) else {
+            return true
+        }
+        if let flag = value as? Bool { return flag }
+        if let number = value as? NSNumber { return number.boolValue }
+        return true
     }
 
     private static let safariUA =

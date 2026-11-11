@@ -61,10 +61,12 @@ enum M3U8AdFilter {
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
 
-        if lines.contains(where: {
-            $0.hasPrefix("#EXT-X-STREAM-INF") || $0.hasPrefix("#EXT-X-I-FRAME-STREAM-INF")
-        }) {
+        if lines.contains(where: { $0.hasPrefix("#EXT-X-STREAM-INF") || $0.hasPrefix("#EXT-X-I-FRAME-STREAM-INF") }) {
             return cleanMaster(lines, baseURL: baseURL, proxyURLFor: proxyURLFor)
+        }
+        // 上游返回错误页/HTML 时原样透出，不把非法内容伪装成 playlist
+        guard lines.contains(where: { $0.hasPrefix("#EXTM3U") }) else {
+            return Output(text: raw, stats: Stats())
         }
         return cleanMedia(lines, baseURL: baseURL)
     }
@@ -157,6 +159,17 @@ enum M3U8AdFilter {
                 if segmentScore(seg, mainHost: mainHost) >= 5 {
                     dropped.insert(idx)
                 }
+            }
+        }
+
+        // 保底：宁可漏杀也不误杀。绝不让过滤把整条片子清空，
+        // 也不允许在较长的片子里剔掉一半以上内容（疑似正片被误判为广告组）。
+        if !segments.isEmpty {
+            let totalDuration = segments.reduce(0.0) { $0 + $1.duration }
+            let droppedDuration = dropped.reduce(0.0) { $0 + segments[$1].duration }
+            if dropped.count == segments.count
+                || (totalDuration > 60 && droppedDuration > totalDuration * 0.5) {
+                dropped.removeAll()
             }
         }
 
