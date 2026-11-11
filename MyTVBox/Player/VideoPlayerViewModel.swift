@@ -46,6 +46,9 @@ final class VideoPlayerViewModel: ObservableObject {
     var videoDetail: VideoDetail
     var sources: [PlaySource]
 
+    /// 当前配置里的解析规则（由 View 注入）；非直链线路靠它兑换 m3u8
+    var parseRules: [ParseRule] = []
+
     /// 进度记录用的原始影片 ID：跨站点换源后仍归到同一条记录，避免进度散落
     private let progressKey: String
 
@@ -75,6 +78,9 @@ final class VideoPlayerViewModel: ObservableObject {
     private var currentURLString: String?
     private var slowTimer: Task<Void, Never>?
     private var prewarmTask: Task<Void, Never>?
+    /// 每次「主动发起播放」自增；异步解析回来后用它判断是否已经切集/换源，
+    /// 避免旧线路的解析结果把新线路顶掉。
+    private var playEpoch: UInt64 = 0
 
     /// 自动换源状态：本次播放已试过的线路下标
     private var autoTriedSources: Set<Int> = []
@@ -159,26 +165,14 @@ final class VideoPlayerViewModel: ObservableObject {
     // MARK: - Lifecycle
 
     /// 视图出现时调用：开始首次播放（处理续播）
-    /// 若当前线路是网页地址（需解析器），自动切到第一条可直连的线路
+    /// 直链直接播；网页型地址（官源 / 分享页）交给解析层换 m3u8，
+    /// 解析不出来时由 autoSwitchSource 自动切到其它线路。
     func start() {
-        if let ep = currentEpisode, PlayURL.isDirectPlayable(url: ep.url),
-           let url = URL(string: ep.url) {
+        if let ep = currentEpisode, let url = URL(string: ep.url) {
             loadAndPlay(url: url, restoreProgress: true)
             return
         }
-        // 自动降级：找第一条能直连的线路
-        if let fallback = firstPlayableSourceIndex() {
-            currentSourceIndex = fallback
-            let eps = sources[fallback].episodes
-            let keep = eps.indices.contains(currentEpisodeIndex) ? currentEpisodeIndex : 0
-            currentEpisodeIndex = keep
-            if let url = URL(string: eps[keep].url) {
-                loadAndPlay(url: url, restoreProgress: true)
-                return
-            }
-        }
-        // 一条直链都没有：交给站点级换源，别直接把用户晾在错误页
-        attemptCrossSite(reason: "所有线路都需要解析器")
+        attemptCrossSite(reason: "没有可用的播放地址")
     }
 
     /// 返回第一条含可直连地址的线路下标
@@ -219,10 +213,7 @@ final class VideoPlayerViewModel: ObservableObject {
             errorMessage = "无效的播放地址"
             return
         }
-        guard PlayURL.isDirectPlayable(url: ep.url) else {
-            errorMessage = playbackHint(url: ep.url)
-            return
-        }
+        // 网页型地址不再直接拒绝，交给解析层兑换
         loadAndPlay(url: url, restoreProgress: false)
     }
 
@@ -243,11 +234,7 @@ final class VideoPlayerViewModel: ObservableObject {
             errorMessage = "无效的播放地址"
             return
         }
-        guard PlayURL.isDirectPlayable(url: ep.url) else {
-            errorMessage = playbackHint(url: ep.url)
-            return
-        }
-        // 切线路尝试保留进度
+        // 切线路尝试保留进度；网页型地址由解析层接管
         loadAndPlay(url: url, restoreProgress: false, seekTo: preservedTime)
     }
 
@@ -463,8 +450,47 @@ final class VideoPlayerViewModel: ObservableObject {
 
     // MARK: - 加载与播放
 
-    private func loadAndPlay(url: URL, restoreProgress: Bool, seekTo: Double? = nil) {
+    private func loadAndPlay(url: URL,
+                             restoreProgress: Bool,
+                             seekTo: Double? = nil,
+                             allowResolve: Bool = true,
+                             bump: Bool = true) {
+        // 主动发起的播放会让 epoch 前进；解析成功后的递归调用 bump=false，
+        // 属于同一次请求，不会把自己的结果判成过期。
+        if bump { playEpoch += 1 }
+        let epoch = playEpoch
         let urlString = url.absoluteString
+
+        // 官源 / 分享页这类非直链：先交给解析层换出 m3u8，再走正常播放。
+        // allowResolve=false 防止解析结果又被当普通网页递归解析。
+        if allowResolve, !PlayURL.isDirectPlayable(url: urlString) {
+            isLoading = true
+            isBuffering = false
+            errorMessage = nil
+            autoSwitchHint = "正在解析播放地址…"
+            let rules = parseRules
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let resolved = await ParseResolver.shared.resolve(
+                    original: urlString, rules: rules, timeout: 12)
+                // 解析期间用户已切集 / 换源 / 自动切线路 → 丢弃这次结果
+                guard self.playEpoch == epoch else { return }
+                guard let resolved else {
+                    self.autoSwitchHint = nil
+                    self.errorMessage = "该线路需要解析，但解析服务不可用"
+                    self.autoSwitchSource(reason: "解析失败")
+                    return
+                }
+                self.autoSwitchHint = "解析成功 · 开始播放"
+                self.loadAndPlay(url: resolved,
+                                 restoreProgress: restoreProgress,
+                                 seekTo: seekTo,
+                                 allowResolve: false,
+                                 bump: false)
+            }
+            return
+        }
+
         bufferingSince = nil
 
         // 同一地址重入（比如误触重播）：只 seek，不重建 item，避免整轮重新缓冲
