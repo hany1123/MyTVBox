@@ -26,6 +26,8 @@ final class VideoPlayerViewModel: ObservableObject {
     @Published var errorMessage: String?
     /// 线路过慢提示
     @Published var slowLineHint: String?
+    /// 自动切换线路时的提示（如「正在切到 XX」）
+    @Published var autoSwitchHint: String?
 
     /// 中心按钮该转圈吗
     var isStalling: Bool { isLoading || isBuffering }
@@ -58,6 +60,7 @@ final class VideoPlayerViewModel: ObservableObject {
     private var keepUpObservation: NSKeyValueObservation?
     private var bufferEmptyObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
+    private var failObserver: NSObjectProtocol?
     private var bgObserver: NSObjectProtocol?
     private var fgObserver: NSObjectProtocol?
     private var didRestoreProgress = false
@@ -65,14 +68,10 @@ final class VideoPlayerViewModel: ObservableObject {
     private var slowTimer: Task<Void, Never>?
     private var prewarmTask: Task<Void, Never>?
 
-    /// 卡死检测：播放点长时间不前进就判定为「假死」，自动重连
-    private var lastSampleTime: Double = 0
-    private var stuckSeconds: Double = 0
-    private var stallReloadCount: Int = 0
-    /// 播放点超过这么多秒不前进就重连
-    private let stallRecoverSeconds: Double = 15
-    /// 同一次播放最多自愈几次，避免无人值守时死循环重连
-    private let maxStallRecover = 2
+    /// 自动换源状态：本次播放已试过的线路下标
+    private var autoTriedSources: Set<Int> = []
+    /// 连续处在缓冲状态的时间起点
+    private var bufferingSince: Date?
 
     /// 已解析过的 asset（复用可跳过 m3u8 多级 playlist 的重新拉取）
     private var assetCache: [String: AVURLAsset] = [:]
@@ -82,9 +81,13 @@ final class VideoPlayerViewModel: ObservableObject {
     // MARK: - 播放参数
 
     /// 预读缓冲时长（秒）。系统默认 0 = 自适应，通常只留 2~3 秒，稍微抖一下就卡
-    private let forwardBufferSeconds: Double = 10
+    private let forwardBufferSeconds: Double = 6
     /// 超过这个时间还没 readyToPlay 就提示线路慢
     private let slowLineThreshold: Double = 12
+    /// 连续缓冲超过这个时间就自动换一条线路
+    private let bufferingSwitchThreshold: TimeInterval = 20
+    /// 单次播放最多自动尝试几条线路
+    private let maxAutoSwitch = 8
 
     // MARK: - Init
 
@@ -99,8 +102,9 @@ final class VideoPlayerViewModel: ObservableObject {
             ? sources[self.currentSourceIndex].episodes.count : 0
         self.currentEpisodeIndex = max(0, min(initialEpisodeIndex, max(epCount - 1, 0)))
 
-        // 关键：不要等系统「攒够缓冲」才起播，先出画面再补缓冲
-        player.automaticallyWaitsToMinimizeStalling = false
+        // 缓冲不足时让系统自动等待并在恢复后继续播放。
+        // 设成 false 会「缓冲即暂停且不再自动恢复」——1.4.5 的回归就出在这里。
+        player.automaticallyWaitsToMinimizeStalling = true
 
         configureAudioSession()
         attachObservers()
@@ -111,6 +115,9 @@ final class VideoPlayerViewModel: ObservableObject {
             player.removeTimeObserver(token)
         }
         if let obs = endObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        if let obs = failObserver {
             NotificationCenter.default.removeObserver(obs)
         }
         if let obs = bgObserver {
@@ -183,6 +190,8 @@ final class VideoPlayerViewModel: ObservableObject {
     func playEpisode(at index: Int) {
         guard let src = currentSource, src.episodes.indices.contains(index) else { return }
         saveProgress()
+        autoTriedSources.removeAll()
+        autoSwitchHint = nil
         currentEpisodeIndex = index
         let ep = src.episodes[index]
         guard let url = URL(string: ep.url) else {
@@ -199,6 +208,9 @@ final class VideoPlayerViewModel: ObservableObject {
     func switchSource(to index: Int) {
         guard sources.indices.contains(index) else { return }
         saveProgress()
+        // 用户手动选线路 → 重置自动切换记录
+        autoTriedSources.removeAll()
+        autoSwitchHint = nil
         let preservedTime = currentTime
         currentSourceIndex = index
         // 集数索引超界则回 0
@@ -412,14 +424,9 @@ final class VideoPlayerViewModel: ObservableObject {
 
     // MARK: - 加载与播放
 
-    private func loadAndPlay(url: URL, restoreProgress: Bool, seekTo: Double? = nil,
-                             resetStallCount: Bool = true) {
+    private func loadAndPlay(url: URL, restoreProgress: Bool, seekTo: Double? = nil) {
         let urlString = url.absoluteString
-        if resetStallCount {
-            stallReloadCount = 0
-        }
-        stuckSeconds = 0
-        lastSampleTime = 0
+        bufferingSince = nil
 
         // 同一地址重入（比如误触重播）：只 seek，不重建 item，避免整轮重新缓冲
         if urlString == currentURLString,
@@ -478,6 +485,14 @@ final class VideoPlayerViewModel: ObservableObject {
                     }
                     self.player.play()
                     self.player.rate = self.playbackRate
+                    // 稳定播放几秒后撤掉「正在切换」提示
+                    Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        guard !Task.isCancelled else { return }
+                        await MainActor.run { [weak self] in
+                            self?.autoSwitchHint = nil
+                        }
+                    }
                     // 起播稳定后再预热下一集，避免和当前流抢带宽
                     Task { [weak self] in
                         try? await Task.sleep(nanoseconds: 3_000_000_000)
@@ -488,7 +503,8 @@ final class VideoPlayerViewModel: ObservableObject {
                     self.isLoading = false
                     self.isBuffering = false
                     self.slowTimer?.cancel()
-                    self.errorMessage = item.error?.localizedDescription ?? "播放失败"
+                    // 不直接报错，先自动换下一条线路
+                    self.autoSwitchSource(reason: "当前线路播放失败")
                 default:
                     break
                 }
@@ -510,6 +526,9 @@ final class VideoPlayerViewModel: ObservableObject {
         if let obs = endObserver {
             NotificationCenter.default.removeObserver(obs)
         }
+        if let obs = failObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
         endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
@@ -520,18 +539,36 @@ final class VideoPlayerViewModel: ObservableObject {
                 self.playNextEpisode()
             }
         }
+        // 播放中途失败（分片 404 / 会话失效）也触发自动换线路
+        failObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.autoSwitchSource(reason: "播放中断")
+            }
+        }
     }
 
-    /// 12 秒还没出画面 → 说明这条线路此刻很慢，给用户一个提示
+    /// 12 秒还没出画面 → 先提示；再等 8 秒仍没出画面 → 自动换线路
     private func startSlowLineWatchdog() {
         slowTimer?.cancel()
-        let limit = slowLineThreshold
+        let hintAt = slowLineThreshold
+        let switchDelay = 8.0
         slowTimer = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(limit * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(hintAt * 1_000_000_000))
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 guard let self = self, self.isLoading else { return }
-                self.slowLineHint = "当前线路较慢，可在集数面板切换线路"
+                self.slowLineHint = "当前线路较慢，正在准备切换…"
+            }
+            try? await Task.sleep(nanoseconds: UInt64(switchDelay * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self = self, self.isLoading else { return }
+                self.autoSwitchSource(reason: "线路连接超时")
             }
         }
     }
@@ -539,57 +576,68 @@ final class VideoPlayerViewModel: ObservableObject {
     private func refreshBufferingState() {
         guard let item = player.currentItem else {
             isBuffering = false
+            bufferingSince = nil
             return
         }
         let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
         let empty = item.isPlaybackBufferEmpty
         let keepUp = item.isPlaybackLikelyToKeepUp
         // 只有「已经在放/该放却拿不到数据」才算卡缓冲；首帧阶段算 isLoading
-        isBuffering = !isLoading && (waiting || (empty && !keepUp))
-    }
-
-    /// 免费源常见「连接没断但画面不动」，AVPlayer 自己不会恢复。
-    /// 播放点连续 15 秒不前进就丢掉旧 item 重连，并 seek 回原位。
-    private func checkStallRecovery() {
-        guard !isLoading, duration > 0 else {
-            stuckSeconds = 0
-            lastSampleTime = currentTime
-            return
-        }
-        // 用户主动暂停不算卡死
-        if player.timeControlStatus == .paused {
-            stuckSeconds = 0
-            lastSampleTime = currentTime
-            return
-        }
-        let advanced = abs(currentTime - lastSampleTime) > 0.05
-        if advanced {
-            stuckSeconds = 0
+        let now = !isLoading && (waiting || (empty && !keepUp))
+        isBuffering = now
+        if now {
+            if bufferingSince == nil { bufferingSince = Date() }
         } else {
-            stuckSeconds += 0.5
+            bufferingSince = nil
         }
-        lastSampleTime = currentTime
-
-        guard stuckSeconds >= stallRecoverSeconds else { return }
-        stuckSeconds = 0
-        recoverFromStall()
     }
 
-    private func recoverFromStall() {
-        guard stallReloadCount < maxStallRecover,
-              let urlString = currentURLString,
-              let url = URL(string: urlString) else {
-            slowLineHint = "线路长时间无响应，建议在集数面板切换线路"
+    /// 每 0.5s 由 timeObserver 调用：连续缓冲超过阈值就自动切线路。
+    /// 正常的几秒等待由系统自动恢复，不会走到这里。
+    private func checkBufferingTimeout() {
+        guard let since = bufferingSince,
+              Date().timeIntervalSince(since) >= bufferingSwitchThreshold else { return }
+        bufferingSince = nil
+        autoSwitchSource(reason: "线路缓冲超时")
+    }
+
+    /// 多源自动切换：当前线路失败 / 超时 / 卡住时，自动切到下一条可直连的线路。
+    /// 保留当前集数与播放进度；已试过的线路不会重复尝试。
+    private func autoSwitchSource(reason: String) {
+        guard sources.count > 1 else {
+            errorMessage = "\(reason)\n该片只有一条线路，建议换一个站点搜索"
+            slowLineHint = nil
             return
         }
-        stallReloadCount += 1
-        let resumeAt = currentTime
-        // 丢掉可能已失效的 asset 与会话
-        assetCache.removeValue(forKey: urlString)
-        assetOrder.removeAll { $0 == urlString }
-        currentURLString = nil
-        loadAndPlay(url: url, restoreProgress: false,
-                    seekTo: resumeAt, resetStallCount: false)
+        guard autoTriedSources.count < maxAutoSwitch else {
+            errorMessage = "\(reason)\n已自动尝试多条线路均失败，建议切换站点"
+            slowLineHint = nil
+            return
+        }
+        autoTriedSources.insert(currentSourceIndex)
+
+        let count = sources.count
+        for step in 1...count {
+            let idx = (currentSourceIndex + step) % count
+            if autoTriedSources.contains(idx) { continue }
+            let eps = sources[idx].episodes
+            let epIdx = eps.indices.contains(currentEpisodeIndex) ? currentEpisodeIndex : 0
+            guard eps.indices.contains(epIdx),
+                  PlayURL.isDirectPlayable(url: eps[epIdx].url),
+                  let url = URL(string: eps[epIdx].url) else { continue }
+
+            let resumeAt = currentTime
+            autoTriedSources.insert(idx)
+            currentSourceIndex = idx
+            currentEpisodeIndex = epIdx
+            autoSwitchHint = "自动切换线路 → \(sources[idx].name)"
+            errorMessage = nil
+            slowLineHint = nil
+            loadAndPlay(url: url, restoreProgress: false, seekTo: resumeAt)
+            return
+        }
+        errorMessage = "\(reason)\n所有线路都不可用，建议切换站点"
+        slowLineHint = nil
     }
 
     private func updateBufferedProgress() {
@@ -628,7 +676,7 @@ final class VideoPlayerViewModel: ObservableObject {
                     self.duration = dur
                 }
                 self.updateBufferedProgress()
-                self.checkStallRecovery()
+                self.checkBufferingTimeout()
             }
         }
         // Rate / playing / waiting

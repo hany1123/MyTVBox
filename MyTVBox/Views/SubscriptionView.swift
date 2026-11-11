@@ -169,6 +169,45 @@ struct SubscriptionView: View {
                     .foregroundStyle(TVBoxTheme.textSecondary)
             }
 
+            if !appState.availableRepos.isEmpty {
+                Section {
+                    ForEach(appState.availableRepos) { repo in
+                        Button {
+                            Task { await appState.selectRepo(repo) }
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: appState.activeRepoURL == repo.url
+                                      ? "checkmark.circle.fill" : "shippingbox")
+                                    .font(.system(size: 15))
+                                    .foregroundStyle(appState.activeRepoURL == repo.url
+                                                     ? TVBoxTheme.accent : TVBoxTheme.textSecondary)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(repo.name)
+                                        .font(TVBoxTheme.text(14, weight: .semibold))
+                                        .foregroundStyle(TVBoxTheme.textPrimary)
+                                        .lineLimit(1)
+                                    Text(repo.url)
+                                        .font(TVBoxTheme.mono(10))
+                                        .foregroundStyle(TVBoxTheme.textMuted)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                Spacer(minLength: 4)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                    }
+                } header: {
+                    Text("多仓 · 子仓库 (\(appState.availableRepos.count)) · 点击切换")
+                        .font(TVBoxTheme.mono(11, weight: .heavy))
+                        .tracking(2)
+                        .foregroundStyle(TVBoxTheme.textSecondary)
+                }
+            }
+
             Section {
                 Text("提示：长按 / 左滑 可删除接口；点击切换激活")
                     .font(TVBoxTheme.mono(10))

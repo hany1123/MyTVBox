@@ -37,6 +37,9 @@ final class AppState: ObservableObject {
 
     @Published var subscriptions: [Subscription] = []
     @Published var activeSubscriptionId: UUID?
+    /// 当前订阅若是多仓，这里是可切换的子仓库列表
+    @Published var availableRepos: [RepoLink] = []
+    @Published var activeRepoURL: String?
 
     // MARK: - 私有
 
@@ -150,8 +153,17 @@ final class AppState: ObservableObject {
         if BuiltinSources.isBuiltin(url) {
             let cfg = BuiltinSources.config()
             self.currentConfig = cfg
+            self.availableRepos = []
+            self.activeRepoURL = nil
             let sites = cfg.sites ?? []
-            if currentSite == nil || !sites.contains(where: { $0.key == currentSite?.key }) {
+            // 老版本内置源只有非凡影视一个站点；升级到 16 站版后自动挪到第一条，
+            // 避免继续停留在原先报错的线路（只做一次，之后尊重用户手动选择）
+            let migratedKey = "MyTVBox.builtinMigrated16"
+            let defs = UserDefaults.standard
+            if !defs.bool(forKey: migratedKey) {
+                defs.set(true, forKey: migratedKey)
+                self.currentSite = sites.first
+            } else if currentSite == nil || !sites.contains(where: { $0.key == currentSite?.key }) {
                 self.currentSite = sites.first
             }
             self.errorMessage = nil
@@ -172,6 +184,8 @@ final class AppState: ObservableObject {
         do {
             let cfg = try await ConfigService.shared.loadConfig(from: url)
             self.currentConfig = cfg
+            self.availableRepos = ConfigService.shared.lastRepos
+            self.activeRepoURL = nil
 
             // 智能选择默认站点：优先 CMS 标准接口（type != 3），其次 type 3 中有真实 URL 的
             let allSites = cfg.sites ?? []
@@ -221,6 +235,35 @@ final class AppState: ObservableObject {
             }
             self.errorMessage = error.localizedDescription
             self.currentConfig = nil
+            self.availableRepos = []
+            self.activeRepoURL = nil
+        }
+    }
+
+    /// 多仓：手动切换到某个子仓库
+    func selectRepo(_ repo: RepoLink) async {
+        isLoading = true
+        errorMessage = nil
+        configNotice = nil
+        defer { isLoading = false }
+        do {
+            let cfg = try await ConfigService.shared.loadRepoConfig(from: repo.url)
+            self.currentConfig = cfg
+            self.activeRepoURL = repo.url
+            let sites = cfg.sites ?? []
+            self.currentSite = sites.first
+            let usable = sites.count
+            let total = ConfigService.shared.lastStats?.totalSites ?? usable
+            let dropped = ConfigService.shared.lastStats?.droppedJarSites ?? 0
+            if usable == 0 {
+                self.configNotice = "仓库「\(repo.name)」共 \(total) 个站点，全部为 JAR 型，iOS 无法加载。"
+            } else if dropped > 0 {
+                self.configNotice = "仓库「\(repo.name)」已加载 \(usable) 个可用站点（另有 \(dropped) 个 JAR 型跳过）。"
+            } else {
+                self.configNotice = "仓库「\(repo.name)」已加载 \(usable) 个可用站点。"
+            }
+        } catch {
+            self.errorMessage = "仓库加载失败：\(error.localizedDescription)"
         }
     }
 

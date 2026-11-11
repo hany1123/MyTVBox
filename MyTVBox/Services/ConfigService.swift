@@ -14,6 +14,8 @@ final class ConfigService {
 
     /// 最近一次 `loadConfig` 的诊断结果；调用方在 await 之后读取
     private(set) var lastStats: ConfigStats?
+    /// 最近一次解析到的多仓列表（供界面切换仓库）
+    private(set) var lastRepos: [RepoLink] = []
 
     private let network = NetworkManager.shared
 
@@ -26,6 +28,7 @@ final class ConfigService {
     /// - 支持 base64 编码的 JSON 配置
     func loadConfig(from urlString: String) async throws -> TVBoxConfig {
         lastStats = nil
+        lastRepos = []
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw NetworkError.invalidURL }
 
@@ -62,6 +65,17 @@ final class ConfigService {
 
         // 尝试直接解析
         if let cfg = try? decodeWithExtras(primaryData) {
+            let repos = cfg.repos ?? []
+            // 多仓配置：本身没站点，自动展开第一个可用子仓（支持多仓套多仓）。
+            // 展开后仍把「顶层仓库列表」挂回去，界面才能切换其它仓库。
+            if (cfg.sites ?? []).isEmpty, !repos.isEmpty,
+               let resolved = await resolveFirstUsableRepo(repos, depth: 0) {
+                lastRepos = repos
+                return TVBoxConfig(spider: resolved.spider, sites: resolved.sites,
+                                   lives: resolved.lives, parses: resolved.parses,
+                                   flags: resolved.flags, ijk: resolved.ijk,
+                                   repos: repos)
+            }
             return cfg
         }
 
@@ -136,6 +150,8 @@ final class ConfigService {
     /// 解析配置并滤掉 iOS 无法执行的站点（type 3 = JAR 爬虫，需要 JVM）
     private func decodeWithExtras(_ data: Data) throws -> TVBoxConfig {
         let cfg = try _decodeWithExtras(data)
+        let repos = Self.extractRepos(from: data)
+        lastRepos = repos
         let all = cfg.sites ?? []
         let usable = all.filter { [0, 1, 4].contains($0.type) }
         lastStats = ConfigStats(
@@ -145,7 +161,80 @@ final class ConfigService {
             lives: cfg.lives?.count ?? 0
         )
         return TVBoxConfig(spider: cfg.spider, sites: usable, lives: cfg.lives,
-                           parses: cfg.parses, flags: cfg.flags, ijk: cfg.ijk)
+                           parses: cfg.parses, flags: cfg.flags, ijk: cfg.ijk,
+                           repos: repos)
+    }
+
+    // MARK: - 多仓
+
+    /// 解析多仓字段。TVBox 生态里字段名不统一：
+    /// `urls` / `storeHouse` / `repos` / `subs`，条目可能是字符串、
+    /// `{name,url}`、`{sourceName,sourceUrl}`，url 还可能是数组。
+    static func extractRepos(from data: Data) -> [RepoLink] {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        var out: [RepoLink] = []
+        for key in ["urls", "storeHouse", "storehouse", "repos", "subs", "list"] {
+            guard let arr = obj[key] as? [Any] else { continue }
+            for item in arr {
+                if let s = item as? String, s.hasPrefix("http") {
+                    out.append(RepoLink(name: (s as NSString).lastPathComponent, url: s))
+                    continue
+                }
+                guard let d = item as? [String: Any] else { continue }
+                let name = (d["name"] as? String)
+                    ?? (d["sourceName"] as? String)
+                    ?? (d["sourcename"] as? String) ?? "仓库"
+                var candidates: [String] = []
+                for k in ["url", "sourceUrl", "sourceurl"] {
+                    if let s = d[k] as? String { candidates.append(s) }
+                    if let list = d[k] as? [String] { candidates += list }
+                }
+                for u in candidates where u.hasPrefix("http") {
+                    out.append(RepoLink(name: name, url: u))
+                }
+            }
+        }
+        var seen = Set<String>()
+        return out.filter { seen.insert($0.url).inserted }
+    }
+
+    /// 多仓自动展开：按顺序找第一个真正含站点的子仓，最多递归 3 层
+    private func resolveFirstUsableRepo(_ repos: [RepoLink], depth: Int) async -> TVBoxConfig? {
+        guard depth < 3 else { return nil }
+        for repo in repos.prefix(12) {
+            guard let data = try? await network.data(from: repo.url) else { continue }
+            guard let cfg = try? decodeWithExtras(data) else { continue }
+            let rawTotal = lastStats?.totalSites ?? 0
+            // 有可用站点就采用；全是 JAR 也返回，让上层给出明确提示而不是空白
+            if !(cfg.sites ?? []).isEmpty || rawTotal > 0 {
+                return cfg
+            }
+            let sub = lastRepos   // decodeWithExtras 刚写入的子仓
+            if !sub.isEmpty, let found = await resolveFirstUsableRepo(sub, depth: depth + 1) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    /// 用户手动切换仓库：直接加载该仓库地址（若又是多仓则继续展开）
+    func loadRepoConfig(from url: String) async throws -> TVBoxConfig {
+        lastStats = nil
+        lastRepos = []
+        let data = try await network.data(from: url)
+        let cfg = try decodeWithExtras(data)
+        let repos = cfg.repos ?? []
+        if (cfg.sites ?? []).isEmpty, !repos.isEmpty,
+           let resolved = await resolveFirstUsableRepo(repos, depth: 0) {
+            lastRepos = repos
+            return TVBoxConfig(spider: resolved.spider, sites: resolved.sites,
+                               lives: resolved.lives, parses: resolved.parses,
+                               flags: resolved.flags, ijk: resolved.ijk,
+                               repos: repos)
+        }
+        return cfg
     }
 
     private func _decodeWithExtras(_ data: Data) throws -> TVBoxConfig {

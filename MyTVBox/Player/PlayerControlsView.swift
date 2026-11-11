@@ -386,10 +386,12 @@ struct PlayerBufferingOverlay: View {
     @ObservedObject var viewModel: VideoPlayerViewModel
 
     private var visible: Bool {
-        viewModel.isLoading || viewModel.isBuffering || viewModel.slowLineHint != nil
+        viewModel.isLoading || viewModel.isBuffering
+            || viewModel.slowLineHint != nil || viewModel.autoSwitchHint != nil
     }
 
     private var title: String {
+        if let auto = viewModel.autoSwitchHint { return auto }
         if viewModel.isLoading { return "连接中" }
         if viewModel.isBuffering {
             if viewModel.bufferedAhead > 0.4 {
