@@ -189,6 +189,8 @@ struct VideoPlayerView: View {
             let state = appState
             let model = viewModel
             model.originSiteKey = originSiteKey
+            // 网页型线路（官源 / 分享页）靠这些解析规则兑换 m3u8
+            model.parseRules = state.currentConfig?.parses ?? []
             model.onCrossSiteFallback = { title, epIdx, progress, excluded in
                 let sites = state.currentConfig?.sites ?? []
                 return await CrossSiteResolver.findAlternative(
