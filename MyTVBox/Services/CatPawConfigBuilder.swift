@@ -6,6 +6,11 @@ import JavaScriptCore
 /// 从 CatPaw `.js.md5` URL 获取打包好的 JS 源码，
 /// 通过正则提取各 spider 的 meta 信息，配合已知 CMS API 地址生成多站点配置。
 ///
+/// 1.5.3：修复中文站名显示成 `\u63A8\u9001` 的问题 ——
+/// JS 求值路径的偏移计算有误导致它永远失败并退回正则，
+/// 而正则抠出来的是未解码的 JS 字符串字面量。现在两条路径都统一走
+/// `decodeJSLiteral()`，还原 \uXXXX / \xNN / 代理对等转义。
+///
 /// 生成流程：
 /// 1. `.js.md5` → 取 MD5 → 下载打包 JS 源码
 /// 2. 正则提取 `meta: { key: '...', name: '...', type: N }`
@@ -220,8 +225,10 @@ final class CatPawConfigBuilder {
             guard let keyRange = Range(match.range(at: 1), in: jsCode),
                   let nameRange = Range(match.range(at: 2), in: jsCode) else { continue }
 
-            let key = String(jsCode[keyRange])
-            let name = String(jsCode[nameRange])
+            // 1.5.3：bundle 里中文站名常写成 '\u63A8\u9001'，
+            // 正则抠出来是字面量，必须按 ECMA 规则解成真中文。
+            let key = Self.decodeJSLiteral(String(jsCode[keyRange]))
+            let name = Self.decodeJSLiteral(String(jsCode[nameRange]))
             let type: Int
             if let typeRange = Range(match.range(at: 3), in: jsCode) {
                 type = Int(String(jsCode[typeRange])) ?? 3
@@ -402,14 +409,23 @@ final class CatPawConfigBuilder {
     /// 用 JavaScriptContext 执行 bundle，提取混淆后的 spider meta
     private func extractSpiderMetasViaJS(_ jsCode: String) -> [SpiderMeta]? {
         let ctx = JSContext()!
-        // 最小 shim
-        ctx.evaluateScript("var console={log:function(){},warn:function(){},error:function(){},info:function(){}}")
+        // 1.5.3：猫爪 bundle 多是 webpack / CommonJS 打包，缺这些全局会直接抛异常
+        let shim = [
+            "var console={log:function(){},warn:function(){},error:function(){},info:function(){},debug:function(){}};",
+            "var module={exports:{}}; var exports=module.exports;",
+            "var require=function(){return {};};",
+            "var window=this; var self=this; var global=this;",
+            "var process={env:{},platform:'ios',version:'1.0'};",
+            "var Buffer=function(){};",
+            "var setTimeout=function(){return 0;}; var clearTimeout=function(){};",
+            "var setInterval=function(){return 0;}; var clearInterval=function(){};",
+            "var localStorage={getItem:function(){return null;},setItem:function(){},removeItem:function(){}};"
+        ].joined(separator: "\n")
+        ctx.evaluateScript(shim)
         ctx.evaluateScript(jsCode)
 
-        // 从源码中找 meta:{ ... } 片段，在已加载的上下文中执行求值
         let pattern = #"meta\s*:\s*\{"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return nil }
-
         let fullRange = NSRange(jsCode.startIndex..., in: jsCode)
         let matches = regex.matches(in: jsCode, options: [], range: fullRange)
         guard !matches.isEmpty else { return nil }
@@ -418,32 +434,147 @@ final class CatPawConfigBuilder {
         var results: [SpiderMeta] = []
 
         for match in matches {
-            guard let braceStart = Range(match.range(at: 0), in: jsCode) else { continue }
-            // 从 { 开始数括号找到完整对象
-            let searchStart = jsCode.index(jsCode.startIndex, offsetBy: match.range.upperBound - match.range.lowerBound)
-            let sliceFromBrace = jsCode[searchStart...]
-            var depth = 0, endIdx = sliceFromBrace.startIndex
-            for ch in sliceFromBrace {
-                if ch == "{" { depth += 1 }
-                else if ch == "}" { depth -= 1; if depth == 0 { break } }
-                endIdx = jsCode.index(after: endIdx)
-            }
-            guard depth == 0 else { continue }
-            let snippet = String(jsCode[searchStart...endIdx])
-
-            // 在已加载上下文中执行，求值得到实际值
-            if let obj = ctx.evaluateScript("(\(snippet))"),
-               let dict = obj.toObject() as? [String: Any],
-               let key = dict["key"] as? String,
-               let name = dict["name"] as? String {
-                let type = dict["type"] as? Int ?? 3
-                guard !seen.contains(key) else { continue }
-                seen.insert(key)
-                results.append(SpiderMeta(key: key, name: name, type: type))
-            }
+            // 1.5.3 修正：旧代码把 `upperBound - lowerBound`（匹配长度）当绝对偏移，
+            // 且 NSRange 是 UTF-16 偏移、String.Index 是 Character 偏移，中文 bundle
+            // 下必然错位 → JS 求值路径全废 → 永远退回正则 → 名字成了 \uXXXX 字面量。
+            guard let mRange = Range(match.range(at: 0), in: jsCode),
+                  let snippet = Self.balancedObject(from: jsCode, braceAt: mRange.upperBound),
+                  let obj = ctx.evaluateScript("(\(snippet))"),
+                  let dict = obj.toObject() as? [String: Any],
+                  let key = dict["key"] as? String,
+                  let rawName = dict["name"] as? String else { continue }
+            let name = Self.decodeJSLiteral(rawName)
+            let type = dict["type"] as? Int ?? 3
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            results.append(SpiderMeta(key: key, name: name, type: type))
         }
 
         return results.isEmpty ? nil : results
+    }
+
+    /// 从 `meta:{` 之后的 `{` 位置起，按引号 / 转义状态扫描到配对的 `}`，
+    /// 返回完整对象字面量（含两侧花括号）。字符串里的花括号不会被误计数。
+    private static func balancedObject(from code: String, braceAt upper: String.Index) -> String? {
+        guard upper > code.startIndex else { return nil }
+        let start = code.index(before: upper)
+        guard code[start] == "{" else { return nil }
+        var depth = 0
+        var quote: Character? = nil
+        var escaped = false
+        var i = start
+        while i < code.endIndex {
+            let ch = code[i]
+            if escaped {
+                escaped = false
+            } else if ch == "\\" {
+                escaped = true
+            } else if let q = quote {
+                if ch == q { quote = nil }
+            } else {
+                switch ch {
+                case "'", "\"", "`": quote = ch
+                case "{": depth += 1
+                case "}":
+                    depth -= 1
+                    if depth == 0 { return String(code[start...i]) }
+                default: break
+                }
+            }
+            i = code.index(after: i)
+        }
+        return nil
+    }
+
+    /// 解码 JS 字符串字面量：\uXXXX / \u{XXXXX} / \xNN / 代理对 / 常见转义。
+    /// 猫爪 bundle 里中文站名大量写成 `'\u63A8\u9001'`，正则抠出来是字面量，
+    /// 不解就会在站点列表里显示成一串 \u 码点 —— 1.5.3 修的正是这个。
+    static func decodeJSLiteral(_ raw: String) -> String {
+        let chars = Array(raw)
+        var out = ""
+        var pendingHigh: UInt32? = nil
+
+        func flushPending() {
+            if let hi = pendingHigh, let sc = Unicode.Scalar(hi) {
+                out.unicodeScalars.append(sc)
+            }
+            pendingHigh = nil
+        }
+
+        func push(_ v: UInt32) {
+            if let hi = pendingHigh, v >= 0xDC00, v <= 0xDFFF {
+                let joined = 0x10000 + ((hi - 0xD800) << 10) + (v - 0xDC00)
+                if let sc = Unicode.Scalar(joined) { out.unicodeScalars.append(sc) }
+                pendingHigh = nil
+                return
+            }
+            flushPending()
+            if v >= 0xD800, v <= 0xDBFF {
+                pendingHigh = v
+            } else if let sc = Unicode.Scalar(v) {
+                out.unicodeScalars.append(sc)
+            }
+        }
+
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            guard c == "\\", i + 1 < chars.count else {
+                flushPending()
+                out.append(c)
+                i += 1
+                continue
+            }
+            let n = chars[i + 1]
+            switch n {
+            case "u":
+                if i + 2 < chars.count, chars[i + 2] == "{" {
+                    var j = i + 3, hex = ""
+                    while j < chars.count, chars[j] != "}" {
+                        hex.append(chars[j])
+                        j += 1
+                    }
+                    if j < chars.count, let v = UInt32(hex, radix: 16) {
+                        push(v); i = j + 1; continue
+                    }
+                } else if i + 5 < chars.count {
+                    let hex = chars[(i + 2)...(i + 5)].reduce("") { $0 + String($1) }
+                    if let v = UInt32(hex, radix: 16) {
+                        push(v); i += 6; continue
+                    }
+                }
+            case "x":
+                if i + 3 < chars.count {
+                    let hex = chars[(i + 2)...(i + 3)].reduce("") { $0 + String($1) }
+                    if let v = UInt32(hex, radix: 16) {
+                        push(v); i += 4; continue
+                    }
+                }
+            case "n": flushPending(); out.append("\n"); i += 2; continue
+            case "r": flushPending(); out.append("\r"); i += 2; continue
+            case "t": flushPending(); out.append("\t"); i += 2; continue
+            case "b": flushPending(); out.append("\u{08}"); i += 2; continue
+            case "f": flushPending(); out.append("\u{0C}"); i += 2; continue
+            case "v": flushPending(); out.append("\u{0B}"); i += 2; continue
+            case "0": flushPending(); out.append("\u{00}"); i += 2; continue
+            case "\n": i += 2; continue
+            case "\r":
+                i += (i + 2 < chars.count && chars[i + 2] == "\n") ? 3 : 2
+                continue
+            default:
+                // \' \" \\ \/ 以及未知 \X：保留字符本身
+                flushPending()
+                out.append(n)
+                i += 2
+                continue
+            }
+            // 上面没识别成功的转义，保守保留反斜杠与字符
+            flushPending()
+            out.append(c)
+            i += 1
+        }
+        flushPending()
+        return out
     }
 
     // MARK: - 内置已知 CMS 源（fallback）
