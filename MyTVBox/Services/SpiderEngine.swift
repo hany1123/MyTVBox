@@ -91,7 +91,7 @@ final class SpiderEngine {
             }
             function hasMethod(o, m) { return !!(o && typeof o[m] === 'function'); }
             function hasAnyFn(o) {
-                if (!o) return false;
+                if (!o || o === __mtv_stub__) return false;
                 for (var k in aliases) {
                     var ns = aliases[k] || [];
                     for (var i = 0; i < ns.length; i++) {
@@ -265,13 +265,64 @@ final class SpiderEngine {
         }
     }
 
+    // MARK: - 1.5.7 源码静态取样
+
+    /// 这份 6.6MB bundle 可能是 Node 服务端程序；即使运行时跑不通，
+    /// 也要能把 meta / spider 方法定义 / 接口 URL 抠出来走「静态生成订阅」路线。
+    private func appendSamples(of code: String, needles: [String],
+                               perNeedle: Int, width: Int, into out: inout [String]) {
+        for needle in needles {
+            var cursor = code.startIndex
+            var n = 0
+            while n < perNeedle, cursor < code.endIndex,
+                  let r = code.range(of: needle, options: .literal,
+                                     range: cursor..<code.endIndex) {
+                let start = code.index(r.lowerBound, offsetBy: -60,
+                                       limitedBy: code.startIndex) ?? code.startIndex
+                let end = code.index(r.upperBound, offsetBy: width,
+                                     limitedBy: code.endIndex) ?? code.endIndex
+                let snippet = String(code[start..<end])
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .replacingOccurrences(of: "\r", with: " ")
+                out.append("  [\(needle)] \(snippet)")
+                n += 1
+                cursor = end
+            }
+        }
+    }
+
+    /// 轻量 URL 扫描（不在 6.6MB 上跑正则，避免卡住诊断线程）
+    private func extractURLs(from code: String, limit: Int) -> [String] {
+        var out: [String] = []
+        var seen = Set<String>()
+        var cursor = code.startIndex
+        while out.count < limit, cursor < code.endIndex,
+              let r = code.range(of: "http", options: [.literal, .caseInsensitive],
+                                 range: cursor..<code.endIndex) {
+            var end = r.lowerBound
+            var n = 0
+            while end < code.endIndex, n < 180 {
+                let c = code[end]
+                if c == "\"" || c == "'" || c == "`" || c == " " ||
+                   c == "\n" || c == "\r" || c == ")" || c == "\\" ||
+                   c == "<" || c == ">" { break }
+                end = code.index(after: end)
+                n += 1
+            }
+            let u = String(code[r.lowerBound..<end])
+            if u.count > 14, u.contains("."), seen.insert(u).inserted { out.append(u) }
+            cursor = end < code.endIndex ? code.index(after: end) : code.endIndex
+        }
+        return out
+    }
+
     // MARK: - 1.5.5 真机诊断
 
     /// 在后台线程同步执行，输出一段可直接复制给开发者的运行时事实。
     /// 不依赖网络抓包，也不需要 Xcode 控制台。
     func diagnoseSync(site: Site?) -> String {
         var out: [String] = []
-        out.append("=== MyTVBox 1.5.6 Spider 诊断 ===")
+        out.append("=== MyTVBox 1.5.7 Spider 诊断 ===")
         out.append("site.name     : \(site?.name ?? "nil")")
         out.append("site.key      : \(site?.key ?? "nil")")
         out.append("site.spiderKey: \(site?.spiderKey ?? "nil")")
@@ -305,6 +356,19 @@ final class SpiderEngine {
             let c = code.components(separatedBy: n).count - 1
             if c > 0 { out.append("  \(n) x\(c)") }
         }
+
+        // 1.5.7：运行时路线可能被 Node 依赖卡死，先把源码里的站点信息抠出来
+        out.append("")
+        out.append("--- 源码取样：meta / spider 方法 ---")
+        appendSamples(of: code,
+                      needles: ["meta:{", "meta: {", "homeContent", "categoryContent",
+                                "detailContent", "playerContent", "module.exports",
+                                "__JS_SPIDER__"],
+                      perNeedle: 3, width: 200, into: &out)
+        let urls = extractURLs(from: code, limit: 80)
+        out.append("")
+        out.append("--- URL 样本 (\(urls.count)) ---")
+        for u in urls { out.append("  \(u)") }
 
         let key = site.spiderKey ?? ""
 
@@ -380,7 +444,7 @@ final class SpiderEngine {
             var spiderNames = ['home','homeContent','homeVod','category','categoryContent',
                                'detail','detailContent','play','playerContent','search','searchContent'];
             function looksSpider(o) {
-                if (!o) return false;
+                if (!o || o === __mtv_stub__ || (typeof o !== 'object' && typeof o !== 'function')) return false;
                 for (var si = 0; si < spiderNames.length; si++) {
                     if (typeof o[spiderNames[si]] === 'function') return true;
                 }
@@ -417,6 +481,38 @@ final class SpiderEngine {
             } catch (e3) { lines.push('global scan err: ' + e3); }
             lines.push('GLOBAL spider candidates (' + found.length + '):');
             for (var fi = 0; fi < found.length; fi++) lines.push('  ' + found[fi]);
+            // 顶层初始化链可能在中间抛错，spider 模块还没被 require。
+            // esbuild 的 q() 返回的惰性加载器本身是全局函数，直接调一遍找导出。
+            var probed = [];
+            try {
+                var mk = Object.keys(G);
+                var __probe_deadline__ = Date.now() + 8000;
+                for (var mi = 0; mi < mk.length && mi < 400 && probed.length < 12 && Date.now() < __probe_deadline__; mi++) {
+                    var mn = mk[mi];
+                    if (!/^[A-Za-z_$][A-Za-z0-9_$]{0,5}$/.test(mn)) continue;
+                    var mf = G[mn];
+                    if (typeof mf !== 'function' || mf === __mtv_stub__) continue;
+                    try {
+                        var mr = mf();
+                        if (!mr) continue;
+                        if (looksSpider(mr)) {
+                            probed.push(mk[mi] + ' fns=[' + fns(mr).slice(0, 20).join(',') + ']');
+                            if (!hit) hit = mr;
+                        }
+                        try {
+                            var msub = Object.keys(mr).slice(0, 12);
+                            for (var mj = 0; mj < msub.length && probed.length < 12; mj++) {
+                                if (looksSpider(mr[msub[mj]])) {
+                                    probed.push(mk[mi] + '.' + msub[mj] + ' fns=[' + fns(mr[msub[mj]]).slice(0, 15).join(',') + ']');
+                                    if (!hit) hit = mr[msub[mj]];
+                                }
+                            }
+                        } catch (e5) {}
+                    } catch (e4) {}
+                }
+            } catch (e6) { lines.push('module probe err: ' + e6); }
+            lines.push('MODULE PROBE (' + probed.length + '):');
+            for (var pi = 0; pi < probed.length; pi++) lines.push('  ' + probed[pi]);
             lines.push('TARGET: ' + (hit ? ('keys=[' + keys(hit).join(',') + '] fns=[' + fns(hit).join(',') + ']') : 'NOT FOUND'));
             if (hit) {
                 var f = hit.homeContent || hit.home || hit.homeVod;
@@ -665,11 +761,47 @@ final class SpiderEngine {
             "var module = { exports: {} }; var exports = module.exports;",
             "var window = __MTV_G__; var self = __MTV_G__; var global = __MTV_G__;",
             "var process = { env: {}, platform: 'ios', version: '1.0', argv: [] };",
+            "var __mtv_stub__ = (function(){",
+            "  var f = function(){ return __mtv_stub__; };",
+            "  if (typeof Proxy === 'undefined') return f;",
+            "  try {",
+            "    return new Proxy(f, {",
+            "      get: function(t, k) {",
+            "        if (k === 'then' || k === 'toJSON') return undefined;",
+            "        if (k === 'home' || k === 'homeContent' || k === 'homeVod' || k === 'category' || k === 'categoryContent' || k === 'detail' || k === 'detailContent' || k === 'play' || k === 'playerContent' || k === 'search' || k === 'searchContent' || k === 'init') return undefined;",
+            "        if (k === Symbol.toPrimitive) return function(){ return ''; };",
+            "        if (k === '__esModule') return false;",
+            "        if (k === 'length' || k === 'name' || k === 'prototype') return t[k];",
+            "        return __mtv_stub__;",
+            "      },",
+            "      apply: function(){ return __mtv_stub__; },",
+            "      construct: function(){ return __mtv_stub__; },",
+            "      has: function(){ return true; }",
+            "    });",
+            "  } catch(e) { return f; }",
+            "})();",
+            "var __mtv_EE__ = function(){ this._h = {}; };",
+            "__mtv_EE__.prototype.on = function(k,f){ (this._h[k]=this._h[k]||[]).push(f); return this; };",
+            "__mtv_EE__.prototype.once = function(k,f){ return this.on(k,f); };",
+            "__mtv_EE__.prototype.off = __mtv_EE__.prototype.removeListener = function(){ return this; };",
+            "__mtv_EE__.prototype.emit = function(k){ var a=this._h[k]||[], args=[].slice.call(arguments,1); for(var i=0;i<a.length;i++){ try{a[i].apply(null,args);}catch(e){} } return a.length>0; };",
+            "__mtv_EE__.prototype.removeAllListeners = function(){ this._h={}; return this; };",
             "var require = function(name) {",
-            "  if (name === 'dayjs') return (typeof dayjs !== 'undefined') ? dayjs : function(){};",
-            "  if (name === 'crypto-js' || name === 'CryptoJS') return (typeof CryptoJS !== 'undefined') ? CryptoJS : {};",
-            "  if (name === 'crypto') return { createHash: function(){ return { update: function(){ return this; }, digest: function(){ return ''; } }; } };",
-            "  return {};",
+            "  name = String(name || '');",
+            "  if (name === 'dayjs') return (typeof dayjs !== 'undefined') ? dayjs : __mtv_stub__;",
+            "  if (name === 'crypto-js' || name === 'CryptoJS') return (typeof CryptoJS !== 'undefined') ? CryptoJS : __mtv_stub__;",
+            "  if (name === 'util' || name === 'node:util') return { debuglog: function(){ return function(){}; }, inspect: function(x){ try { return JSON.stringify(x); } catch(e){ return String(x); } }, promisify: function(f){ return f; }, format: function(){ return [].slice.call(arguments).join(' '); }, inherits: function(){}, TextEncoder: TextEncoder, TextDecoder: TextDecoder, types: {} };",
+            "  if (name === 'events' || name === 'node:events') return { EventEmitter: __mtv_EE__, default: __mtv_EE__ };",
+            "  if (name === 'buffer' || name === 'node:buffer') return { Buffer: Buffer, default: Buffer };",
+            "  if (name === 'process' || name === 'node:process') return process;",
+            "  if (name === 'crypto' || name === 'node:crypto') return { createHash: function(){ return { update: function(){ return this; }, digest: function(){ return ''; } }; }, randomBytes: function(n){ return new Array(n||16).fill(0); }, randomUUID: function(){ return '00000000-0000-0000-0000-000000000000'; } };",
+            "  if (name === 'path' || name === 'node:path') return { join: function(){ return [].slice.call(arguments).join('/'); }, resolve: function(){ return [].slice.call(arguments).join('/'); }, basename: function(p){ return String(p).split('/').pop(); }, dirname: function(p){ return String(p).split('/').slice(0,-1).join('/'); }, extname: function(){ return ''; }, sep: '/' };",
+            "  if (name === 'url' || name === 'node:url') return { URL: (typeof URL !== 'undefined') ? URL : __mtv_stub__, URLSearchParams: (typeof URLSearchParams !== 'undefined') ? URLSearchParams : __mtv_stub__, fileURLToPath: function(p){ return String(p); } };",
+            "  if (name === 'stream' || name === 'node:stream') return { Readable: __mtv_EE__, Writable: __mtv_EE__, Duplex: __mtv_EE__, Transform: __mtv_EE__, PassThrough: __mtv_EE__, pipeline: function(){}, finished: function(){} };",
+            "  if (name === 'axios' || name === 'node-fetch' || name === 'undici' || name === 'cross-fetch') return { get: function(u){ return Promise.resolve({status:200,data:nativeReq(String(u),'GET',null,null)}); }, post: function(u,b){ return Promise.resolve({status:200,data:nativeReq(String(u),'POST',null,String(b))}); }, request: function(){ return Promise.resolve({status:200,data:{}}); }, create: function(){ return this; }, default: fetch };",
+            "  if (name === 'fs' || name === 'node:fs') return { readFileSync: function(){ return ''; }, existsSync: function(){ return false; }, promises: {} };",
+            "  if (name === 'os' || name === 'node:os') return { platform: function(){ return 'ios'; }, tmpdir: function(){ return '/tmp'; }, EOL: String.fromCharCode(10), cpus: function(){ return []; } };",
+            "  return __mtv_stub__;",
             "};",
             "var __mtv_store__ = {};",
             "var localStorage = {",
@@ -680,7 +812,7 @@ final class SpiderEngine {
             "};",
             "var setTimeout = function(fn){ try { if (typeof fn === 'function') fn(); } catch(e){} return 0; };",
             "var clearTimeout = function(){}; var setInterval = function(){ return 0; }; var clearInterval = function(){};",
-            "var Buffer = { from: function(s){ return { toString: function(enc){ return enc === 'base64' ? nativeBase64(String(s), false) : String(s); } }; } };",
+            "var Buffer = { from: function(s){ return { toString: function(enc){ return enc === 'base64' ? nativeBase64(String(s), false) : String(s); } }; }, alloc: function(n){ return new Array(n||0).fill(0); }, concat: function(a){ return [].concat.apply([], a || []); }, isBuffer: function(){ return false; }, byteLength: function(s){ return String(s).length; } };",
             "var btoa = function(s){ return nativeBase64(String(s), false); };",
             "var atob = function(s){ return nativeBase64(String(s), true); };",
             "function fetch(url, opts) {",
