@@ -85,7 +85,7 @@ final class VideoPlayerViewModel: ObservableObject {
     /// 是否正在跨站点搜索（防止多个失败回调并发触发多次换源）
     private var isCrossSiteSwitching = false
     /// 线路全部耗尽时的兜底：片名 / 集序号 / 进度 / 排除站点 → 可播放候选
-    var onCrossSiteFallback: (@MainActor (String, Int, Double, Set<String>) async -> CrossSitePlayable?)?
+    var onCrossSiteFallback: (@MainActor (String, Int, Double, Set<String>) async -> CrossSiteResolver.CrossSitePlayable?)?
     /// 连续处在缓冲状态的时间起点
     private var bufferingSince: Date?
 
@@ -731,7 +731,7 @@ final class VideoPlayerViewModel: ObservableObject {
     }
 
     /// 用其它站点的详情整体替换播放上下文，保留集数与进度
-    private func applyCrossSite(_ candidate: CrossSitePlayable) {
+    private func applyCrossSite(_ candidate: CrossSiteResolver.CrossSitePlayable) {
         videoDetail = candidate.detail
         sources = candidate.sources
         activeSiteName = candidate.siteName
