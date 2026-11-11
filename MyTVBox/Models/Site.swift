@@ -1,7 +1,7 @@
 import Foundation
 
 /// 资源站点配置
-struct Site: Codable, Identifiable, Hashable {
+struct Site: Codable, Identifiable, Hashable, Sendable {
     var id: String { key }
     let key: String
     let name: String
@@ -100,4 +100,16 @@ struct Site: Codable, Identifiable, Hashable {
 
     var isSearchable: Bool { (searchable ?? 0) == 1 }
     var isFilterable: Bool { (filterable ?? 0) == 1 }
+
+    /// 复制一份并替换 key。
+    ///
+    /// 1.4.9 起支持「同时启用多个订阅源」：各源的站点会合并成一个池子，
+    /// 不同源可能有同名 key（csp_xxx / 数字 key 都很常见），
+    /// 合并时用订阅名做前缀重写，保证 key 在池内唯一。
+    func replacingKey(_ newKey: String) -> Site {
+        Site(key: newKey, name: name, type: type, api: api,
+             searchable: searchable, quickSearch: quickSearch, filterable: filterable,
+             playerType: playerType, ext: ext, categories: categories,
+             jar: jar, spiderKey: spiderKey)
+    }
 }

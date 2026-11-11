@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - 视频分类
 
-struct VideoCategory: Codable, Identifiable, Hashable {
+struct VideoCategory: Codable, Identifiable, Hashable, Sendable {
     var id: String { typeId }
     let typeId: String
     let typeName: String
@@ -50,7 +50,7 @@ struct VideoCategory: Codable, Identifiable, Hashable {
 
 // MARK: - 视频列表项
 
-struct VideoItem: Codable, Identifiable, Hashable {
+struct VideoItem: Codable, Identifiable, Hashable, Sendable {
     var id: String { vodId }
     let vodId: String
     let vodName: String
@@ -117,7 +117,7 @@ struct VideoItem: Codable, Identifiable, Hashable {
 
 // MARK: - 视频详情
 
-struct VideoDetail: Codable, Identifiable, Hashable {
+struct VideoDetail: Codable, Identifiable, Hashable, Sendable {
     var id: String { vodId }
     let vodId: String
     let vodName: String
@@ -350,14 +350,28 @@ struct VideoDetailResponse: Codable {
 
 // MARK: - 解析后的播放信息
 
-struct PlayURL: Identifiable, Hashable {
+struct PlayURL: Identifiable, Hashable, Sendable {
     let id = UUID()
     let name: String
     let url: String
 }
 
-struct PlaySource: Identifiable, Hashable {
+struct PlaySource: Identifiable, Hashable, Sendable {
     let id = UUID()
     let name: String
     let episodes: [PlayURL]
+    /// 跨站线路的来源站点名（本站线路为 nil）
+    var siteName: String?
+    /// 跨站线路的来源站点 key（本站线路为 nil）
+    var siteKey: String?
+
+    init(name: String, episodes: [PlayURL], siteName: String? = nil, siteKey: String? = nil) {
+        self.name = name
+        self.episodes = episodes
+        self.siteName = siteName
+        self.siteKey = siteKey
+    }
+
+    /// 是否来自其它站点（详情页会把它和本站线路分开显示）
+    var isCrossSite: Bool { siteName != nil }
 }

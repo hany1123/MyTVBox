@@ -1,7 +1,7 @@
 import Foundation
 
 /// 多仓配置里的一个子仓库（urls / storeHouse 条目）
-struct RepoLink: Identifiable, Hashable {
+struct RepoLink: Identifiable, Hashable, Sendable {
     var id: String { url }
     let name: String
     let url: String

@@ -5,7 +5,7 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// 最近一次解析的站点统计（用于向用户解释「为什么站点很少」）
-    struct ConfigStats {
+    struct ConfigStats: Sendable {
         var totalSites: Int = 0
         var usableSites: Int = 0
         var droppedJarSites: Int = 0
@@ -19,7 +19,10 @@ final class ConfigService {
 
     private let network = NetworkManager.shared
 
-    private init() {}
+    /// 1.4.9：允许多实例。
+    /// 合并多个订阅源时会并发加载各源，`lastStats` / `lastRepos` 是实例级状态，
+    /// 共用单例会导致诊断数据互相覆盖，故并发场景各用各的实例。
+    init() {}
 
     /// 从给定 URL 下载并解析 TVBox / 猫爪 JSON 配置
     /// - 支持 .md5 后缀（先尝试直接获取，若返回内容是 32 位 md5 则去掉 .md5 重新请求）
