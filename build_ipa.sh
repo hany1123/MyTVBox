@@ -76,6 +76,26 @@ else
   exit 1
 fi
 
+# 校验 Node 项目资源确实进了包（folder reference 很容易配错而静默丢失）
+if [ -f "${APP_PATH}/NodeProject/index.js" ]; then
+  ISZ=$(stat -f%z "${APP_PATH}/NodeProject/index.js" 2>/dev/null || echo 0)
+  echo "    NodeProject/index.js 已打包 (${ISZ} bytes)"
+  # 6.6 MB 的 bundle，太小说明拷错了文件
+  if [ "${ISZ}" -lt 6000000 ]; then
+    echo "!! 错误：index.js 只有 ${ISZ} bytes，应该是 6,629,280"
+    exit 1
+  fi
+else
+  echo "!! 错误：NodeProject/index.js 未打包，端上 Node 起不来"
+  exit 1
+fi
+if [ -f "${APP_PATH}/NodeProject/main.js" ]; then
+  echo "    NodeProject/main.js 已打包"
+else
+  echo "!! 错误：NodeProject/main.js 未打包"
+  exit 1
+fi
+
 echo "==> Packaging IPA..."
 mkdir -p "${IPA_DIR}/Payload"
 cp -R "${APP_PATH}" "${IPA_DIR}/Payload/"

@@ -23,14 +23,16 @@ targets:
         excludes:
           - "Info.plist"
           - "MyTVBox-Bridging-Header.h"
-          # 排除掉，改用下面的 folder reference 单独加，避免资源被收录两次
+          # 排除掉，下面用 folder reference 单独加，避免资源被收录两次
           - "Resources/NodeProject"
-    resources:
-      - MyTVBox/Assets.xcassets
-      # 端上 Node 项目：整目录作为 folder reference 拷进 Bundle，
-      # 运行时由 NodeRuntime 复制到 Documents 再交给 node_start。
+      # 端上 Node 项目：整目录作为 folder reference（蓝色文件夹）拷进 Bundle。
+      # 注意：type: folder 必须放在 sources 里并显式指定 buildPhase，写进
+      # resources 字段是不生效的（1.7.0 第一次构建就因为这点导致资源没进包）。
       - path: MyTVBox/Resources/NodeProject
         type: folder
+        buildPhase: resources
+    resources:
+      - MyTVBox/Assets.xcassets
     dependencies:
       # 1.7.0 端上 Node 运行时（nodejs-mobile v18.20.4，动态库，54.9 MB）
       # CI 在 xcodegen 之前下载解压到仓库根目录。
