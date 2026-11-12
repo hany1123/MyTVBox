@@ -55,6 +55,11 @@ final class SpikeProbe {
     private let lock = NSLock()
     private var task: Task<Void, Never>?
     private var active = false
+    /// 1.8.13：/play 可能被 autoSwitchSource 并发调用（旧 Task 的 await 不会
+    /// 因为 playEpoch 失效而取消）。若每个 defer 都写 END，先返回的那次会把
+    /// 仍在飞、随后崩溃的窗口标成「正常结束」，[9] 就会漏掉崩溃轮。
+    /// 用引用计数保证只有最后一个窗口退出才收口。
+    private var depth = 0
 
     private let fmt: DateFormatter = {
         let f = DateFormatter()
@@ -84,6 +89,7 @@ final class SpikeProbe {
     /// 进入 /play 取流窗口。重复调用不会叠加采样任务。
     func start(_ label: String) {
         lock.lock()
+        depth += 1
         if active { lock.unlock(); return }
         active = true
         task?.cancel()
@@ -104,6 +110,8 @@ final class SpikeProbe {
     /// 离开 /play 取流窗口。写 END 是「活着走出来」的唯一凭据。
     func stop(_ label: String) {
         lock.lock()
+        depth = max(0, depth - 1)
+        if depth > 0 { lock.unlock(); return }
         let wasActive = active
         active = false
         task?.cancel()
