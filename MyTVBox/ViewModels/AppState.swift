@@ -141,9 +141,22 @@ final class AppState: ObservableObject {
     /// 之前是「关详情 + 切 Tab + 塞关键词」在同一帧里做。SwiftUI 会在视图更新期间
     /// 拆掉正在 dismiss 的 NavigationStack，iOS 16 上表现为**点豆瓣电影直接闪退**。
     /// 现在统一成：调用方先 dismiss，隔一拍（放过转场）再切 Tab 并带关键词。
+    /// 1.8.1：同一关键词短时间内重复跳转直接忽略。
+    /// 详情页被重新创建（推荐墙条目尤其容易）时 `.task` 会再跑一遍，
+    /// 于是「详情 → 搜索 → 详情 → 搜索」能自己循环起来，每轮开一次百站聚合搜索。
+    /// 视图内的 `didAutoJumpToSearch` 只管单实例，这里再兜一层跨实例的冷却。
+    private var lastJumpKeyword: String?
+    private var lastJumpAt: Date?
+
     func jumpToSearch(keyword kw: String, after delay: TimeInterval = 0.35) {
         let t = kw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
+        if lastJumpKeyword == t, let at = lastJumpAt, Date().timeIntervalSince(at) < 6 {
+            SessionTrace.mark("略 跳搜索 \(t)（6 秒内重复）")
+            return
+        }
+        lastJumpKeyword = t
+        lastJumpAt = Date()
         SessionTrace.mark("开 跳搜索 \(t)")
         DispatchQueue.main.asyncAfter(deadline: .now() + max(0, delay)) { [weak self] in
             guard let self else { return }

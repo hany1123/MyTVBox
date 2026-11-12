@@ -39,6 +39,11 @@ struct VideoDetailView: View {
 
     @State private var pendingTarget: PlayTarget?
     @State private var isPlayerActive: Bool = false
+    /// 1.8.1：自动跳搜索只允许发生一次。
+    /// 之前这个跳转写在 `.task` 里，只要视图重新出现（Tab 切回、详情没真正退出、
+    /// 转场被打断）就会再触发一次 —— 于是「详情 → 搜索 → 详情 → 搜索」自己循环，
+    /// 每轮都开一次 110 站聚合搜索，最后把进程顶崩。守卫住就断了这个环。
+    @State private var didAutoJumpToSearch = false
 
     private struct PlayTarget: Identifiable, Hashable {
         var id: String { "\(sourceIndex)-\(episodeIndex)" }
@@ -608,7 +613,8 @@ struct VideoDetailView: View {
         // 1.7.5：豆瓣这类推荐墙，直接跳到「全站聚合搜索」。
         // 以前是在详情页里静默接管一个站，用户看不到「这部片还有哪些源有」，
         // 也没法挑。跳过去能按站点筛选，和 MiraPlay 一致。
-        if autoSearchOnOpen, isRecommendWallItem, !title.isEmpty {
+        if autoSearchOnOpen, isRecommendWallItem, !title.isEmpty, !didAutoJumpToSearch {
+            didAutoJumpToSearch = true
             diag("推荐墙条目 → 跳转全站搜索「\(title)」")
             // 1.8.0：先退详情，再隔一拍切 Tab。
             // 同一帧里「关导航栈 + 切 Tab」会让 SwiftUI 在视图更新中拆掉正在

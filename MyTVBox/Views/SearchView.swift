@@ -593,20 +593,32 @@ struct SearchView: View {
                 return
             }
             // 1.8.0：面包屑。闪退时进程直接消失，下次启动靠这行定位「死在哪一步」。
-            SessionTrace.mark("开 搜索 \(trimmed) 站=\(usable.count)")
+            // 1.8.1：同时记下「可用站数/实际搜索站数」，两者不一样说明被上限截断。
+            let scanCount = min(usable.count, 60)
+            SessionTrace.mark("开 搜索 \(trimmed) 站=\(scanCount)/\(usable.count)")
             // 1.7.5：搜索页就是要「全站聚合」，别只搜前 24 个。
             // 1.8.0：每站 30 → 16、总量 400 → 240。海报张数直接决定内存峰值，
             // 24 站并发时每站 30 条会把 700+ 张封面同时排队解码，容易顶到 Jetsam。
+            // 1.8.1：站数 200 → 60、并发 16 → 12。
+            // 1.8.0 的轨迹里最后一行是「开 搜索 站=110」，之后就没了 —— 110 个站
+            // 轮流进 Node 跑 spider，V8 堆一路涨到上限，进程被 abort（闪退）。
+            // 60 站 × 每站 16 条已足够凑满 240 条结果，负载直接砍半。
             let found = await CrossSiteResolver.search(
                 keyword: trimmed,
                 in: usable,
                 limitPerSite: 16,
                 limitTotal: 240,
                 preferredSiteKey: preferred,
-                maxSites: 200
+                maxSites: 60,
+                concurrency: 12
             )
+            // 1.8.1：先判取消再记「完」。以前先记后判，被取代的搜索也会写一条
+            // 「完 命中 N」，看日志时容易误判成两次搜索都成功了。
+            guard !Task.isCancelled else {
+                SessionTrace.mark("弃 搜索 \(trimmed)（被新搜索取代）")
+                return
+            }
             SessionTrace.mark("完 搜索 \(trimmed) 命中 \(found.count)")
-            guard !Task.isCancelled else { return }
             self.searchedSiteCount = usable.count
             self.results = found
             self.isLoading = false

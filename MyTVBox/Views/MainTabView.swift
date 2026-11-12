@@ -107,7 +107,25 @@ private struct SettingsTab: View {
                         }
                         .buttonStyle(.plain)
 
-                        SectionHeader(title: "关于", code: "02")
+                        // 1.8.1：诊断入口从站点选择器搬到这里 —— 站点列表为空时
+                        // 那个入口本身进不去，恰恰是最需要诊断的时候。
+                        SectionHeader(title: "诊断", code: "02")
+                            .padding(.top, 8)
+
+                        NavigationLink {
+                            DiagnosticsView()
+                                .environmentObject(appState)
+                        } label: {
+                            settingRow(
+                                icon: "stethoscope",
+                                title: "诊断信息",
+                                subtitle: "内核 / 配置 / 崩溃轨迹，可一键复制",
+                                badge: "LOG"
+                            )
+                        }
+                        .buttonStyle(.plain)
+
+                        SectionHeader(title: "关于", code: "03")
                             .padding(.top, 8)
 
                         infoRow(icon: "info.circle", title: "版本", value: appVersion)
