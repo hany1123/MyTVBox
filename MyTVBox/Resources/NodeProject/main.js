@@ -98,5 +98,17 @@ process.on('unhandledRejection', (e) => {
 // 保活：Node 的 event loop 不能空转退出
 setInterval(() => {}, 1 << 30);
 
+// 1.7.1：每分钟记一次内存，方便线上排查「播放返回后闪退」是不是 Node 吃太多。
+// unref() 让这个定时器不阻止进程退出。
+setInterval(() => {
+    try {
+        const m = process.memoryUsage();
+        log('mem rss=' + Math.round(m.rss / 1048576) + 'MB'
+            + ' heapUsed=' + Math.round(m.heapUsed / 1048576) + 'MB'
+            + ' heapTotal=' + Math.round(m.heapTotal / 1048576) + 'MB'
+            + ' ext=' + Math.round(m.external / 1048576) + 'MB');
+    } catch (e) { /* 忽略 */ }
+}, 60000).unref();
+
 // 确保 flush 被引用（避免打包器优化掉）
 flush();

@@ -129,6 +129,11 @@ final class NodeRuntime {
             setenv("NODE_ENV", "production", 1)
             setenv("HOME", self.workDir.path, 1)
 
+            // 1.7.1 内存防护：端上 Node + V8 堆 + AVPlayer 同时在场时很容易吃满，
+            // 被系统 Jetsam 杀掉的表现就是「播放返回后闪退」。把老生代上限压到
+            // 128 MB，宁可 GC 勤一点、稍微慢一点，也不要被杀进程。
+            setenv("NODE_OPTIONS", "--max-old-space-size=128", 1)
+
             // C 的 argv 必须以 NULL 结尾，argc 不含这个 NULL。
             // 少写这个 nil 会导致 node_start 读越界，表现为启动即崩或卡死。
             var args: [UnsafeMutablePointer<CChar>?] = [
