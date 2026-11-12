@@ -154,5 +154,19 @@ setInterval(() => {
     } catch (e) { /* 忽略 */ }
 }, 60000).unref();
 
+// 1.7.7：V8 撞到堆上限是进程级 abort，JS 里连 catch 都拿不到 ——
+// 所以要在逼近上限之前留下密集证据（每 10 秒一行，只在偏高时写）。
+// 下次「点开一部片直接闪退」，翻 node.log 就能确认是不是内存。
+setInterval(() => {
+    try {
+        const m = process.memoryUsage();
+        const heapMB = Math.round(m.heapUsed / 1048576);
+        const rssMB = Math.round(m.rss / 1048576);
+        if (heapMB > 128 || rssMB > 600) {
+            log('mem HIGH heapUsed=' + heapMB + 'MB rss=' + rssMB + 'MB');
+        }
+    } catch (e) { /* 忽略 */ }
+}, 10000).unref();
+
 // 确保 flush 被引用（避免打包器优化掉）
 flush();

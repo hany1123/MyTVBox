@@ -373,7 +373,9 @@ struct SubscriptionView: View {
                     .tracking(2)
                     .foregroundStyle(online ? TVBoxTheme.accent : TVBoxTheme.textMuted)
                 Text(online
-                     ? "已启用 \(enabled) 个接口 · 共 \(vm.mergedSiteCount) 个站点"
+                     ? (vm.mergedSiteCount == 0
+                        ? "已启用 \(enabled) 个接口 · 正在加载站点…"
+                        : "已启用 \(enabled) 个接口 · 共 \(vm.mergedSiteCount) 个站点")
                      : "未启用任何接口")
                     .font(TVBoxTheme.text(13, weight: .semibold))
                     .foregroundStyle(TVBoxTheme.textPrimary)
@@ -382,14 +384,37 @@ struct SubscriptionView: View {
 
             Spacer()
 
-            VStack(alignment: .trailing, spacing: 2) {
-                Text("\(vm.mergedSiteCount)")
-                    .font(TVBoxTheme.mono(20, weight: .heavy))
-                    .foregroundStyle(TVBoxTheme.textPrimary)
-                Text("SITES")
-                    .font(TVBoxTheme.mono(9, weight: .bold))
-                    .tracking(1.5)
-                    .foregroundStyle(TVBoxTheme.textMuted)
+            if online && vm.mergedSiteCount == 0 {
+                // 1.7.7：自动加载没赶上时给个一键补，别让人去一条条点订阅
+                Button {
+                    Task { await vm.refreshAll() }
+                } label: {
+                    HStack(spacing: 6) {
+                        if vm.isLoading {
+                            ProgressView()
+                                .tint(TVBoxTheme.accent)
+                                .scaleEffect(0.7)
+                        }
+                        Text(vm.isLoading ? "加载中…" : "重新加载")
+                            .font(TVBoxTheme.text(12, weight: .semibold))
+                            .foregroundStyle(TVBoxTheme.accent)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Capsule().stroke(TVBoxTheme.accent.opacity(0.5), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .disabled(vm.isLoading)
+            } else {
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("\(vm.mergedSiteCount)")
+                        .font(TVBoxTheme.mono(20, weight: .heavy))
+                        .foregroundStyle(TVBoxTheme.textPrimary)
+                    Text("SITES")
+                        .font(TVBoxTheme.mono(9, weight: .bold))
+                        .tracking(1.5)
+                        .foregroundStyle(TVBoxTheme.textMuted)
+                }
             }
         }
         .padding(.horizontal, 16)

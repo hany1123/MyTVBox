@@ -110,38 +110,57 @@ enum CrossSiteResolver {
 
     /// 并发搜索所有可用站点；任一站失败/超时不影响其它站点。
     /// 结果排序：完全匹配 > 包含匹配 > 其它；同级别下当前站点优先、站点原顺序优先。
+    ///
+    /// - Parameter concurrency: 同时最多打几个站。
+    ///   1.7.7：以前是把 200 个站一次性全 `addTask` 出去 —— 端上 Node 那边等于同时
+    ///   发起 200 个上游请求，每个都持有整页 HTML/JSON，V8 堆撞上限直接
+    ///   `FATAL ERROR: Reached heap limit` → **整个 App 进程被 abort，表现就是闪退**。
+    ///   分批后峰值内存与连接数都可控；24 路是「比 48 条连接略低、又不太拖时间」的取值，
+    ///   98 个站约 5 批、总耗时只比以前多一两秒。
     static func search(keyword: String,
                        in sites: [Site],
                        limitPerSite: Int = 12,
                        limitTotal: Int = 120,
                        preferredSiteKey: String? = nil,
-                       maxSites: Int = 24) async -> [SiteSearchResult] {
+                       maxSites: Int = 24,
+                       concurrency: Int = 24) async -> [SiteSearchResult] {
         let targets = Array(usableSites(sites).prefix(max(1, maxSites)))
         guard !targets.isEmpty else { return [] }
 
         let kw = keyword
         let per = max(1, limitPerSite)
-        let batches: [Batch] = await withTaskGroup(
-            of: Batch?.self,
-            returning: [Batch].self
-        ) { group in
-            for (idx, site) in targets.enumerated() {
-                group.addTask {
-                    do {
-                        let items = try await APIService.shared.searchVideos(
-                            site: site, keyword: kw, timeout: 6
-                        )
-                        return Batch(index: idx, site: site, items: Array(items.prefix(per)))
-                    } catch {
-                        return nil
+        let indexed = Array(targets.enumerated())
+        let width = max(1, min(concurrency, indexed.count))
+
+        var batches: [Batch] = []
+        var start = 0
+        while start < indexed.count {
+            let end = min(start + width, indexed.count)
+            let slice = Array(indexed[start..<end])
+            let part: [Batch] = await withTaskGroup(
+                of: Batch?.self,
+                returning: [Batch].self
+            ) { group in
+                for (idx, site) in slice {
+                    group.addTask {
+                        do {
+                            let items = try await APIService.shared.searchVideos(
+                                site: site, keyword: kw, timeout: 6
+                            )
+                            return Batch(index: idx, site: site, items: Array(items.prefix(per)))
+                        } catch {
+                            return nil
+                        }
                     }
                 }
+                var collected: [Batch] = []
+                for await batch in group {
+                    if let batch = batch { collected.append(batch) }
+                }
+                return collected
             }
-            var collected: [Batch] = []
-            for await batch in group {
-                if let batch = batch { collected.append(batch) }
-            }
-            return collected
+            batches.append(contentsOf: part)
+            start = end
         }
 
         let ordered = batches.sorted { $0.index < $1.index }

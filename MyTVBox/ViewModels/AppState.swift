@@ -317,6 +317,12 @@ final class AppState: ObservableObject {
         !enabledSubscriptions.isEmpty
     }
 
+    /// 1.7.7：已启用订阅里是否有「指向端上 Node」的那种。
+    /// 这种在 Node 就绪前加载必定失败，所以要等启动流程统一处理，不能抢先拉。
+    var hasEnabledLocalNodeSubscription: Bool {
+        enabledSubscriptions.contains { $0.url.hasPrefix("http://127.0.0.1:") }
+    }
+
     // MARK: - 配置加载
 
     /// 加载全部「已启用」订阅并合并成一个站点池
@@ -389,6 +395,23 @@ final class AppState: ObservableObject {
             configNotice = "已合并 \(okCount) 个接口 · \(usableSiteCount) 个可用站点（另有 \(dropped) 个 JAR 型站点无法在 iOS 运行）。"
         } else {
             configNotice = "已合并 \(okCount) 个接口 · \(usableSiteCount) 个可用站点。"
+        }
+    }
+
+    /// 1.7.7：带重试的加载。
+    ///
+    /// 端上 Node 刚 listen 时，源内部的 `/config` 可能还在拉远端站点配置，
+    /// 第一次请求经常超时 —— 以前的表现就是「打开 App 显示 0 个站点，
+    /// 得手动点一下订阅才加载出来」。这里失败就退避重试，用户不用管。
+    @discardableResult
+    func loadConfigWithRetry(attempts: Int = 4, delay: TimeInterval = 2.0) async -> Bool {
+        var attempt = 0
+        while true {
+            attempt += 1
+            await loadConfig()
+            if usableSiteCount > 0 { return true }
+            if attempt >= attempts { return false }
+            try? await Task.sleep(nanoseconds: UInt64(max(0.2, delay) * 1_000_000_000))
         }
     }
 

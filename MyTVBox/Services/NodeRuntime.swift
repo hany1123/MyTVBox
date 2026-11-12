@@ -133,10 +133,12 @@ final class NodeRuntime {
             setenv("NODE_ENV", "production", 1)
             setenv("HOME", self.workDir.path, 1)
 
-            // 1.7.1 内存防护：端上 Node + V8 堆 + AVPlayer 同时在场时很容易吃满，
-            // 被系统 Jetsam 杀掉的表现就是「播放返回后闪退」。把老生代上限压到
-            // 128 MB，宁可 GC 勤一点、稍微慢一点，也不要被杀进程。
-            setenv("NODE_OPTIONS", "--max-old-space-size=128", 1)
+            // 1.7.1 把这个值压到 128 MB 想防 Jetsam，但方向反了：
+            // V8 撞到堆上限是 `FATAL ERROR: Reached heap limit` → **abort 整个进程**，
+            // 表现就是「点开一部片直接闪退」，比 Jetsam 更频繁也更难查。
+            // 1.7.7 放到 512 MB（前台 App 的 Jetsam 水位远高于此），峰值内存改由
+            // 「跨站搜索分批（CrossSiteResolver concurrency）」控制，不再靠压堆。
+            setenv("NODE_OPTIONS", "--max-old-space-size=512", 1)
 
             // C 的 argv 必须以 NULL 结尾，argc 不含这个 NULL。
             // 少写这个 nil 会导致 node_start 读越界，表现为启动即崩或卡死。
@@ -178,6 +180,28 @@ final class NodeRuntime {
         if isReady, currentReadyPort() != nil { return true }
         startIfNeeded()
         return await waitUntilReady(timeout: timeout)
+    }
+
+    /// 1.7.7：预热 /config。
+    ///
+    /// 源刚 listen 的时候，`/config` 内部还要去拉远端站点配置（设备上是解释执行，
+    /// 第一次可能要十几秒），App 这时候去拉就成了「超时 → 0 个站点 → 用户发现
+    /// 得手动点一下订阅才出来」。先在这儿敲一次把它的缓存热起来，超时给足。
+    func warmUpConfig(timeout: TimeInterval = 45) async {
+        guard isReady else { return }
+        guard let url = URL(string: baseURL + "/config") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = timeout
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        let t0 = Date()
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            appendLog(String(format: "warmup /config %.1fs %d bytes",
+                             Date().timeIntervalSince(t0), data.count))
+        } catch {
+            appendLog(String(format: "warmup /config %.1fs 失败: %@",
+                             Date().timeIntervalSince(t0), error.localizedDescription))
+        }
     }
 
     private func currentReadyPort() -> UInt16? {

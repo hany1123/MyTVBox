@@ -518,6 +518,27 @@ final class SpiderEngine {
         // 1.7.3：先报端上 Node 状态。上一轮最大的问题就是「诊断里看不出 Node 到底起没起来」，
         // 只能靠站点 key 前缀（catpaw_ = JSC 路线，noderelay_ = Node 路线）反推。
         let rt = NodeRuntime.shared
+
+        // 1.7.7：闪退排查要的第一手信息 —— 上次是怎么没的 + 现在跑的是哪份内核
+        out.append("")
+        out.append("--- 内核与崩溃 ---")
+        if let k = rt.activeKernel {
+            out.append("运行中内核    : \(k.source) \(k.bytes) B md5 \(k.md5)")
+        } else {
+            out.append("运行中内核    : (未记录到 kernel.txt)")
+        }
+        if let p = rt.pendingKernelMD5 {
+            out.append("已下载待生效  : md5 \(p)（需完全退出 App 再打开）")
+        }
+        if let crash = CrashGuard.lastReport() {
+            out.append("上次崩溃记录  :")
+            for line in crash.split(separator: "\n").suffix(24) {
+                out.append("  " + line)
+            }
+        } else {
+            out.append("上次崩溃记录  : 无（若是闪退，多半是内存被系统回收或 V8 堆溢出）")
+        }
+
         out.append("")
         out.append("--- 端上 Node 运行时 ---")
         out.append("node ready    : \(rt.isReady ? "YES" : "NO")")

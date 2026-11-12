@@ -22,6 +22,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // 1.7.7：抓 NSException 型闪退，落到 Documents/MyTVBox/crash.log
+        CrashGuard.install()
+
         // 注册后台/前台切换通知
         NotificationCenter.default.addObserver(
             self, selector: #selector(didEnterBackground),
@@ -143,9 +146,17 @@ struct MyTVBoxApp: App {
 
         // iOS 上的 Node 是 interpreter-only（无 JIT），加载 6.6 MB bundle 偏慢，
         // 首次启动给足 120 秒；之后就绪标记已在，会很快返回。
-        let ok = await NodeRuntime.shared.waitUntilReady(timeout: 120)
+        var ok = await NodeRuntime.shared.waitUntilReady(timeout: 120)
+        if !ok {
+            // 1.7.7：冷启偶发超过 120 秒（低电量模式、首次解 bundle），再给一次机会
+            ok = await NodeRuntime.shared.waitUntilReady(timeout: 60)
+        }
         guard ok else {
             NSLog("[App] 端上 Node 启动失败，日志:\n%@", NodeRuntime.shared.tailLog())
+            // 1.7.7：Node 没起来也绝不能把界面留在「0 个站点」——
+            // ContentView 那边已经因为「有本机源」而跳过了抢先加载，这里要是也直接
+            // return，用户看到的就是「什么都要手动点一下才出来」。让内置/远程源照常加载。
+            _ = await appState.loadConfigWithRetry(attempts: 2, delay: 1.0)
             return
         }
 
@@ -160,6 +171,16 @@ struct MyTVBoxApp: App {
         // ContentView 的 .task 在 App 一启动就 loadConfig 了，那时 Node 还没起来，
         // 只能拿老订阅（JS bundle 型 → catpaw_* 站点）解析出一堆跑不了的站点；
         // Node 就绪装上本机源后如果不再重载，界面就永远停在旧结果上。
-        await appState.loadConfig()
+        //
+        // 1.7.7：光重载一次还不够。设备上源刚 listen 时 `/config` 内部还在拉远端
+        // 站点配置（解释执行，第一次可能十几秒），这一发经常超时 —— 用户看到的
+        // 就是「0 个站点，得手动点一下订阅才加载」。改成：预热 + 失败重试。
+        async let warmup: Void = NodeRuntime.shared.warmUpConfig()
+        let loaded = await appState.loadConfigWithRetry(attempts: 3, delay: 2.0)
+        await warmup
+        if !loaded {
+            // 预热那一发已经拿到数据了，再来一轮基本必成
+            await appState.loadConfigWithRetry(attempts: 3, delay: 1.5)
+        }
     }
 }
