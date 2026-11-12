@@ -38,6 +38,9 @@ process.on('uncaughtException', (e) => {
 process.on('unhandledRejection', (e) => {
     log('FATAL unhandled: ' + (e && e.stack ? e.stack : String(e)));
 });
+// 1.8.5：Node 与 App 同进程。若 Node 事件循环退出 / V8 abort，会带走整个 App，
+// 所以要把「正常退出」也记下来，用于和「崩溃」区分。
+process.on('exit', (code) => { log('EXIT code=' + code); });
 
 (async () => {
     let mod;
@@ -155,15 +158,26 @@ setInterval(() => {
 }, 60000).unref();
 
 // 1.7.7：V8 撞到堆上限是进程级 abort，JS 里连 catch 都拿不到 ——
-// 所以要在逼近上限之前留下密集证据（每 10 秒一行，只在偏高时写）。
-// 下次「点开一部片直接闪退」，翻 node.log 就能确认是不是内存。
+// 所以要在逼近上限之前留下密集证据。
+// 1.8.5：改成**每 10 秒无条件写一行**（mem10），不再只在偏高时写。
+// 播放中稳定闪退两次，需要一条完整的 V8/RSS 曲线才能判断是不是 Node 拖垮了进程；
+// 同时在偏高时主动 full GC（NodeRuntime 已加 --expose-gc），降低与视频缓冲的叠加。
 setInterval(() => {
     try {
         const m = process.memoryUsage();
         const heapMB = Math.round(m.heapUsed / 1048576);
         const rssMB = Math.round(m.rss / 1048576);
-        if (heapMB > 128 || rssMB > 600) {
-            log('mem HIGH heapUsed=' + heapMB + 'MB rss=' + rssMB + 'MB');
+        log('mem10 heap=' + heapMB + 'MB rss=' + rssMB + 'MB'
+            + ' total=' + Math.round(m.heapTotal / 1048576) + 'MB'
+            + ' ext=' + Math.round(m.external / 1048576) + 'MB');
+        if (heapMB > 96 || rssMB > 260) {
+            let after = heapMB;
+            if (typeof global.gc === 'function') {
+                try { global.gc(); } catch (e) { /* 没开 expose-gc 就算了 */ }
+                after = Math.round(process.memoryUsage().heapUsed / 1048576);
+            }
+            log('mem HIGH heap ' + heapMB + '->' + after + 'MB rss=' + rssMB + 'MB'
+                + ' gc=' + (typeof global.gc === 'function' ? 'yes' : 'no'));
         }
     } catch (e) { /* 忽略 */ }
 }, 10000).unref();

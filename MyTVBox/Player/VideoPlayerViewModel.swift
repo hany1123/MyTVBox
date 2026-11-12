@@ -882,6 +882,9 @@ final class VideoPlayerViewModel: ObservableObject {
                     self.isLoading = false
                     self.isBuffering = false
                     self.slowTimer?.cancel()
+                    // 1.8.5：AVFoundation 侧的失败要留痕，用于排除「播放器错误导致退出」
+                    SessionTrace.mark("败 播放 item.failed: "
+                                      + (item.error?.localizedDescription ?? "未知错误"))
                     // 自定义 scheme 加载失败：整轮关掉过滤并用原始地址重建，
                     // 绝不让「去广告」把正常播放拖垮（1.4.7 回归的最终兜底）
                     if !self.adProxyBypassed,
@@ -932,6 +935,7 @@ final class VideoPlayerViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+                SessionTrace.mark("完 播放 \(self.videoDetail.vodName) 自然播完")
                 self.playNextEpisode()
             }
         }
@@ -943,6 +947,7 @@ final class VideoPlayerViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+                SessionTrace.mark("败 播放 播放中断（分片/会话失效）")
                 self.autoSwitchSource(reason: "播放中断")
             }
         }

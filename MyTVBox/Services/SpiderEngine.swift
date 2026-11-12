@@ -533,6 +533,8 @@ final class SpiderEngine {
         // 1.7.8：/config 到底慢在哪一步，直接看这两行
         out.append("本机源配置    : " + LocalSourceCache.lastProbe)
         out.append("配置缓存      : " + LocalSourceCache.describe())
+        // 1.8.5：进程真实物理内存（含 V8 堆 + 视频缓冲 + 位图），判 Jetsam 的基准
+        out.append("进程内存      : " + MemoryProbe.summary())
         // 1.8.4：老大问「慢是不是某些站点没加载」—— 直接把被跳过的坏站列出来
         let cooling = SiteHealth.shared.coolingKeys()
         out.append("站点健康      : " + (cooling.isEmpty
@@ -583,12 +585,15 @@ final class SpiderEngine {
         out.append("node ready    : \(rt.isReady ? "YES" : "NO")")
         out.append("node baseURL  : \(rt.baseURL)")
         out.append("relay baseURL : " + (NodeRelayService.shared.baseURL ?? "nil"))
-        let logTail = rt.tailLog(lines: 12)
+        // 1.8.5：12 行只够看到 undici 栈的尾巴，看不到错误首行和内存曲线
+        let logTail = rt.tailLog(lines: 40)
         out.append("node.log 尾部 :")
         for line in logTail.split(separator: "\n", omittingEmptySubsequences: false) {
             out.append("  " + line)
         }
         out.append("")
+        // 1.8.5：不再押单一假设，把 6 类原因的证据逐项列出来
+        out.append(contentsOf: CrashDiagnostic.lines())
         out.append("--- 站点路由 ---")
         if let site {
             let isNode = NodeRelayService.isNodeSite(site)

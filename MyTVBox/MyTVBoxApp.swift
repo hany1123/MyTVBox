@@ -50,6 +50,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     // MARK: - 后台音频保活
 
     @objc private func didEnterBackground() {
+        // 1.8.5：生命周期写进面包屑，用来排除「切后台被系统回收 / 用户主动杀进程」
+        SessionTrace.mark("命 进入后台")
         // 通知视频播放器：禁用视频轨道，只保留音频输出
         // iOS 在后台不允许渲染视频，但允许音频继续
         // 如果不禁用视频轨道，整个 AVPlayer 会被挂起
@@ -62,11 +64,18 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     @objc private func willEnterForeground() {
+        // 1.8.5：配对的生命周期痕迹
+        SessionTrace.mark("命 回前台")
         // 通知视频播放器：恢复视频轨道
         NotificationCenter.default.post(name: .appWillEnterForeground, object: nil)
 
         // 确保音频会话活跃
         try? AVAudioSession.sharedInstance().setActive(true)
+    }
+
+    func applicationWillTerminate(_ application: UIApplication) {
+        // 1.8.5：正常终止也留痕。若能看到这一行，就不是「闪退」而是系统/用户主动结束
+        SessionTrace.mark("命 即将终止（非崩溃）")
     }
 }
 

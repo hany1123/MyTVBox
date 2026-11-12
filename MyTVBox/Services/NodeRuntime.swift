@@ -140,7 +140,9 @@ final class NodeRuntime {
             // 表现就是「点开一部片直接闪退」，比 Jetsam 更频繁也更难查。
             // 1.7.7 放到 512 MB（前台 App 的 Jetsam 水位远高于此），峰值内存改由
             // 「跨站搜索分批（CrossSiteResolver concurrency）」控制，不再靠压堆。
-            setenv("NODE_OPTIONS", "--max-old-space-size=512", 1)
+            // 1.8.5：加 `--expose-gc`，让 main.js 在高水位时主动 full GC。
+            // Node 与 AVPlayer 同进程，播放时 V8 堆不回收会和视频缓冲叠加。
+            setenv("NODE_OPTIONS", "--max-old-space-size=512 --expose-gc", 1)
 
             // C 的 argv 必须以 NULL 结尾，argc 不含这个 NULL。
             // 少写这个 nil 会导致 node_start 读越界，表现为启动即崩或卡死。
