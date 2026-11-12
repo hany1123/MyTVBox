@@ -29,7 +29,8 @@ enum MemoryProbe {
             MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size)
         let result: kern_return_t = withUnsafeMutablePointer(to: &info) { ptr in
             ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { out in
-                task_info(mach_task_self(), task_flavor_t(MACH_TASK_BASIC_INFO), out, &count)
+                // mach_task_self() 是 C 宏，Swift 里要用同名的全局变量 mach_task_self_
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), out, &count)
             }
         }
         guard result == KERN_SUCCESS else { return 0 }

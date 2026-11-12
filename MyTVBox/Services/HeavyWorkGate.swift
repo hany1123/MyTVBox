@@ -67,7 +67,7 @@ actor HeavyWorkGate {
     func run<T>(_ body: @escaping () async -> T) async -> T? {
         guard await acquire() else { return nil }
         let result = await body()
-        await release()
+        release()   // 同一个 actor 内部调用，不需要 await
         return result
     }
 }
