@@ -100,13 +100,39 @@ enum CrashDiagnostic {
                 let fmin = footList.min() ?? 0
                 let fp = footList.max() ?? 0
                 let jump = fp - fmin
-                out.append("     foot 判读      : 最低 \(fmin)MB / 峰值 \(fp)MB / 末条 \(footList.last ?? 0)MB，跃升 \(jump)MB")
-                out.append("     结论          : "
-                           + (jump < 40 && fp < 400
-                              ? "**按现有证据基本排除 Jetsam**（foot 全程平稳且绝对值不高，视频侧映射没有暴涨）"
-                              : "**高度可疑**（foot 出现明显跃升，优先查视频侧缓冲）"))
+                // 1.8.12：1.8.11 只有 2 条心跳（t=0 / t=2s），foot 2 秒涨 39MB，
+                // 进程在跃升刚开始处就没了 —— 判别器却按「39 < 40」判成
+                //「全程平稳、排除 Jetsam」。**曲线被截断时没有后半段，不能叫平稳**。
+                let interrupted = !scope.contains(where: { $0.contains("完 心跳") })
+                let rate = Double(jump) / 2.0
+                out.append("     foot 判读      : 最低 \(fmin)MB / 峰值 \(fp)MB / 末条 \(footList.last ?? 0)MB，跃升 \(jump)MB · 约 \(Int(rate))MB/s · 样本 \(footList.count) 条，曲线"
+                           + (interrupted ? "**被截断（进程消失）**" : "完整收尾"))
+                let verdict: String
+                if interrupted && footList.count < 3 {
+                    verdict = "**证据不足，不能排除 Jetsam**：曲线在跃升刚开始处被砍断（只有 \(footList.count) 条心跳、无「完 心跳」），按 \(Int(rate))MB/s 外推 3 秒还会再涨约 \(Int(rate * 3))MB。1.8.9 那次是播到 t=6s 且正常退出，那才叫真平稳"
+                } else if jump < 40 && fp < 400 {
+                    verdict = "**按现有证据基本排除 Jetsam**（曲线完整，foot 平稳且绝对值不高）"
+                } else {
+                    verdict = "**高度可疑**（foot 明显跃升，优先查视频侧缓冲与 Node V8 堆）"
+                }
+                out.append("     结论          : " + verdict)
             } else {
                 out.append("     foot 判读      : 本版心跳应带 foot=；若为空请回报（task_vm_info 在该设备读取失败）")
+            }
+            // 1.8.12：node.log 的 mem10 是另一条独立曲线。1.8.11 里 Node RSS
+            // 144→164→182MB 与 App RSS 186→232MB 同步上涨，说明内存在 Node 侧
+            // （跨站搜索 + /play 同时在跑），不是纯 AVFoundation 解码缓冲。
+            let nodeRssList: [Int] = NodeRuntime.shared.tailLog(lines: 400)
+                .split(separator: "\n")
+                .filter { $0.contains("mem10 ") }
+                .suffix(8)
+                .compactMap { line in
+                    guard let r = line.range(of: "rss=") else { return nil }
+                    let digits = String(line[r.upperBound...].prefix(while: { $0.isNumber }))
+                    return Int(digits)
+                }
+            if !nodeRssList.isEmpty {
+                out.append("     Node RSS       : 最近 \(nodeRssList.count) 条 mem10 样本 \(nodeRssList.first ?? 0)→\(nodeRssList.last ?? 0)MB（峰值 \(nodeRssList.max() ?? 0)MB）· 与 App RSS 同步上涨 = 内存在 Node 侧；不同步才更像视频解码缓冲")
             }
         }
 
@@ -166,7 +192,7 @@ enum CrashDiagnostic {
         } else {
             out.append("[7] 原生信号      : 未捕获到 SIGABRT / SIGSEGV / SIGBUS / SIGTRAP 记录")
         }
-        out.append("     判据          : 这类崩溃不产生 NSException、不写 node.log FATAL，只有 signal handler 能留痕；SIGKILL 抓不到，但已由 foot 曲线排除 Jetsam")
+        out.append("     判据          : 这类崩溃不产生 NSException、不写 node.log FATAL，只有 signal handler 能留痕；SIGKILL 抓不到，Jetsam 是否成立请看 [1] 的曲线完整性与增速判读")
 
         // 8. 起播阶段 + 重活并发 —— 1.8.10：1.8.9 崩在「记 播放 URL」之前
         let stageHits = playScope.filter { $0.contains("记 播放") || $0.contains("item.status=") }
@@ -185,10 +211,13 @@ enum CrashDiagnostic {
         for l in stageHits.suffix(4) { out.append("     " + l) }
         let openWork = scope.filter { $0.contains("开 重活") }.count
         let closeWork = scope.filter { $0.contains("完 重活") }.count
-        out.append("     重活并发      : 整站级搜索 开 \(openWork) / 完 \(closeWork) → "
-                   + (openWork > closeWork
-                      ? "**起播时仍有未结束的跨站搜索**（与本机 Node 同进程）"
-                      : "无在飞重活"))
+        // 1.8.12：全局「开/完 数量配对」≠ 时间上不重叠。1.8.11 的 `完 重活`
+        // 就落在播放窗口内（起播后 2 秒），判别器却报「无在飞重活」。
+        let playWork = playScope.filter { $0.contains("开 重活") || $0.contains("完 重活") }
+        out.append("     重活并发      : 本次播放窗口内 \(playWork.count) 条重活事件（全局配对 开 \(openWork) / 完 \(closeWork)）→ "
+                   + (playWork.isEmpty ? "播放期间无重活"
+                      : "**起播与整站搜索时间重叠**（数量配对不代表不重叠）"))
+        for l in playWork.suffix(2) { out.append("     " + l) }
         out.append("     心跳结局      : "
                    + (scope.contains(where: { $0.contains("完 心跳") })
                       ? "有「完 心跳」→ 播放页主动消失，心跳是正常收尾"
@@ -203,7 +232,7 @@ enum CrashDiagnostic {
             out.append("     说明          : "
                        + (scope.contains(where: { $0.contains("完 心跳") })
                           ? "有「完 心跳」，本轮心跳是正常收尾，不是被杀断的"
-                          : "按 2 秒采样，末条之后本应还有下一条；缺了就是进程在那一瞬间没了"))
+                          : "按 1~2 秒采样（起播前 10 秒为 1 秒），末条之后本应还有下一条；缺了就是进程在那一瞬间没了"))
         }
         out.append("播放结局          : "
                    + (playScope.last(where: { $0.contains("完 播放") })

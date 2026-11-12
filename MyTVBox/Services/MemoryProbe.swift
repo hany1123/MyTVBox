@@ -7,7 +7,8 @@
 //
 //  进程消失至少有 6 类原因。这里做**双心跳**：
 //    · 主线程每 1 秒只更新一个时间戳（不写日志）
-//    · 后台每 2 秒写一行面包屑，同时读出「主线程多久没动过」+ 两个内存指标
+//    · 后台写一行面包屑，同时读出「主线程多久没动过」+ 两个内存指标
+//      1.8.12 起：起播前 10 秒每 1 秒一条，之后每 2 秒一条
 //  于是：
 //    · 后台心跳继续、主线程时间戳停摆 → 主线程卡死 → watchdog(0x8badf00d)
 //    · 两条线同时停 → 进程被杀，再看内存曲线区分 Jetsam / V8 abort
@@ -129,11 +130,14 @@ final class PlaybackHeartbeat {
         }
 
         // 后台探针：即使主线程卡死也继续写，这是区分 watchdog 的关键。
-        // 1.8.9：3s → 2s。1.8.8 崩在 t=6s 心跳之后、下一条 t=9s 之前，
-        // 采样太粗会漏掉突发的 phys_footprint 尖峰。
+        // 1.8.9：3s → 2s。1.8.12：**起播前 10 秒再加密到 1s**。
+        // AVAsset 装载窗口就是崩溃高发段，1.8.11 只拿到 t=0/t=2s 两个点，
+        // 曲线一被截断，判别器既看不到峰值也无法算增速。
+        // 240 行日志窗口复核：前 10s 10 条 + 之后每 2s 一条 ≈ 覆盖 7 分钟播放，仍够。
         bgTask = Task.detached { [weak self] in
+            var interval: UInt64 = 1_000_000_000
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(nanoseconds: interval)
                 guard !Task.isCancelled, let self else { return }
                 let sec = Int(Date().timeIntervalSince(t0))
                 let rss = MemoryProbe.record()
@@ -143,6 +147,7 @@ final class PlaybackHeartbeat {
                     ? String(format: "主=卡%.1fs", gap)
                     : "主=OK"
                 SessionTrace.mark("跳 播放 t=\(sec)s rss=\(rss)MB foot=\(foot)MB \(state)")
+                interval = sec < 10 ? 1_000_000_000 : 2_000_000_000
             }
         }
     }

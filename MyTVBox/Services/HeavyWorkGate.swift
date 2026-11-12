@@ -23,7 +23,17 @@ actor HeavyWorkGate {
     static let shared = HeavyWorkGate()
 
     private var busy = false
+    /// 1.8.12：播放页起播时置位，让在飞的整站级重活尽快收手。
+    /// 1.8.11 诊断里 Node RSS 144→164→182MB 与 App RSS 186→232MB 同步上涨，
+    /// 且 `完 重活` 落在起播窗口内 —— 跨站搜索与 AVAsset 装载在同一进程抢内存。
+    private var cancelRequested = false
     private var waiters: [(id: UUID, cont: CheckedContinuation<Bool, Never>)] = []
+
+    /// 播放页 onAppear 调用；不打断已经发出的单站请求，只让滑动窗口别再补位
+    func requestCancelCurrent() { cancelRequested = true }
+
+    /// 供 CrossSiteResolver 在 `group.next()` 循环里轮询
+    func isCancelRequested() -> Bool { cancelRequested }
 
     /// 拿闸；被取消时返回 false（调用方直接放弃，不要再干活）
     func acquire() async -> Bool {
@@ -66,7 +76,10 @@ actor HeavyWorkGate {
     /// 排队 → 执行 → 必然还闸。取消时返回 nil。
     func run<T>(_ body: @escaping () async -> T) async -> T? {
         guard await acquire() else { return nil }
+        // 新重活开始，清掉上一次播放页留下的取消请求；结束时也清，避免串会话
+        cancelRequested = false
         let result = await body()
+        cancelRequested = false
         release()   // 同一个 actor 内部调用，不需要 await
         return result
     }

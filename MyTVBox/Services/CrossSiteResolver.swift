@@ -224,6 +224,14 @@ enum CrossSiteResolver {
 
                 // 1.8.2：页面已退 / 搜索被新词取代 → 收手，别占着重活闸
                 if Task.isCancelled { group.cancelAll(); break }
+                // 1.8.12：播放页已起播 → 让出 Node 资源。整站搜索的 V8 堆与
+                // AVAsset 装载在同一进程抢内存，1.8.11 两条曲线同步涨了 40MB+，
+                // 随后进程在 AVPlayerItem 装载阶段被终止。
+                if await HeavyWorkGate.shared.isCancelRequested() {
+                    SessionTrace.mark("略 重活 播放页起播，主动收手")
+                    group.cancelAll()
+                    break
+                }
                 // 1.8.3：总时间预算到点 → 取消在飞的，用已拿到的结果出报告
                 if budget > 0, Date().timeIntervalSince(t0) >= budget {
                     group.cancelAll()

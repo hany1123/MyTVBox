@@ -219,6 +219,12 @@ struct VideoPlayerView: View {
                     preferredSiteKey: state.currentSite?.key
                 )
             }
+            // 1.8.12：起播前先请跨站聚合搜索收手。1.8.11 里 `完 重活` 落在
+            // 起播窗口内，Node RSS 与 App RSS 同步上涨，两条线一起把内存顶上去。
+            // 不改 model.start() 的时序，只发取消请求；搜索在下一次 group.next()
+            // 就会 break，通常几十毫秒内生效。
+            Task { await HeavyWorkGate.shared.requestCancelCurrent() }
+            SessionTrace.mark("记 播放 已请求取消在飞跨站搜索")
             model.start()
             scheduleAutoHide()
             TabBarVisibility.setHidden(true)
