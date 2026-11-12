@@ -102,10 +102,35 @@ final class NodeRelayService {
               let name = health["name"] as? String,
               name == "CatVodSpiderios" else { return nil }
         guard let cfg = try? await getJSON(base + "/config", timeout: 12),
-              let video = cfg["video"] as? [String: Any],
-              let arr = video["sites"] as? [[String: Any]], !arr.isEmpty else { return nil }
+              let parsed = Self.config(fromJSONObject: cfg, base: base) else { return nil }
 
         baseURL = base
+        return parsed
+    }
+
+    /// 1.7.8：把 `/config` 的 JSON 转成可用的站点池。
+    ///
+    /// 源返回的是 `{video:{sites:[…]}}`，站点长这样：
+    /// `{key:"nodejs_douban", name:"豆瓣|首页", type:3, api:"/spider/douban/3"}`。
+    /// 必须做四件事才可用：
+    /// 1. key 去掉 `nodejs_` 前缀，加 `noderelay_`；
+    /// 2. `api` 是**相对路径**，要拼上 base 变成绝对地址；
+    /// 3. `type` 归一到 1（走 JSON 直解分支，避免被判成 JSP）；
+    /// 4. 记下 `spiderKey` 与 `nodeRelayBase`，后续 play/detail 才能转发。
+    ///
+    /// 直接用通用 JSON 解码（`decodeWithExtras`）只会得到 0 个站点 ——
+    /// 因为顶层 `sites` 是空的，站点全在 `video.sites` 里。
+    static func config(fromJSON data: Data, base: String) -> TVBoxConfig? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return config(fromJSONObject: obj, base: base)
+    }
+
+    static func config(fromJSONObject cfg: [String: Any], base: String) -> TVBoxConfig? {
+        guard let video = cfg["video"] as? [String: Any],
+              let arr = video["sites"] as? [[String: Any]], !arr.isEmpty else { return nil }
+
         let sites: [Site] = arr.compactMap { d in
             guard let key = d["key"] as? String, !key.isEmpty else { return nil }
             // 1.7.5：源自己勾了「不启用」的站点直接跳过 —— 源作者标了 enable:false

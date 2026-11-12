@@ -72,28 +72,46 @@ final class ConfigService {
 
         // 1) 缓存够新：直接命中（打开就出站点，源再慢也不影响界面）
         if let cached = LocalSourceCache.data(maxAge: 30 * 60),
-           let cfg = try? decodeWithExtras(cached) {
+           let cfg = Self.nodeConfig(from: cached, url: urlString) {
             LocalSourceCache.note("缓存命中 · " + LocalSourceCache.describe())
+            applyLocalStats(cfg)
             return cfg
         }
 
         // 2) 单飞取一次：和启动预热共用同一个请求，60 秒超时，不猜备选路径
         if let data = await NodeRuntime.shared.fetchLocalConfigOnce(),
-           let cfg = try? decodeWithExtras(data),
-           (cfg.sites ?? []).isEmpty == false {
+           let cfg = Self.nodeConfig(from: data, url: urlString) {
+            applyLocalStats(cfg)
             return cfg
         }
-        // 注意：源刚起来时可能返回 200 但 sites 为空（远端站点配置还没拉到），
+        // 注意：源刚起来时可能返回 200 但 video.sites 为空（远端站点配置还没拉到），
         // 那不能算成功 —— 继续往下走缓存，否则界面就是「0 个站点」。
 
         // 3) 任意年龄的缓存兜底：宁可给旧站点，也别让界面空着
         if let cached = LocalSourceCache.data(),
-           let cfg = try? decodeWithExtras(cached) {
+           let cfg = Self.nodeConfig(from: cached, url: urlString) {
             LocalSourceCache.note("已退回缓存 · " + LocalSourceCache.describe())
+            applyLocalStats(cfg)
             return cfg
         }
 
         throw NetworkError.noData
+    }
+
+    /// 1.7.8 修：本机源的 `/config` 是 `{video:{sites:[…]}}`，
+    /// 必须走 Node 专用解析（去 `nodejs_` 前缀、相对 api 拼绝对、type 归一到 1）。
+    /// 用通用 JSON 解码会得到 0 个站点 —— 顶层 `sites` 本来就是空的。
+    private static func nodeConfig(from data: Data, url: String) -> TVBoxConfig? {
+        let base = NodeRelayService.normalize(url) ?? NodeRuntime.shared.baseURL
+        guard let cfg = NodeRelayService.config(fromJSON: data, base: base),
+              let sites = cfg.sites, !sites.isEmpty else { return nil }
+        return cfg
+    }
+
+    private func applyLocalStats(_ cfg: TVBoxConfig) {
+        let n = cfg.sites?.count ?? 0
+        lastStats = ConfigStats(totalSites: n, usableSites: n, droppedJarSites: 0, lives: 0)
+        lastRepos = []
     }
 
     private func loadStandardConfig(from urlString: String) async throws -> TVBoxConfig {
