@@ -24,7 +24,9 @@ enum CrashDiagnostic {
         // 1.8.7：旧版只读 previousTail(40)。用户在**同一次会话**里打开诊断时，
         // 本轮播放心跳全被丢掉 —— 1.8.6 诊断明明有 4 条「跳 播放」，
         // 却报「[1] 证据不足 / 心跳覆盖度 0」。判别器自己制造了证据盲区。
-        let all = SessionTrace.recent(80)
+        // 1.8.9：心跳 3s→2s，80 行窗口只够 160 秒播放，会把「启 启动」分界线
+        // 和上一轮崩溃现场一起挤出日志。窗口放大到 240 行（≈8 分钟播放）。
+        let all = SessionTrace.recent(240)
         let boot = all.lastIndex(where: { $0.contains(SessionTrace.bootToken) })
         let current = boot.map { Array(all[($0 + 1)...]) } ?? all
         let previous = boot.map { Array(all[..<$0]) } ?? []
@@ -63,17 +65,34 @@ enum CrashDiagnostic {
         out.append("证据范围      : 本轮 \(current.count) 行 / 上一轮 \(previous.count) 行 → 取「\(scopeName)」（心跳 \(beats.count) 条）")
         out.append("node.log 关键行: \(keyLines.count) 行（本次启动后全文提取，见报告下一段）")
 
-        // 1. Jetsam
+        // 1. Jetsam —— 1.8.9：必须同时看 RSS 与 phys_footprint
+        let footList = beats.compactMap { footMB(from: $0) }
         if rssList.isEmpty {
-            out.append("[1] Jetsam/内存    : 证据不足（\(scopeName)没有播放心跳，看不到 RSS 曲线）")
+            out.append("[1] Jetsam/内存    : 证据不足（\(scopeName)没有播放心跳，看不到内存曲线）")
         } else {
             let first = rssList.first ?? 0
             let last = rssList.last ?? 0
             let peak = rssList.max() ?? 0
             let trend = last - first
+            let footText: String
+            if footList.isEmpty {
+                footText = "phys_footprint 未记录（旧版心跳 / task_vm_info 读取失败）"
+            } else {
+                let f0 = footList.first ?? 0
+                let f1 = footList.last ?? 0
+                let fp = footList.max() ?? 0
+                footText = "foot \(f0)→\(f1)MB（峰值 \(fp)MB，变化 \(f1 - f0 >= 0 ? "+" : "")\(f1 - f0)MB）"
+            }
             out.append("[1] Jetsam/内存    : RSS \(first)→\(last)MB（\(scopeName)峰值 \(peak)MB，变化 \(trend >= 0 ? "+" : "")\(trend)MB）"
-                       + " · 内存警告 \(warns.count) 次 · 历史峰值 \(MemoryProbe.peakMB())MB")
-            out.append("     判据          : RSS 持续爬升且逼近设备上限 → 高度可疑；RSS 平稳 → 基本排除")
+                       + " · \(footText) · 内存警告 \(warns.count) 次")
+            out.append("     判据          : **Jetsam 看 phys_footprint，不是 RSS**。AVPlayer 的硬件解码缓冲 / IOSurface / IOKit 映射不计入 resident_size；所以「RSS 平稳」不能排除内存被系统回收，要看 foot 是否一路爬升")
+            if !footList.isEmpty {
+                let fmin = footList.min() ?? 0
+                let fp = footList.max() ?? 0
+                out.append("     foot 判读      : 最低 \(fmin)MB / 峰值 \(fp)MB / 末条 \(footList.last ?? 0)MB，跃升 \(fp - fmin)MB；进程若在末条心跳后消失，重点看最后 2 秒采样窗口内的突发分配")
+            } else {
+                out.append("     foot 判读      : 本版心跳应带 foot=；若为空请回报（task_vm_info 在该设备读取失败）")
+            }
         }
 
         // 2. Watchdog
@@ -159,5 +178,15 @@ enum CrashDiagnostic {
         let rest = line[r.upperBound...]
         let digits = rest.prefix(while: { $0.isNumber })
         return Int(digits)
+    }
+
+    /// 1.8.9：读心跳里的 phys_footprint。0 = task_vm_info 读取失败，不能当成
+    /// 「内存只有 0MB」画进曲线，否则会把证据变成误导。
+    private static func footMB(from line: String) -> Int? {
+        guard let r = line.range(of: "foot=") else { return nil }
+        let rest = line[r.upperBound...]
+        let digits = rest.prefix(while: { $0.isNumber })
+        guard let v = Int(digits), v > 0 else { return nil }
+        return v
     }
 }

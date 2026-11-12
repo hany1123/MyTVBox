@@ -18,8 +18,10 @@ import Foundation
 enum SessionTrace {
 
     private static let lock = NSLock()
-    /// 只留最近 80 行，避免文件变长
-    private static let keep = 80
+    /// 1.8.9：心跳 2s 一条，80 行窗口只够 160 秒播放。放大到 240 行（≈8 分钟），
+    /// 并做「滞后裁剪」：超过 keep+slack 才裁回 keep，避免每 2 秒重写整个文件。
+    private static let keep = 240
+    private static let slack = 40
 
     private static var logFile: URL {
         let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -52,7 +54,7 @@ enum SessionTrace {
     private static func trimIfNeeded(_ url: URL) {
         guard let s = try? String(contentsOf: url, encoding: .utf8) else { return }
         let lines = s.components(separatedBy: "\n").filter { !$0.isEmpty }
-        guard lines.count > keep else { return }
+        guard lines.count > keep + slack else { return }
         let kept = lines.suffix(keep).joined(separator: "\n") + "\n"
         try? kept.data(using: .utf8)?.write(to: url, options: .atomic)
     }
