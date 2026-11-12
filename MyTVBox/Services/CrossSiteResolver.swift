@@ -189,7 +189,20 @@ enum CrossSiteResolver {
         // 用开/完配对让判别器能判断「起播时是否有整站级重活并发」。
         // defer 保证所有 return 分支都收口，进程被杀时自然只剩「开」。
         SessionTrace.mark("开 重活 跨站搜索 \(keyword) 站=\(targets.count)")
-        defer { SessionTrace.mark("完 重活 跨站搜索 \(keyword)") }
+        // 1.8.14：1.8.13 诊断里进程正死在「开 重活」后 2.4 秒，而这段既没有
+        // 播放心跳也没有 spike 采样。重活期间把 App 级心跳加密到 200ms，
+        // 并标上 work/stage，下一轮就能看到崩前整段内存曲线。
+        AppRuntimeState.shared.beginWork()
+        AppRuntimeState.shared.set(stage: "search")
+        AppHeartbeat.shared.setFast(true)
+        AppHeartbeat.shared.mark("事件 开重活 跨站搜索 \(keyword) 站=\(targets.count)")
+        defer {
+            AppHeartbeat.shared.setFast(false)
+            AppRuntimeState.shared.endWork()
+            AppRuntimeState.shared.set(stage: "home")
+            AppHeartbeat.shared.mark("事件 完重活 跨站搜索 \(keyword)")
+            SessionTrace.mark("完 重活 跨站搜索 \(keyword)")
+        }
 
         let kw = keyword
         let per = max(1, limitPerSite)

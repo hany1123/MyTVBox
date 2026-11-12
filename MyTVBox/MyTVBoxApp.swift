@@ -32,6 +32,14 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // 1.8.13：/play 高频内存采样日志的启动分界线。写在 bootToken 之前，
         // 这样上一轮没有 END 的 spike 窗口能被明确切成「崩溃轮」。
         SpikeProbe.shared.boot()
+        // 1.8.14：App 级常驻心跳。1.8.13 诊断第二次证明崩溃发生在**非播放状态**
+        //（播放正常收尾 → 后台 → 回前台 → 详情 → 跨站搜索 → 2.4 秒后进程消失），
+        // 而播放心跳 / spike / 面包屑都覆盖不到这段。这里从启动一直采到进程终止。
+        AppHeartbeat.shared.boot()
+        AppHeartbeat.shared.start()
+        AppRuntimeState.shared.set(foreground: true)
+        AppRuntimeState.shared.set(stage: "home")
+        AppHeartbeat.shared.mark("事件 App 启动")
 
         // 1.8.2：写启动分界线。诊断里「上一轮最后一行」只认这条线之前的内容，
         // 否则本次会话里正在飞的 `开 搜索` 会被误报成上次闪退。
@@ -60,6 +68,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     @objc private func didEnterBackground() {
         // 1.8.5：生命周期写进面包屑，用来排除「切后台被系统回收 / 用户主动杀进程」
         SessionTrace.mark("命 进入后台")
+        AppRuntimeState.shared.set(foreground: false)
+        AppRuntimeState.shared.set(stage: "bg")
+        AppHeartbeat.shared.mark("事件 进入后台")
         // 通知视频播放器：禁用视频轨道，只保留音频输出
         // iOS 在后台不允许渲染视频，但允许音频继续
         // 如果不禁用视频轨道，整个 AVPlayer 会被挂起
@@ -74,6 +85,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     @objc private func willEnterForeground() {
         // 1.8.5：配对的生命周期痕迹
         SessionTrace.mark("命 回前台")
+        AppRuntimeState.shared.set(foreground: true)
+        AppRuntimeState.shared.set(stage: "home")
+        AppHeartbeat.shared.mark("事件 回前台")
         // 通知视频播放器：恢复视频轨道
         NotificationCenter.default.post(name: .appWillEnterForeground, object: nil)
 
@@ -84,6 +98,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     func applicationWillTerminate(_ application: UIApplication) {
         // 1.8.5：正常终止也留痕。若能看到这一行，就不是「闪退」而是系统/用户主动结束
         SessionTrace.mark("命 即将终止（非崩溃）")
+        AppHeartbeat.shared.mark("事件 即将终止（非崩溃）")
     }
 }
 

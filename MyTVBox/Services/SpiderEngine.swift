@@ -636,6 +636,16 @@ final class SpiderEngine {
             for line in prevTrace { out.append("  " + line) }
         }
         out.append("/play 高频取样 : " + (SpikeProbe.shared.recentWindows(1).last?.describe ?? "无窗口（本次启动还没发起过取流）"))
+        // 1.8.14：App 级常驻心跳。1.8.13 第二次复现「播放正常收尾后崩在非播放状态」，
+        // 播放心跳 / spike / 面包屑全都不覆盖那段。这里把崩溃轮最后 20 行原文贴出来，
+        // 崩前 10 秒的 foot / 前台后台 / 播放中 / 在飞重活 / 阶段一眼可见。
+        let appPrev = AppHeartbeat.shared.previousWindow()
+        out.append("App 级心跳（崩溃轮，\(appPrev.count) 行 · 末 20 行）:")
+        if appPrev.isEmpty {
+            out.append("  (无 · 本版首次启动 / appbeat.log 被裁剪)")
+        } else {
+            for line in appPrev.suffix(20) { out.append("  " + line) }
+        }
         out.append("")
         // 1.8.5：不再押单一假设，把 6 类原因的证据逐项列出来
         out.append(contentsOf: CrashDiagnostic.lines())

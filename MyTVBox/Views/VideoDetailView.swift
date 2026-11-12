@@ -608,6 +608,8 @@ struct VideoDetailView: View {
         let title = previewItem?.vodName ?? detail?.vodName ?? ""
         diag("站点 \(site.key) · vodId=\(vodId) · 标题=\(title)")
         SessionTrace.mark("开 详情 \(title.isEmpty ? vodId : title)")
+        AppRuntimeState.shared.set(stage: "detail")
+        AppHeartbeat.shared.mark("事件 开详情 " + (title.isEmpty ? vodId : title))
         diag(isRecommendWallItem ? "判定：推荐墙条目 → 直接跨站找片源" : "判定：普通条目 → 先问本驿站")
 
         // 1.7.5：豆瓣这类推荐墙，直接跳到「全站聚合搜索」。
@@ -628,8 +630,13 @@ struct VideoDetailView: View {
         if !isRecommendWallItem {
             let t0 = Date()
             do {
+                // 1.8.14：20 → 10 秒。1.8.13 诊断里 `开 详情 21:04:34.481` →
+                // `记 搜索 21:04:54.502` 正好空等 20 秒，Node 侧那条
+                // `REQ POST /spider/appv7zhuijudaren/3/detail` 始终没有 RES。
+                // 本站没数据就是没数据，等 20 秒不会让它变出来，只是把用户
+                // 和「仍在飞的请求」一起拖进后面的 16 路跨站搜索。
                 if let d = try await APIService.shared.fetchVideoDetail(
-                    site: site, vodId: vodId, timeout: 20) {
+                    site: site, vodId: vodId, timeout: 10) {
                     let ms = Int(Date().timeIntervalSince(t0) * 1000)
                     let parsed = d.parsePlaySources()
                     diag("本站 detail: OK \(ms)ms · 线路 \(parsed.count) 条")
@@ -655,6 +662,7 @@ struct VideoDetailView: View {
         // 一进详情 1 毫秒就出现「无线路」，看起来像瞬间失败 —— 其实接管还在跑。
         // 现在挪到接管之后，并把本站失败原因一起记下。
         if Task.isCancelled { return }
+        AppHeartbeat.shared.mark("事件 本站 detail 未拿到线路 → 跨站接管")
         if await adoptDetailFromOtherSites(title: title) { return }
         SessionTrace.mark("完 详情 \(title.isEmpty ? vodId : title) 无线路（\(failReason)）")
 

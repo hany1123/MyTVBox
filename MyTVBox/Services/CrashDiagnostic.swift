@@ -30,6 +30,7 @@ enum CrashDiagnostic {
         // 1.8.7：本轮/上一轮双范围；1.8.9：窗口 80→240 行（2s 心跳）。
         let all = SessionTrace.recent(240)
         let boot = all.lastIndex(where: { $0.contains(SessionTrace.bootToken) })
+        let bootLine = boot.map { all[$0] }
         let current = boot.map { Array(all[($0 + 1)...]) } ?? all
         let previous = boot.map { Array(all[..<$0]) } ?? []
 
@@ -45,9 +46,21 @@ enum CrashDiagnostic {
         let scopeName = useCurrent ? "本轮" : "上一轮"
         let beats = useCurrent ? curBeats : prevBeats
 
-        // 本次播放范围：最后一次「开 播放」之后的所有行
+        // 本次播放范围：最后一次「开 播放」之后、到「播放页消失」为止。
+        // 1.8.14：原来一直取到会话结束，把播放结束 36 秒后的详情页 / 跨站搜索
+        // 全算进「本次播放窗口」，于是 1.8.13 误报「起播与整站搜索时间重叠」，
+        // 那些重活其实都在 `完 播放 正常退出` 之后。
         let pStart = scope.lastIndex(where: { $0.contains("开 播放") }) ?? scope.startIndex
-        let playScope = Array(scope[pStart...])
+        let playTail = Array(scope[pStart...])
+        let playEnd = playTail.firstIndex(where: {
+            $0.contains("命 播放页消失") || $0.contains("完 心跳")
+                || ($0.contains("完 播放") && $0.contains("正常退出"))
+        })
+        let playScope = playEnd.map { Array(playTail[...$0]) } ?? playTail
+        let playEndedNormally = playTail.contains(where: {
+            $0.contains("完 播放") && $0.contains("正常退出")
+        })
+        let beatGap = beats.last.flatMap { gapToBoot(from: $0, bootLine: bootLine) }
 
         // 1.8.7：node.log 每 10s 一条 mem10，tail 40 行几乎全是内存样本。
         // 改用「本次启动之后」的全文关键行，FATAL 首行 / shim 状态 / rc=9 都不会被挤掉。
@@ -117,7 +130,13 @@ enum CrashDiagnostic {
                     verdict = "**证据不足，不能排除 Jetsam**：" + shapeText
                         + "。1.8.9 那次是播到 t=6s 且正常退出，那才叫真平稳；本轮请看 [9] 的 100ms 采样"
                 } else if jump < 40 && fp < 400 {
-                    verdict = "**按现有证据基本排除 Jetsam**（1s 心跳曲线完整、foot 平稳且绝对值不高；若 [9] 抓到尖峰则以 [9] 为准）"
+                    // 1.8.14：1.8.13 拿播放期（21:03:50~21:04:20）的平稳曲线
+                    // 去判 21:04:56 的崩溃，中间 36 秒完全没有内存证据。
+                    if let g = beatGap, g > 8 {
+                        verdict = "**仅播放期可排除 Jetsam**：曲线完整、foot 平稳，但末条播放心跳距本次启动 \(g) 秒 —— 崩溃时刻**没有内存证据**，结论不能外推到非播放期；请看 [10] App 级心跳"
+                    } else {
+                        verdict = "**按现有证据基本排除 Jetsam**（1s 心跳曲线完整、foot 平稳且绝对值不高；若 [9] 抓到尖峰则以 [9] 为准）"
+                    }
                 } else {
                     verdict = "**高度可疑**（foot 明显跃升，优先查视频侧缓冲与 Node V8 堆）"
                 }
@@ -219,12 +238,16 @@ enum CrashDiagnostic {
         let reachedURL = playScope.contains(where: { $0.contains("记 播放 URL") })
         let playStarted = playScope.contains(where: { $0.contains("发起 /play 取流") })
         let playEnded = playScope.contains(where: { $0.contains("/play 结束") })
-        let stageText = reachedReady ? "首帧就绪之后"
-            : (reachedItem ? "已创建 AVPlayerItem、等 status"
-               : (reachedURL ? "已拿到播放 URL"
-                  : (playStarted ? (playEnded ? "/play 已返回、未拿到可播 URL"
-                                   : "**/play 取流请求在飞（未见返回）**")
-                     : "起播入口之前 / 非本机源解析")))
+        // 1.8.14：播放已经正常收尾时，别再按「缺 item.status 回调」判成崩在装载期。
+        // 1.8.13 就是这样把一次完整 29 秒的正常播放读成「已创建 AVPlayerItem、等 status」。
+        let stageText = playEndedNormally
+            ? "**播放已正常收尾 → 崩溃发生在非播放状态**（看 [10] App 级心跳）"
+            : (reachedReady ? "首帧就绪之后"
+               : (reachedItem ? "已创建 AVPlayerItem、等 status"
+                  : (reachedURL ? "已拿到播放 URL"
+                     : (playStarted ? (playEnded ? "/play 已返回、未拿到可播 URL"
+                                      : "**/play 取流请求在飞（未见返回）**")
+                        : "起播入口之前 / 非本机源解析"))))
         out.append("[8] 起播阶段      : 本次播放停在「\(stageText)」 · 阶段轨迹 \(stageHits.count) 条")
         for l in stageHits.suffix(4) { out.append("     " + l) }
         let openWork = scope.filter { $0.contains("开 重活") }.count
@@ -301,6 +324,43 @@ enum CrashDiagnostic {
         out.append("     判据          : 1s 心跳与 100ms 采样冲突时以 100ms 为准；SIGKILL 抓不到，"
                    + "「无 END」+「尖峰」= Jetsam，「无 END」+「全程平稳」= 请求悬空或其他终止")
 
+        // 10. 非播放期 / App 级心跳 —— 1.8.14
+        // 1.8.11 标记、1.8.13 第二次复现的盲区：播放心跳绑播放页、spike 绑 /play，
+        // 「播放页消失 → 后台 → 回前台 → 详情 → 跨站搜索」这段完全没有内存与存活证据。
+        let appW = AppHeartbeat.shared.previousWindow()
+        let appFoots = AppHeartbeat.footValues(appW)
+        let appEvents = appW.filter { $0.contains(" E ") }
+        out.append("[10] 非播放期取证 : App 级心跳 \(appW.count) 行（foot \(appFoots.count) 样本 / 事件 \(appEvents.count) 条）· 崩溃轮")
+        if appW.isEmpty {
+            out.append("     appbeat.log   : 无崩溃轮记录（本版首次启动 / 日志被裁剪）")
+        } else {
+            let f0 = appFoots.first ?? 0
+            let f1 = appFoots.last ?? 0
+            let fp = appFoots.max() ?? 0
+            var jump2 = 0
+            if appFoots.count > 1 {
+                for i in 1..<appFoots.count { jump2 = max(jump2, appFoots[i] - appFoots[i - 1]) }
+            }
+            out.append("     foot 曲线     : \(f0)→\(f1)MB（峰值 \(fp)MB · 单次最大 +\(jump2)MB）· 常态 1s / 重活期 200ms")
+            for l in appEvents.suffix(5) { out.append("     事件          : " + l) }
+            if let last = appW.last {
+                out.append("     末条          : " + last)
+                if let gap = gapToBoot(from: last, bootLine: bootLine) {
+                    out.append("     距本次启动    : \(gap) 秒（末条 App 心跳 → 重开）")
+                }
+            }
+            let v10: String
+            if fp >= 400 || jump2 >= 80 {
+                v10 = "**Jetsam 高度可疑**：非播放期抓到了内存尖峰（峰值 \(fp)MB / 单次 +\(jump2)MB）"
+            } else if appFoots.count < 3 {
+                v10 = "证据不足（App 心跳样本太少）"
+            } else {
+                v10 = "**非播放期内存平稳**：排除持续性内存压力；进程仍无 END 地消失 → 优先查请求悬空 / Node 在飞请求（INFLIGHT）/ 系统回收"
+            }
+            out.append("     结论          : " + v10)
+        }
+        out.append("     判据          : 播放心跳与 spike 都绑窗口，只有 App 级心跳覆盖「播放页消失 → 后台 → 详情 → 搜索」这段；重活期间自动加密到 200ms")
+
         // 心跳覆盖度
         if beats.isEmpty {
             out.append("心跳覆盖度        : 0 条（\(scopeName)没有播放心跳；可能没进播放页）")
@@ -311,6 +371,7 @@ enum CrashDiagnostic {
                           ? "有「完 心跳」，本轮心跳是正常收尾，不是被杀断的"
                           : "按 1~2 秒采样（起播前 10 秒为 1 秒），末条之后本应还有下一条；缺了就是进程在那一瞬间没了"))
         }
+        out.append("     覆盖边界      : 播放心跳在「完 心跳」处主动停止，**不覆盖非播放期**；崩在播放页消失之后请看 [10] App 级心跳")
         out.append("播放结局          : "
                    + (playScope.last(where: { $0.contains("完 播放") })
                       ?? "本次播放没有「完 播放」（未正常收尾）"))

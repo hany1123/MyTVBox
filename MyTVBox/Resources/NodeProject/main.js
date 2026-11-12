@@ -142,10 +142,16 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
             const tag = shape(url);
             let settled = false;
             let received = 0;
+            let totalTimer = null;
+
+            function clearTimers() {
+                if (totalTimer) { clearTimeout(totalTimer); totalTimer = null; }
+            }
 
             function settleErr(e) {
                 if (settled) return;
                 settled = true;
+                clearTimers();
                 log('FETCHERR ' + tag + ' ms=' + (Date.now() - t0) + ' got=' + received + 'B '
                     + String(e && e.message ? e.message : e).slice(0, 100));
                 reject(e);
@@ -153,6 +159,7 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
             function settleOK(v, raw, out, enc, code) {
                 if (settled) return;
                 settled = true;
+                clearTimers();
                 log('FETCH ' + tag + ' status=' + code + ' ms=' + (Date.now() - t0)
                     + ' raw=' + Math.round(raw / 1024) + 'KB out=' + Math.round(out / 1024)
                     + 'KB enc=' + (enc || '-'));
@@ -224,6 +231,15 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
             });
             req.on('error', settleErr);
             req.setTimeout(20000, () => req.destroy(new Error('fetch shim: timeout')));
+            // 1.8.14：setTimeout 是「socket 不活动超时」，服务端若一直挂着不吐数据
+            // 也不关连接，它到点也不触发。1.8.13 诊断里 detail 请求有 REQ 无 RES
+            // 挂满 20 秒、且没有 FETCHERR —— 就是这种悬空。补一个总时限兜底。
+            totalTimer = setTimeout(() => {
+                if (settled) return;
+                try { req.destroy(); } catch (e) {}
+                settleErr(new Error('fetch shim: total timeout 15000ms'));
+            }, 15000);
+            if (totalTimer.unref) totalTimer.unref();
             if (opts.signal) {
                 const sig = opts.signal;
                 if (sig.aborted) { req.destroy(new Error('fetch shim: aborted')); return; }
@@ -285,6 +301,23 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
         const orig = http.createServer;
         let memTimer = null;
         let memStopAt = 0;
+        let seq = 0;
+        // 1.8.14：只靠 REQ / RES 配对看不出「有请求挂着不回」。1.8.13 诊断里
+        // `REQ POST /spider/appv7zhuijudaren/3/detail` 之后既无 RES 也无
+        // RES-ABORT，用户白等 20 秒才走跨站搜索，而那条请求可能还在飞。
+        // 每 5 秒把在飞清单（含已等待时长）落盘，崩前状态就能直接读到。
+        const inflight = new Map();
+        const inflightTimer = setInterval(() => {
+            if (!inflight.size) return;
+            const now = Date.now();
+            const arr = Array.from(inflight.values());
+            let oldest = 0;
+            arr.forEach((x) => { if (now - x.t0 > oldest) oldest = now - x.t0; });
+            const paths = arr.slice(0, 6)
+                .map((x) => x.p + '(' + (now - x.t0) + 'ms)').join(',');
+            log('INFLIGHT n=' + inflight.size + ' oldest=' + oldest + 'ms ' + paths);
+        }, 5000);
+        if (inflightTimer.unref) inflightTimer.unref();
 
         function startMem1(reason) {
             if (memTimer) return;
@@ -313,14 +346,19 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
                 server.on('request', (req, res) => {
                     const p = String(req.url || '').split('?')[0];
                     const t0 = Date.now();
+                    const id = ++seq;
+                    inflight.set(id, { p: p, t0: t0 });
+                    const done = () => inflight.delete(id);
                     log('REQ ' + (req.method || '?') + ' ' + p);
                     if (p.indexOf('/play') >= 0) startMem1(p);
                     res.once('finish', () => {
+                        done();
                         const cl = res.getHeader ? res.getHeader('content-length') : null;
                         log('RES ' + p + ' status=' + res.statusCode
                             + ' ms=' + (Date.now() - t0) + ' len=' + (cl == null ? -1 : cl));
                     });
                     res.once('close', () => {
+                        done();
                         if (!res.writableFinished) {
                             log('RES-ABORT ' + p + ' ms=' + (Date.now() - t0));
                         }

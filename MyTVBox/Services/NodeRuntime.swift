@@ -619,7 +619,7 @@ final class NodeRuntime {
 
     private static func traceHits(_ lines: [String], limit: Int) -> [String] {
         let keys = ["REQ ", "RES ", "RES-ABORT", "FETCH ", "FETCHERR ",
-                    "BIGBODY", "MEM1 ", "mem1 ", "WARN reqtrace"]
+                    "BIGBODY", "MEM1 ", "mem1 ", "INFLIGHT", "WARN reqtrace"]
         return Array(lines.filter { line in keys.contains { line.contains($0) } }.suffix(limit))
     }
 

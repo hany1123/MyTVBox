@@ -119,6 +119,11 @@ final class PlaybackHeartbeat {
         lock.lock()
         lastMainTick = Date()
         lock.unlock()
+        // 1.8.14：App 级心跳要知道「现在是不是在播放」，否则非播放窗口的
+        // 内存曲线没有阶段标签，判读时分不清哪段是后台 / 详情 / 搜索。
+        AppRuntimeState.shared.set(playing: true)
+        AppRuntimeState.shared.set(stage: "play")
+        AppHeartbeat.shared.mark("事件 播放开始 " + title)
         SessionTrace.mark("跳 播放 \(title) t=0 rss=\(first)MB foot=\(firstFoot)MB 主=OK")
 
         // 主线程探针：只更新时间戳，不写文件（避免日志被刷爆）
@@ -164,6 +169,9 @@ final class PlaybackHeartbeat {
         lock.unlock()
         if wasRunning {
             SessionTrace.mark("完 心跳 主动停止（播放页消失 / 视图重建）")
+            AppRuntimeState.shared.set(playing: false)
+            AppRuntimeState.shared.set(stage: "home")
+            AppHeartbeat.shared.mark("事件 播放页消失 / 心跳主动停止")
         }
     }
 
