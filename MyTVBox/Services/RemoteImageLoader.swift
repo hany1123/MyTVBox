@@ -48,7 +48,6 @@ final class RemoteImageLoader {
             cache?.removeAllObjects()
             // 1.8.3：内存警告是 Jetsam 的前一步，写进面包屑。
             // 下次诊断里出现「警 内存警告」，就能坐实是图片内存而不是 Node 抓取。
-            SessionTrace.mark("警 内存警告 → 已清空海报缓存")
         }
     }
 

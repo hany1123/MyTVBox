@@ -188,16 +188,13 @@ struct VideoPlayerView: View {
         }
         .onAppear {
             // 1.8.0：面包屑 —— 播放页是闪退高发区（AVPlayer + 端上 Node 同进程）
-            SessionTrace.mark("开 播放 \(videoDetail.vodName) 线路 \(allSources.count)")
             // 1.8.4：进播放页先把海报位图全释放（最多 28MB），
             // 给马上要来的视频解码缓冲腾地方。
             RemoteImageLoader.shared.clearCache()
             // 1.8.5：连同 URLSession 的响应缓存一起清（120 张海报的 HTTP 响应也占内存）
             URLCache.shared.removeAllCachedResponses()
-            SessionTrace.mark("记 播放 已释放海报缓存")
             // 1.8.5：双心跳。进程被直接干掉后，这些行是唯一能区分
             // 「内存被杀 / 主线程卡死 / Node abort」的现场证据。
-            PlaybackHeartbeat.shared.start(videoDetail.vodName)
             // 注入站点级换源：线路全部耗尽时，去当前配置的其它 CMS 站点找同名片
             // @StateObject 的 wrappedValue 在 View 内会被解析成 Binding，
             // 先取出实例引用再改其属性，避免 dynamicMember 下标报错
@@ -224,7 +221,6 @@ struct VideoPlayerView: View {
             // 不改 model.start() 的时序，只发取消请求；搜索在下一次 group.next()
             // 就会 break，通常几十毫秒内生效。
             Task { await HeavyWorkGate.shared.requestCancelCurrent() }
-            SessionTrace.mark("记 播放 已请求取消在飞跨站搜索")
             model.start()
             scheduleAutoHide()
             TabBarVisibility.setHidden(true)
@@ -232,13 +228,10 @@ struct VideoPlayerView: View {
         .onDisappear {
             // 1.8.10：播放页消失本身是一等证据。崩溃时这条不会出现，
             // 于是能把「进程被杀」与「SwiftUI 把视图拆了」区分开。
-            SessionTrace.mark("命 播放页消失")
             viewModel.saveProgress()
             hideTask?.cancel()
             TabBarVisibility.setHidden(false)
-            PlaybackHeartbeat.shared.stop()
             // 1.8.4：正常退出也要写「完」，否则下次诊断永远误报「崩在播放」
-            SessionTrace.mark("完 播放 \(videoDetail.vodName) 正常退出")
         }
     }
 

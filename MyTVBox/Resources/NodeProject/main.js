@@ -160,9 +160,7 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
                 if (settled) return;
                 settled = true;
                 clearTimers();
-                log('FETCH ' + tag + ' status=' + code + ' ms=' + (Date.now() - t0)
-                    + ' raw=' + Math.round(raw / 1024) + 'KB out=' + Math.round(out / 1024)
-                    + 'KB enc=' + (enc || '-'));
+                // 1.8.18：成功请求不再逐条落盘（60 站搜索会刷屏）
                 resolve(v);
             }
 
@@ -433,99 +431,7 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
         + ', nodes<=' + MAX_NODES + ', toJSON<=' + MAX_TOJSON + ')');
 })();
 
-// ---------------------------------------------------------------------------
-// 1.8.13：/play 在飞取证
-//
-// 1.8.12 的判别器只能说「/play 取流请求在飞（未见返回）」，因为 Swift 侧
-// 只看得到「发起」和「结束」两个面包屑，中间整段是黑的：请求到底有没有进
-// Node？Node 有没有回？是 Node 卡在事件循环、卡在外网 fetch，还是回包时
-// 进程已经没了？三种情况修法完全不同，不能靠猜。
-//
-// 在 require(bundle) 之前包装 http.createServer，给每个进来的请求补一个
-// 观察 listener（不改原有 listener 的行为）：
-//   REQ /spider/.../play      → 请求进 Node 了
-//   RES ... status/ms/bytes   → Node 回包了（finish）
-//   RES-ABORT ...             → 连接中途断了，Swift 侧会一直等
-// 同时 /play 窗口内开 1 秒一条的 mem1（含 external / arrayBuffers），
-// 这是 Node 侧 Buffer 的直接指标，与 Swift 的 phys_footprint 曲线对齐。
-// ---------------------------------------------------------------------------
-(function installRequestTrace() {
-    try {
-        const http = require('http');
-        const orig = http.createServer;
-        let memTimer = null;
-        let memStopAt = 0;
-        let seq = 0;
-        // 1.8.14：只靠 REQ / RES 配对看不出「有请求挂着不回」。1.8.13 诊断里
-        // `REQ POST /spider/appv7zhuijudaren/3/detail` 之后既无 RES 也无
-        // RES-ABORT，用户白等 20 秒才走跨站搜索，而那条请求可能还在飞。
-        // 每 5 秒把在飞清单（含已等待时长）落盘，崩前状态就能直接读到。
-        const inflight = new Map();
-        const inflightTimer = setInterval(() => {
-            if (!inflight.size) return;
-            const now = Date.now();
-            const arr = Array.from(inflight.values());
-            let oldest = 0;
-            arr.forEach((x) => { if (now - x.t0 > oldest) oldest = now - x.t0; });
-            const paths = arr.slice(0, 6)
-                .map((x) => x.p + '(' + (now - x.t0) + 'ms)').join(',');
-            log('INFLIGHT n=' + inflight.size + ' oldest=' + oldest + 'ms ' + paths);
-        }, 5000);
-        if (inflightTimer.unref) inflightTimer.unref();
-
-        function startMem1(reason) {
-            if (memTimer) return;
-            log('MEM1 start ' + reason);
-            memStopAt = Date.now() + 25000;
-            memTimer = setInterval(() => {
-                try {
-                    const m = process.memoryUsage();
-                    log('mem1 heap=' + Math.round(m.heapUsed / 1048576) + 'MB'
-                        + ' rss=' + Math.round(m.rss / 1048576) + 'MB'
-                        + ' ext=' + Math.round(m.external / 1048576) + 'MB'
-                        + ' buf=' + Math.round((m.arrayBuffers || 0) / 1048576) + 'MB');
-                } catch (e) { /* 忽略 */ }
-                if (Date.now() > memStopAt) {
-                    clearInterval(memTimer);
-                    memTimer = null;
-                    log('MEM1 stop');
-                }
-            }, 1000);
-            if (memTimer.unref) memTimer.unref();
-        }
-
-        http.createServer = function () {
-            const server = orig.apply(this, arguments);
-            try {
-                server.on('request', (req, res) => {
-                    const p = String(req.url || '').split('?')[0];
-                    const t0 = Date.now();
-                    const id = ++seq;
-                    inflight.set(id, { p: p, t0: t0 });
-                    const done = () => inflight.delete(id);
-                    log('REQ ' + (req.method || '?') + ' ' + p);
-                    if (p.indexOf('/play') >= 0) startMem1(p);
-                    res.once('finish', () => {
-                        done();
-                        const cl = res.getHeader ? res.getHeader('content-length') : null;
-                        log('RES ' + p + ' status=' + res.statusCode
-                            + ' ms=' + (Date.now() - t0) + ' len=' + (cl == null ? -1 : cl));
-                    });
-                    res.once('close', () => {
-                        done();
-                        if (!res.writableFinished) {
-                            log('RES-ABORT ' + p + ' ms=' + (Date.now() - t0));
-                        }
-                    });
-                });
-            } catch (e) { log('WARN reqtrace: ' + (e && e.message ? e.message : e)); }
-            return server;
-        };
-        log('reqtrace: http.createServer wrapped');
-    } catch (e) {
-        log('WARN reqtrace install: ' + (e && e.message ? e.message : e));
-    }
-})();
+// 1.8.18 收尾：/play 在飞取证 / 高频内存采样已移除，Node 只处理业务请求。
 
 process.on('uncaughtException', (e) => {
     log('FATAL uncaught: ' + (e && e.stack ? e.stack : String(e)));
@@ -648,43 +554,6 @@ process.on('exit', (code) => { log('EXIT code=' + code); });
 
 // 保活：Node 的 event loop 不能空转退出
 setInterval(() => {}, 1 << 30);
-
-// 1.7.1：每分钟记一次内存，方便线上排查「播放返回后闪退」是不是 Node 吃太多。
-// unref() 让这个定时器不阻止进程退出。
-setInterval(() => {
-    try {
-        const m = process.memoryUsage();
-        log('mem rss=' + Math.round(m.rss / 1048576) + 'MB'
-            + ' heapUsed=' + Math.round(m.heapUsed / 1048576) + 'MB'
-            + ' heapTotal=' + Math.round(m.heapTotal / 1048576) + 'MB'
-            + ' ext=' + Math.round(m.external / 1048576) + 'MB');
-    } catch (e) { /* 忽略 */ }
-}, 60000).unref();
-
-// 1.7.7：V8 撞到堆上限是进程级 abort，JS 里连 catch 都拿不到 ——
-// 所以要在逼近上限之前留下密集证据。
-// 1.8.5：改成**每 10 秒无条件写一行**（mem10），不再只在偏高时写。
-// 播放中稳定闪退两次，需要一条完整的 V8/RSS 曲线才能判断是不是 Node 拖垮了进程；
-// 同时在偏高时主动 full GC（NodeRuntime 已加 --expose-gc），降低与视频缓冲的叠加。
-setInterval(() => {
-    try {
-        const m = process.memoryUsage();
-        const heapMB = Math.round(m.heapUsed / 1048576);
-        const rssMB = Math.round(m.rss / 1048576);
-        log('mem10 heap=' + heapMB + 'MB rss=' + rssMB + 'MB'
-            + ' total=' + Math.round(m.heapTotal / 1048576) + 'MB'
-            + ' ext=' + Math.round(m.external / 1048576) + 'MB');
-        if (heapMB > 96 || rssMB > 260) {
-            let after = heapMB;
-            if (typeof global.gc === 'function') {
-                try { global.gc(); } catch (e) { /* 没开 expose-gc 就算了 */ }
-                after = Math.round(process.memoryUsage().heapUsed / 1048576);
-            }
-            log('mem HIGH heap ' + heapMB + '->' + after + 'MB rss=' + rssMB + 'MB'
-                + ' gc=' + (typeof global.gc === 'function' ? 'yes' : 'no'));
-        }
-    } catch (e) { /* 忽略 */ }
-}, 10000).unref();
 
 // 确保 flush 被引用（避免打包器优化掉）
 flush();

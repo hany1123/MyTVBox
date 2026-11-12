@@ -22,29 +22,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        // 1.7.7：抓 NSException 型闪退，落到 Documents/MyTVBox/crash.log
-        CrashGuard.install()
-        // 1.8.10：六类原因全排除后补第 7 类 —— 原生层 SIGABRT / SIGSEGV /
-        // SIGBUS / SIGTRAP（AVFoundation、NodeMobile C++、Swift runtime 断言）。
-        // 这类不产生 NSException，CrashGuard 永远抓不到。
-        SignalGuard.install()
-
-        // 1.8.13：/play 高频内存采样日志的启动分界线。写在 bootToken 之前，
-        // 这样上一轮没有 END 的 spike 窗口能被明确切成「崩溃轮」。
-        SpikeProbe.shared.boot()
-        // 1.8.14：App 级常驻心跳。1.8.13 诊断第二次证明崩溃发生在**非播放状态**
-        //（播放正常收尾 → 后台 → 回前台 → 详情 → 跨站搜索 → 2.4 秒后进程消失），
-        // 而播放心跳 / spike / 面包屑都覆盖不到这段。这里从启动一直采到进程终止。
-        AppHeartbeat.shared.boot()
-        AppHeartbeat.shared.start()
-        AppRuntimeState.shared.set(foreground: true)
-        AppRuntimeState.shared.set(stage: "home")
-        AppHeartbeat.shared.mark("事件 App 启动")
-
-        // 1.8.2：写启动分界线。诊断里「上一轮最后一行」只认这条线之前的内容，
-        // 否则本次会话里正在飞的 `开 搜索` 会被误报成上次闪退。
-        SessionTrace.mark(SessionTrace.bootToken)
-
+        // 1.8.18 收尾：取证探针（异常/信号/面包屑/心跳/高频取样）已全部移除，
+        // 启动阶段只保留运行时必需的初始化。
         // 注册后台/前台切换通知
         NotificationCenter.default.addObserver(
             self, selector: #selector(didEnterBackground),
@@ -66,14 +45,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     // MARK: - 后台音频保活
 
     @objc private func didEnterBackground() {
-        // 1.8.5：生命周期写进面包屑，用来排除「切后台被系统回收 / 用户主动杀进程」
-        SessionTrace.mark("命 进入后台")
-        AppRuntimeState.shared.set(foreground: false)
-        AppRuntimeState.shared.set(stage: "bg")
-        AppHeartbeat.shared.mark("事件 进入后台")
-        // 通知视频播放器：禁用视频轨道，只保留音频输出
-        // iOS 在后台不允许渲染视频，但允许音频继续
-        // 如果不禁用视频轨道，整个 AVPlayer 会被挂起
+        // iOS 在后台不允许渲染视频，但允许音频继续；
+        // 不禁用视频轨道，整个 AVPlayer 会被挂起
         NotificationCenter.default.post(name: .appDidEnterBackground, object: nil)
 
         // 重新激活音频会话（防止被系统 deactive）
@@ -83,22 +56,11 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     @objc private func willEnterForeground() {
-        // 1.8.5：配对的生命周期痕迹
-        SessionTrace.mark("命 回前台")
-        AppRuntimeState.shared.set(foreground: true)
-        AppRuntimeState.shared.set(stage: "home")
-        AppHeartbeat.shared.mark("事件 回前台")
         // 通知视频播放器：恢复视频轨道
         NotificationCenter.default.post(name: .appWillEnterForeground, object: nil)
 
         // 确保音频会话活跃
         try? AVAudioSession.sharedInstance().setActive(true)
-    }
-
-    func applicationWillTerminate(_ application: UIApplication) {
-        // 1.8.5：正常终止也留痕。若能看到这一行，就不是「闪退」而是系统/用户主动结束
-        SessionTrace.mark("命 即将终止（非崩溃）")
-        AppHeartbeat.shared.mark("事件 即将终止（非崩溃）")
     }
 }
 
@@ -190,7 +152,6 @@ struct MyTVBoxApp: App {
         guard ok else {
             // 1.8.6：waitUntilReady 现在遇到 nodeDidExit 会立刻返回，
             // 这里留一条明确轨迹，诊断里就能看出「是启动失败」而不是「加载慢」
-            SessionTrace.mark("败 端上 Node 未就绪（后续只加载其它源）")
             NSLog("[App] 端上 Node 启动失败，日志:\n%@", NodeRuntime.shared.tailLog())
             // 1.7.7：Node 没起来也绝不能把界面留在「0 个站点」——
             // ContentView 那边已经因为「有本机源」而跳过了抢先加载，这里要是也直接

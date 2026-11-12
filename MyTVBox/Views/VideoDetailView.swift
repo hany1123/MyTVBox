@@ -607,9 +607,6 @@ struct VideoDetailView: View {
 
         let title = previewItem?.vodName ?? detail?.vodName ?? ""
         diag("站点 \(site.key) · vodId=\(vodId) · 标题=\(title)")
-        SessionTrace.mark("开 详情 \(title.isEmpty ? vodId : title)")
-        AppRuntimeState.shared.set(stage: "detail")
-        AppHeartbeat.shared.mark("事件 开详情 " + (title.isEmpty ? vodId : title))
         diag(isRecommendWallItem ? "判定：推荐墙条目 → 直接跨站找片源" : "判定：普通条目 → 先问本驿站")
 
         // 1.7.5：豆瓣这类推荐墙，直接跳到「全站聚合搜索」。
@@ -662,9 +659,7 @@ struct VideoDetailView: View {
         // 一进详情 1 毫秒就出现「无线路」，看起来像瞬间失败 —— 其实接管还在跑。
         // 现在挪到接管之后，并把本站失败原因一起记下。
         if Task.isCancelled { return }
-        AppHeartbeat.shared.mark("事件 本站 detail 未拿到线路 → 跨站接管")
         if await adoptDetailFromOtherSites(title: title) { return }
-        SessionTrace.mark("完 详情 \(title.isEmpty ? vodId : title) 无线路（\(failReason)）")
 
         if title.isEmpty {
             errorMessage = "没拿到这个条目的详情（id=\(vodId)），也没有片名可以拿去其它站搜。"
@@ -682,7 +677,6 @@ struct VideoDetailView: View {
     private func applyDetail(_ d: VideoDetail) {
         self.detail = d
         let parsed = d.parsePlaySources()
-        SessionTrace.mark("完 详情 \(d.vodName) 线路 \(parsed.count)")
         self.sources = parsed
         self.selectedSourceIndex = 0
         // 1.7.1：配置中心类站点的正文里带 http://<ip>:<port>/website，

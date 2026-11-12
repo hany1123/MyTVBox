@@ -1,10 +1,10 @@
 import SwiftUI
 import UIKit
 
-/// 1.8.1：把 Spider 诊断从「站点选择器工具栏」搬进设置。
-/// 老大反馈「诊断信息不在设置里」——原来只有从首页进站点选择器才看得到，
-/// 出问题时那个入口本身可能就是坏的（站点列表空 → 进不去）。
-/// 这里独立成页：不依赖任何站点列表，随时可跑、可复制。
+/// 1.8.18 收尾版：设置页的「运行状态」。
+/// 十类崩溃判读、内存/信号/心跳/高频取样探针已整体移除；
+/// 这里只保留「内核跑没跑起来 / 配置读到没 / 站点健康」这些真正能动手修的信息。
+/// 真崩了请以系统 .ips 的线程栈为准，说明卡里写了导出路径。
 struct DiagnosticsView: View {
 
     @EnvironmentObject var appState: AppState
@@ -17,7 +17,7 @@ struct DiagnosticsView: View {
         if let site = appState.currentSite {
             return "\(site.name) · \(site.key)"
         }
-        return "无当前站点（报告里会说明）"
+        return "无当前站点"
     }
 
     var body: some View {
@@ -55,19 +55,13 @@ struct DiagnosticsView: View {
             kv("可用站点", "\(appState.usableSiteCount) 个")
             kv("启用接口", "\(appState.enabledSubscriptions.count) 个")
             kv("当前站点", siteLabel)
-            kv("海报缓存", "420px 缩略 · 96 张 / 28MB")
             kv("站点健康", "\(SiteHealth.shared.coolingKeys().count) 站冷却中")
-            kv("进程内存", MemoryProbe.summary())
-            // 1.8.6：把「Node 到底起没起来」摆到概览第一行区，别让人对着
-            // 97 个缓存站点猜为什么首页 NO CONTENT
+            kv("搜索模式", "流式增量上屏 · 自适应并发 · 快站优先")
             kv("Node 启动", NodeRuntime.shared.bootFailureText
                ?? (NodeRuntime.shared.nodeDidExit
                    ? "已退出（rc=\(NodeRuntime.shared.lastExitCode.map(String.init) ?? "?")）"
                    : (NodeRuntime.shared.isReady ? "已就绪" : "未就绪")))
             kv("fetch 兼容层", NodeRuntime.shared.fetchShimText)
-            // 1.8.10：原生信号崩溃（CrashGuard 抓不到的那一类）
-            kv("上次原生信号", SignalGuard.lastSignal() ?? "未捕获到")
-            kv("signal 监听", SignalGuard.status())
             kv("App 版本", appVersion)
         }
         .padding(14)
@@ -95,7 +89,7 @@ struct DiagnosticsView: View {
                         Image(systemName: "stethoscope")
                             .font(.system(size: 14, weight: .bold))
                     }
-                    Text(running ? "诊断中…" : "开始诊断")
+                    Text(running ? "检查中…" : "检查运行状态")
                         .font(TVBoxTheme.text(15, weight: .semibold))
                 }
                 .frame(maxWidth: .infinity)
@@ -107,73 +101,51 @@ struct DiagnosticsView: View {
             .buttonStyle(.plain)
             .disabled(running)
 
-            // 1.8.6：Node 启动失败（rc=9）或运行中退出后，一键重引导
             Button {
                 NodeRuntime.shared.restartNode()
-                SessionTrace.mark("手 重启本机内核")
             } label: {
-                Label("重启本机内核（Node 退出后）", systemImage: "arrow.clockwise")
-                    .font(TVBoxTheme.text(13, weight: .semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(TVBoxTheme.surface)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(TVBoxTheme.stroke, lineWidth: 1)
-                    )
-                    .foregroundStyle(TVBoxTheme.warn)
+                actionLabel("重启本机内核（Node 退出后）", systemImage: "arrow.clockwise",
+                            color: TVBoxTheme.warn)
             }
             .buttonStyle(.plain)
 
-            // 1.8.3：内存吃紧时手动释放海报位图，不重启也能缓一口气
             Button {
                 RemoteImageLoader.shared.clearCache()
-                SessionTrace.mark("手 清理海报缓存")
             } label: {
-                Label("清空海报缓存", systemImage: "photo.badge.arrow.down.fill")
-                    .font(TVBoxTheme.text(13, weight: .semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(TVBoxTheme.surface)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(TVBoxTheme.stroke, lineWidth: 1)
-                    )
-                    .foregroundStyle(TVBoxTheme.accent)
+                actionLabel("清空海报缓存", systemImage: "photo.badge.arrow.down.fill",
+                            color: TVBoxTheme.accent)
             }
             .buttonStyle(.plain)
 
-            // 1.8.4：万一某个站被误拉黑（临时网络抖动），一键恢复全量搜索
             Button {
                 SiteHealth.shared.reset()
-                SessionTrace.mark("手 重置站点健康记录")
             } label: {
-                Label("重置站点健康（恢复全量搜索）", systemImage: "arrow.uturn.backward")
-                    .font(TVBoxTheme.text(13, weight: .semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(TVBoxTheme.surface)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(TVBoxTheme.stroke, lineWidth: 1)
-                    )
-                    .foregroundStyle(TVBoxTheme.accent)
+                actionLabel("重置站点健康（恢复全量搜索）", systemImage: "arrow.uturn.backward",
+                            color: TVBoxTheme.accent)
             }
             .buttonStyle(.plain)
 
-            Text("会跑一遍内核启动、配置拉取、站点解析，数秒内出结果。崩溃类问题请把整段报告复制给我。")
+            Text("检查会跑一遍内核启动、配置拉取与站点解析，数秒内出结果。")
                 .font(TVBoxTheme.mono(10))
                 .foregroundStyle(TVBoxTheme.textMuted)
         }
+    }
+
+    private func actionLabel(_ title: String, systemImage: String,
+                             color: Color) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(TVBoxTheme.text(13, weight: .semibold))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 11)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(TVBoxTheme.surface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(TVBoxTheme.stroke, lineWidth: 1)
+            )
+            .foregroundStyle(color)
     }
 
     // MARK: - 结果
@@ -219,32 +191,22 @@ struct DiagnosticsView: View {
 
     private var explainCard: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("报告里这几段最有用")
+            Text("出问题看哪里")
                 .font(TVBoxTheme.text(13, weight: .semibold))
                 .foregroundStyle(TVBoxTheme.textPrimary)
-            Text("· 内核与崩溃 —— 实际在跑哪个内核、本机源配置耗时、上次停在哪一步")
-            Text("· 崩溃原因判别 —— 10 类原因逐项列证据，不预设结论")
-            Text("· 最近轨迹 —— 开/完/弃 的先后顺序；播放心跳带 rss 和主线程状态")
-            Text("· /play 在飞取证 —— 100ms 高频内存尖峰 + Node 侧 REQ/RES/FETCH 轨迹")
+            Text("· 首页空白 / NO CONTENT → 看「Node 启动」和「fetch 兼容层」，必要时点重启内核")
+            Text("· 搜不到 / 搜索慢 → 看「站点健康」冷却站名单，可一键重置")
+            Text("· 播放失败 → 报告里的「站点路由」能看出站点 key 前缀是否走错路线")
 
             Divider().padding(.vertical, 4)
-            Text("进程消失的 10 类可能原因")
+            Text("闪退请用系统崩溃日志")
                 .font(TVBoxTheme.text(13, weight: .semibold))
                 .foregroundStyle(TVBoxTheme.textPrimary)
-            Text("[1] Jetsam 内存回收  → 看心跳的 rss 与 foot 曲线（Jetsam 依据 phys_footprint）")
-            Text("[2] Watchdog 主线程卡死 → 看心跳里有没有「主=卡」")
-            Text("[3] Node V8 abort    → 看 node.log 有没有 FATAL / EXIT code")
-            Text("[4] AVFoundation 失败 → 看本次播放有没有「败 播放」")
-            Text("[5] NSException      → 看 CrashGuard 的崩溃记录")
-            Text("[6] 切后台 / 主动结束 → 看「命 进入后台 / 播放页消失」")
-            Text("[7] 原生信号崩溃     → 看 signal.log（SIGABRT / SIGSEGV / SIGTRAP）")
-            Text("[8] 起播阶段 / 重活并发 → 看本次播放停在哪一步、跨站搜索是否还在飞")
-            Text("[9] /play 在飞          → 看 spike.log 有没有亚秒级尖峰、Node 有没有回 RES")
-            Text("[10] 非播放期 / 后台回收 → 看 App 级心跳（播放页消失后的那段，重活期 200ms）")
-            Text("1s 心跳采不到亚秒级尖峰；`/play` 窗口另有 100ms 采样。播放心跳在「完 心跳」就停了，")
-            Text("播放正常收尾后再崩只能看 [10]，拿播放期平稳曲线判整轮是拿错时段的证据。")
-                .foregroundStyle(TVBoxTheme.textMuted)
-            Text("证据范围已收窄到最后一个完整会话；`启 启动` 是重开时间，不是死亡时刻。")
+            Text("App 内的内存/信号/心跳探针已全部移除 —— 前 15 轮证明它们看不到")
+            Text("NodeMobile / V8 内部的 C++ 层崩溃，只会增加开销。真闪退时请导出 .ips：")
+            Text("设置 → 隐私与安全性 → 分析与改进 → 分析数据 → MyTVBox")
+                .foregroundStyle(TVBoxTheme.accent)
+            Text("以 .ips 里的崩溃线程栈为准，比任何 App 内判读都准。")
                 .foregroundStyle(TVBoxTheme.textMuted)
         }
         .font(TVBoxTheme.mono(10))
@@ -259,7 +221,7 @@ struct DiagnosticsView: View {
         running = true
         copiedAt = nil
         let site = appState.currentSite
-        // 诊断会执行 bundle + 可能发同步网络请求，必须离开主线程
+        // 会执行 bundle + 可能发同步网络请求，必须离开主线程
         DispatchQueue.global(qos: .userInitiated).async {
             let text = SpiderEngine.shared.diagnoseSync(site: site)
             DispatchQueue.main.async {

@@ -213,7 +213,6 @@ final class NodeRuntime {
         localConfigTask = nil
         lock.unlock()
         try? FileManager.default.removeItem(at: readyFile)
-        SessionTrace.mark("败 Node 启动 rc=\(rc) \(note)")
     }
 
     /// 1.8.6：手动/回前台自愈。node_start 已退出时复位状态再引导一次。
@@ -221,7 +220,6 @@ final class NodeRuntime {
     /// 由用户动作或回前台触发一次，不做无人值守的循环重启。
     func restartNode() {
         appendLog("restartNode: 重新引导端上内核")
-        SessionTrace.mark("记 重启内核")
         lock.lock()
         booted = false
         nodeDidExit = false

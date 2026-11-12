@@ -530,125 +530,47 @@ final class SpiderEngine {
         if let p = rt.pendingKernelMD5 {
             out.append("已下载待生效  : md5 \(p)（需完全退出 App 再打开）")
         }
+        // 1.8.18 收尾：诊断报告只保留「运行状态」，不再输出取证探针数据
+        // （面包屑 / 心跳 / 高频取样 / 十类判读已整体移除）
         // 1.7.8：/config 到底慢在哪一步，直接看这两行
         out.append("本机源配置    : " + LocalSourceCache.lastProbe)
         out.append("配置缓存      : " + LocalSourceCache.describe())
-        // 1.8.5：进程真实物理内存（含 V8 堆 + 视频缓冲 + 位图），判 Jetsam 的基准
-        out.append("进程内存      : " + MemoryProbe.summary())
-        // 1.8.4：老大问「慢是不是某些站点没加载」—— 直接把被跳过的坏站列出来
+        // 1.8.4：被跳过的坏站是「搜索慢」的主因
         let cooling = SiteHealth.shared.coolingDetails()
         out.append("站点健康      : " + (cooling.isEmpty
             ? "无冷却站（每个站都参与搜索）"
             : "冷却 \(cooling.count) 站（连续失败 ≥3 次，10 分钟内跳过）"))
         if !cooling.isEmpty {
-            // 1.8.7：把失败原因一起列出来，才能区分「站点自己挂了」和
-            // 「端上 fetch 兼容层没覆盖到」—— 1.8.6 只有名单，20 个冷却站无从判读
             for d in cooling.prefix(12) {
                 out.append("  冷却站      : \(d.key) · 失败 \(d.fails) 次 · \(d.reason)")
             }
             if cooling.count > 12 { out.append("              : …另有 \(cooling.count - 12) 站") }
             out.append("              : 这些站每次搜索都要等满超时，是「慢」的主因；成功一次会自动解禁")
         }
-        // 1.8.0：闪退定位 —— 上次最后停在哪个动作上（`开` 之后没有对应的 `完`）
-        // 1.8.2：只认「本次启动线之前」的内容，且必须同时给出上一轮最后一行。
-        // 上一版只找 `开 `，最后一行是 `弃 搜索` 时就报「无记录」—— 恰是崩溃现场。
-        if let step = SessionTrace.interruptedStep() {
-            out.append("上次最后停在  : \(step)（这一步没走完 → 崩在这里）")
-        } else if let last = SessionTrace.previousLastLine() {
-            // 1.8.4：措辞改中性。末行是 `弃/记/完` 不代表一定正常收尾 ——
-            // 进程完全可能死在那一行之后、下一个动作还没来得及写「开」。
-            out.append("上次最后停在  : \(last)（上一轮末行；若仍闪退，则崩在这条之后）")
-        } else {
-            out.append("上次最后停在  : （本版首次启动，还没有上一轮记录）")
-        }
-        let prevTail = SessionTrace.previousTail(3)
-        if !prevTail.isEmpty {
-            out.append("上一轮末 3 行 :")
-            for line in prevTail {
-                out.append("  " + line)
-            }
-        }
-        let marks = SessionTrace.recent(8)
-        if !marks.isEmpty {
-            out.append("最近轨迹      :")
-            for line in marks {
-                out.append("  " + line)
-            }
-        }
-        if let crash = CrashGuard.lastReport() {
-            out.append("上次崩溃记录  :")
-            for line in crash.split(separator: "\n").suffix(24) {
-                out.append("  " + line)
-            }
-        } else {
-            out.append("上次崩溃记录  : 无（NSException 型；原生信号看下一条）")
-        }
-        // 1.8.10：六类全排除后补的原生信号证据。signal.log 里只看「最后一次
-        // 启动之前」的 SIGNAL 行，也就是上一轮是不是被 SIGABRT/SIGSEGV 带走的。
-        out.append("上次原生信号  : "
-                   + (SignalGuard.lastSignal()
-                      ?? "未捕获到（SIGABRT / SIGSEGV / SIGBUS / SIGTRAP）"))
-        // 1.8.11：「未捕获到」要能区分真没发生与 handler 没装（假阴性）
-        out.append("signal 监听    : " + SignalGuard.status())
 
         out.append("")
         out.append("--- 端上 Node 运行时 ---")
         out.append("node ready    : \(rt.isReady ? "YES" : "NO")")
-        // 1.8.6：node_start 是阻塞调用，它返回 = Node 已经结束。
-        // 以前完全不记退出码，才会出现「node ready YES 却全连不上」的假象。
+        // 1.8.6：node_start 是阻塞调用，它返回 = Node 已经结束
         out.append("node 已退出   : \(rt.nodeDidExit ? "YES" : "NO")")
         out.append("node 退出码   : \(rt.lastExitCode.map(String.init) ?? "—")（9=启动参数不被接受）")
         out.append("node 启动故障 : \(rt.bootFailureText ?? "无")")
         out.append("node baseURL  : \(rt.baseURL)")
         out.append("relay baseURL : " + (NodeRelayService.shared.baseURL ?? "nil"))
-        // 1.8.7：shim 状态独立成文件，不用在 mem10 刷屏的日志里翻
         out.append("fetch 兼容层  : " + rt.fetchShimText)
-        // 1.8.7：先给「本次启动后」的全文关键行，再给尾部原文。
-        // 1.8.6 的 tail 40 行被 mem10 占满，FATAL 首行 / shim 安装标记全被挤掉，
-        // 只留下一串看不懂的 undici 栈帧 —— 这正是「有证据但读不到」。
         let keyLines = rt.keyLogLines()
-        out.append("node.log 关键行（本次启动后全文提取，\(keyLines.count) 行）:")
+        out.append("node.log 关键行（本次启动后，\(keyLines.count) 行 · 末 20 行）:")
         if keyLines.isEmpty {
             out.append("  (无)")
         } else {
-            for line in keyLines { out.append("  " + line) }
+            for line in keyLines.suffix(20) { out.append("  " + line) }
         }
-        // 1.8.5：12 行只够看到 undici 栈的尾巴，看不到错误首行和内存曲线
-        let logTail = rt.tailLog(lines: 40)
+        let logTail = rt.tailLog(lines: 12)
         out.append("node.log 尾部 :")
         for line in logTail.split(separator: "\n", omittingEmptySubsequences: false) {
             out.append("  " + line)
         }
-        // 1.8.13：/play 轨迹单独成段，不塞进 60 行关键行窗口（mem1 每秒一条会挤掉 FATAL）
-        let playTrace = rt.playTraceLines()
-        out.append("node /play 轨迹（本次启动后，\(playTrace.count) 行）:")
-        if playTrace.isEmpty {
-            out.append("  (无 · 本次启动还没发起过取流 / createServer 包装未生效)")
-        } else {
-            for line in playTrace { out.append("  " + line) }
-        }
-        // 崩溃发生在上一轮，重开 App 才看得到诊断 —— 只给「本次」会全是空的
-        let prevTrace = rt.previousPlayTraceLines(limit: 45)
-        out.append("node /play 轨迹（上一轮，\(prevTrace.count) 行）:")
-        if prevTrace.isEmpty {
-            out.append("  (无 · 本版首次启动 / 日志被清理)")
-        } else {
-            for line in prevTrace { out.append("  " + line) }
-        }
-        out.append("/play 高频取样 : " + (SpikeProbe.shared.recentWindows(1).last?.describe ?? "无窗口（本次启动还没发起过取流）"))
-        // 1.8.14：App 级常驻心跳。1.8.13 第二次复现「播放正常收尾后崩在非播放状态」，
-        // 播放心跳 / spike / 面包屑全都不覆盖那段。这里把崩溃轮最后 20 行原文贴出来，
-        // 崩前 10 秒的 foot / 前台后台 / 播放中 / 在飞重活 / 阶段一眼可见。
-        let appPrev = AppHeartbeat.shared.previousWindow()
-        out.append("App 级心跳（崩溃轮，\(appPrev.count) 行 · 末 20 行）:")
-        if appPrev.isEmpty {
-            out.append("  (无 · 本版首次启动 / appbeat.log 被裁剪)")
-        } else {
-            for line in appPrev.suffix(20) { out.append("  " + line) }
-        }
         out.append("")
-        // 1.8.5：不再押单一假设，把 6 类原因的证据逐项列出来
-        out.append(contentsOf: CrashDiagnostic.lines())
         out.append("--- 站点路由 ---")
         if let site {
             let isNode = NodeRelayService.isNodeSite(site)

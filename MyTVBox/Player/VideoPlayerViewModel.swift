@@ -172,7 +172,6 @@ final class VideoPlayerViewModel: ObservableObject {
                 self.cancelPrewarm()
                 self.assetCache.removeAll()
                 self.assetOrder.removeAll()
-                SessionTrace.mark("警 播放页内存警告 → 清 asset 缓存")
             }
         }
     }
@@ -657,13 +656,6 @@ final class VideoPlayerViewModel: ObservableObject {
         if bump { playEpoch += 1 }
         let epoch = playEpoch
         let urlString = url.absoluteString
-        // 1.8.10：1.8.9 诊断里播放页起来后连 `记 播放 URL` 都没有 —— 崩在
-        // **起播/取流阶段**，旧埋点在这一段是全黑的。这里补入口，后面每条
-        // 取流分支补开始/结束，下一份诊断能直接定位卡在哪一步。
-        if bump {
-            SessionTrace.mark("记 播放 起播入口 · " + Self.urlDigest(url))
-        }
-
         // 1.5.1：mddcloud 内置源的剧集用自定义 scheme 占位，播放前先换真实 m3u8。
         if allowResolve, urlString.hasPrefix(MddCloudService.playScheme) {
             isLoading = true
@@ -700,21 +692,17 @@ final class VideoPlayerViewModel: ObservableObject {
             showHint("正在获取播放地址…", hold: nil)
             // 1.8.10：本机源主路径。/play 卡住或把 Node 侧带崩时，
             // 旧轨迹只到「开 播放」，看不出请求有没有发出去、有没有回来。
-            SessionTrace.mark("记 播放 发起 /play 取流")
             let playT0 = Date()
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let resolved = await NodeRelayService.shared.resolvePlay(urlString)
                 let playMs = Int(Date().timeIntervalSince(playT0) * 1000)
-                SessionTrace.mark("记 播放 /play 结束 \(playMs)ms "
-                                  + (resolved == nil ? "失败" : "成功"))
                 guard self.playEpoch == epoch else { return }
                 guard let resolved else {
                     self.showHint(nil)
                     self.errorMessage = "该线路暂时无法获取播放地址"
                     // 1.8.8：/play 没给出有效 URL 也要留痕，才能区分
                     // 「取流失败」和「取到了但 URL 形态不对」
-                    SessionTrace.mark("败 播放 取流失败（/play 无有效 URL）")
                     self.autoSwitchSource(reason: "取流失败")
                     return
                 }
@@ -843,15 +831,12 @@ final class VideoPlayerViewModel: ObservableObject {
         let proxyOK = scheme == LocalPlaylistProxy.scheme.lowercased()
             && LocalPlaylistProxy.isProxied(url)
         guard scheme == "http" || scheme == "https" || proxyOK else {
-            SessionTrace.mark("败 播放 URL 不支持 scheme=\(scheme.isEmpty ? "(空)" : scheme) · "
-                              + Self.urlDigest(url))
             errorMessage = "该线路地址不被支持（\(scheme.isEmpty ? "无 scheme" : scheme)）"
             isLoading = false
             isBuffering = false
             autoSwitchSource(reason: "播放地址不支持")
             return
         }
-        SessionTrace.mark("记 播放 URL " + Self.urlDigest(url))
 
         // 同一地址重入（比如误触重播）：只 seek，不重建 item，避免整轮重新缓冲
         if urlString == currentURLString,
@@ -877,7 +862,6 @@ final class VideoPlayerViewModel: ObservableObject {
         errorMessage = nil
 
         // 1.8.10：创建 AVPlayerItem 是原生层（AVFoundation / 解码器）真正介入的点
-        SessionTrace.mark("记 播放 创建 AVPlayerItem")
         let item = makeItem(for: url)
         player.replaceCurrentItem(with: item)
 
@@ -908,9 +892,6 @@ final class VideoPlayerViewModel: ObservableObject {
                 guard let self = self else { return }
                 // 1.8.10：status 回调有没有触发，能区分「崩在 asset 装载」与
                 // 「崩在首帧之后」。1.8.9 那一轮两种结局都看不到。
-                SessionTrace.mark("记 播放 item.status="
-                                  + (item.status == .readyToPlay ? "readyToPlay"
-                                     : (item.status == .failed ? "failed" : "unknown")))
                 switch item.status {
                 case .readyToPlay:
                     self.isLoading = false
@@ -918,7 +899,6 @@ final class VideoPlayerViewModel: ObservableObject {
                     self.slowTimer?.cancel()
                     // 1.8.4：补上「完 播放」。旧版只有「开 播放」没有配对，
                     // 于是只要用户最后进过播放器，诊断就永远误报「崩在播放」。
-                    SessionTrace.mark("完 播放 \(self.videoDetail.vodName) 首帧就绪")
                     let dur = item.duration.seconds
                     if dur.isFinite { self.duration = dur }
                     // 1.5.2 稳健续播：等可 seek 区间就绪、带 completion 校验、失败重试
@@ -946,9 +926,6 @@ final class VideoPlayerViewModel: ObservableObject {
                     let digest = self.currentURLString
                         .flatMap { URL(string: $0) }
                         .map { Self.urlDigest($0) } ?? "(无 URL 记录)"
-                    SessionTrace.mark("败 播放 item.failed: "
-                                      + (item.error?.localizedDescription ?? "未知错误")
-                                      + " · " + digest)
                     // 自定义 scheme 加载失败：整轮关掉过滤并用原始地址重建，
                     // 绝不让「去广告」把正常播放拖垮（1.4.7 回归的最终兜底）
                     if !self.adProxyBypassed,
@@ -999,7 +976,6 @@ final class VideoPlayerViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                SessionTrace.mark("完 播放 \(self.videoDetail.vodName) 自然播完")
                 self.playNextEpisode()
             }
         }
@@ -1011,7 +987,6 @@ final class VideoPlayerViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                SessionTrace.mark("败 播放 播放中断（分片/会话失效）")
                 self.autoSwitchSource(reason: "播放中断")
             }
         }
@@ -1096,7 +1071,6 @@ final class VideoPlayerViewModel: ObservableObject {
             autoSwitchBurst = 1
         }
         if autoSwitchBurst >= 3 {
-            SessionTrace.mark("阻 播放 换源风暴（2 秒内 \(autoSwitchBurst) 次）")
             showHint(nil)
             errorMessage = "多条线路连续失败，已暂停自动换源，请手动选择线路"
             slowLineHint = nil

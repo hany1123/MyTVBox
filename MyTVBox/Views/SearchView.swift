@@ -25,6 +25,10 @@ struct SearchView: View {
     @AppStorage("MyTVBox.aggregateSearch")
     private var aggregateSearch: Bool = true
     @State private var searchTask: Task<Void, Never>?
+    /// 1.8.18 流式搜索：本轮搜索的令牌，防止上一轮迟到的增量结果污染新词
+    @State private var searchToken = UUID()
+    /// 结果已开始上屏、但其它站点还在跑
+    @State private var streaming = false
 
     // MARK: - 搜索历史
 
@@ -83,6 +87,12 @@ struct SearchView: View {
                         // 聚合开关
                         aggregateBar
                             .padding(.horizontal, 16)
+
+                        // 1.8.18：结果已上屏但其它站还在跑，给个轻提示
+                        if streaming {
+                            streamingHint
+                                .padding(.horizontal, 16)
+                        }
 
                         if isLoading {
                             loadingState
@@ -600,6 +610,17 @@ struct SearchView: View {
 
     // MARK: - 搜索行为
 
+    private var streamingHint: some View {
+        HStack(spacing: 8) {
+            ProgressView().tint(TVBoxTheme.accent)
+            Text("已出 \(results.count) 条 · 仍在搜索其它站点…")
+                .font(TVBoxTheme.mono(10))
+                .foregroundStyle(TVBoxTheme.textSecondary)
+            Spacer()
+        }
+        .padding(.vertical, 6)
+    }
+
     private func performSearch() {
         let trimmed = keyword.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
@@ -609,7 +630,11 @@ struct SearchView: View {
         keyword = trimmed
 
         searchTask?.cancel()
+        // 1.8.18：每轮搜索发一个令牌，挡住上一轮被取消后仍可能迟到的增量结果
+        let token = UUID()
+        searchToken = token
         isLoading = true
+        streaming = true
         errorMessage = nil
         hasSearched = true
         results = []
@@ -629,23 +654,20 @@ struct SearchView: View {
                 self.errorMessage = "当前配置没有可用于搜索的 CMS 站点，建议切回内置源"
                 self.searchedSiteCount = 0
                 self.isLoading = false
+                self.streaming = false
                 return
             }
-            // 1.8.0：面包屑。闪退时进程直接消失，下次启动靠这行定位「死在哪一步」。
-            // 1.8.1：同时记下「可用站数/实际搜索站数」，两者不一样说明被上限截断。
-            let scanCount = min(usable.count, 60)
-            SessionTrace.mark("开 搜索 \(trimmed) 站=\(scanCount)/\(usable.count)")
-            // 1.7.5：搜索页就是要「全站聚合」，别只搜前 24 个。
-            // 1.8.0：每站 30 → 16、总量 400 → 240。海报张数直接决定内存峰值，
-            // 24 站并发时每站 30 条会把 700+ 张封面同时排队解码，容易顶到 Jetsam。
-            // 1.8.1：站数 200 → 60、并发 16 → 12。
-            // 1.8.0 的轨迹里最后一行是「开 搜索 站=110」，之后就没了 —— 110 个站
-            // 轮流进 Node 跑 spider，V8 堆一路涨到上限，进程被 abort（闪退）。
-            // 60 站 × 每站 16 条已足够凑满 240 条结果，负载直接砍半。
-            // 1.8.3：总量 240 → 120、单站 16 → 12、总时限 14 秒。
-            // 1.8.1 真机实测「入夜不再」跑了 23.3 秒才出 174 条 —— 等太久用户会
-            // 反复点、反复开新搜索，也把高内存状态拉得更长。
-            let t0 = Date()
+
+            // 1.8.18 流式：某个站一返回就把该站结果追加到列表上屏，
+            // 不用等齐 60 个站 / 14 秒预算。首批到达即把 loading 撤掉。
+            let onPartial: @Sendable ([CrossSiteResolver.SiteSearchResult]) -> Void = { chunk in
+                Task { @MainActor in
+                    guard self.searchToken == token, !Task.isCancelled else { return }
+                    self.isLoading = false
+                    self.results.append(contentsOf: chunk)
+                }
+            }
+
             let found = await CrossSiteResolver.search(
                 keyword: trimmed,
                 in: usable,
@@ -653,24 +675,19 @@ struct SearchView: View {
                 limitTotal: 120,
                 preferredSiteKey: preferred,
                 maxSites: 60,
-                concurrency: 12,
-                budget: 14
+                concurrency: 16,
+                budget: 14,
+                onPartial: onPartial
             )
-            // 1.8.1：先判取消再记「完」。以前先记后判，被取代的搜索也会写一条
-            // 「完 命中 N」，看日志时容易误判成两次搜索都成功了。
-            guard !Task.isCancelled else {
-                SessionTrace.mark("弃 搜索 \(trimmed)（被新搜索取代）")
-                return
-            }
-            let cost = Date().timeIntervalSince(t0)
-            SessionTrace.mark("完 搜索 \(trimmed) 命中 \(found.count) · \(String(format: "%.1f", cost))s")
+            guard !Task.isCancelled, self.searchToken == token else { return }
             self.searchedSiteCount = usable.count
-            self.results = found
+            // 不用 found 覆盖 results —— 避免整轮结束后列表重排跳动。
+            // 仅在增量回调一条都没落地时用全量结果兜底。
+            if self.results.isEmpty, !found.isEmpty {
+                self.results = found
+            }
             self.isLoading = false
-            // 1.8.3：再记一条「上屏」。1.8.1 的诊断里最后是 `完 搜索 命中 174`，
-            // 13 秒后进程重启、中间没有任何点击痕迹 —— 崩的就是结果上屏/刷海报，
-            // 但日志看不出来。有这条就能把「死在渲染」和「死在抓取」分开。
-            SessionTrace.mark("屏 搜索 \(trimmed) 上屏 \(min(found.count, 60))/\(found.count) 条")
+            self.streaming = false
         }
     }
 }

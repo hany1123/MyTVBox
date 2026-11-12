@@ -52,21 +52,25 @@ enum CrossSiteResolver {
         let batch: Batch?
         let failed: Bool
         let key: String
-        /// 1.8.7：失败原因文本，交给 SiteHealth 存起来供诊断判读
         let reason: String
+        /// 1.8.18：本次请求耗时，既喂给 SiteHealth 做快站优先，也用于自适应并发
+        let ms: TimeInterval
     }
 
     private static func fetchOne(idx: Int, site: Site, kw: String,
                                  per: Int, timeout: TimeInterval) async -> FetchResult {
+        let t0 = Date()
         do {
             let items = try await APIService.shared.searchVideos(
                 site: site, keyword: kw, timeout: timeout)
             return FetchResult(batch: Batch(index: idx, site: site,
                                             items: Array(items.prefix(per))),
-                               failed: false, key: site.key, reason: "")
+                               failed: false, key: site.key, reason: "",
+                               ms: Date().timeIntervalSince(t0))
         } catch {
             let why = String(error.localizedDescription.prefix(120))
-            return FetchResult(batch: nil, failed: true, key: site.key, reason: why)
+            return FetchResult(batch: nil, failed: true, key: site.key, reason: why,
+                               ms: Date().timeIntervalSince(t0))
         }
     }
 
@@ -145,6 +149,8 @@ enum CrossSiteResolver {
     /// 崩溃现场是「搜索页 60 站」与「详情页跨站接管 110 站」同时在跑，
     /// Node 侧同时执行两批 spider，V8 堆撞顶 → abort。
     /// 过闸后两件重活会排队，峰值只有一批。
+    /// `onPartial` 非空即启用流式：每个站一返回就把该站结果推给调用方，
+    /// 调用方可以边搜边上屏，不必等齐全部站点（1.8.18）。
     static func search(keyword: String,
                        in sites: [Site],
                        limitPerSite: Int = 12,
@@ -152,12 +158,15 @@ enum CrossSiteResolver {
                        preferredSiteKey: String? = nil,
                        maxSites: Int = 24,
                        concurrency: Int = 16,
-                       budget: TimeInterval = 0) async -> [SiteSearchResult] {
+                       budget: TimeInterval = 0,
+                       onPartial: (@Sendable ([SiteSearchResult]) -> Void)? = nil
+    ) async -> [SiteSearchResult] {
         let result = await HeavyWorkGate.shared.run {
             await searchUngated(
                 keyword: keyword, in: sites, limitPerSite: limitPerSite,
                 limitTotal: limitTotal, preferredSiteKey: preferredSiteKey,
-                maxSites: maxSites, concurrency: concurrency, budget: budget)
+                maxSites: maxSites, concurrency: concurrency, budget: budget,
+                onPartial: onPartial)
         }
         return result ?? []
     }
@@ -169,88 +178,89 @@ enum CrossSiteResolver {
                                       preferredSiteKey: String? = nil,
                                       maxSites: Int = 24,
                                       concurrency: Int = 16,
-                                      budget: TimeInterval = 0) async -> [SiteSearchResult] {
-        // 1.8.4：跳过「连续失败」的坏站。老大问「慢是不是某些站点没加载导致的」——
-        // 正是。以前每搜一次都要重新撞一遍这些站，每次都白等一个超时。
+                                      budget: TimeInterval = 0,
+                                      onPartial: (@Sendable ([SiteSearchResult]) -> Void)? = nil
+    ) async -> [SiteSearchResult] {
+        // 跳过连续失败的坏站；全被冷却了就照常全量，别把结果搜没了
         let all = usableSites(sites)
         let healthy = all.filter { !SiteHealth.shared.isCooling($0.key) }
-        let pool = healthy.isEmpty ? all : healthy   // 全被冷却了就照常全量，别把结果搜没了
-        let skipped = all.count - pool.count
-        if skipped > 0 {
-            SessionTrace.mark("记 搜索 \(keyword) 跳过冷却 \(skipped) 站")
+        let pool = healthy.isEmpty ? all : healthy
+
+        // 1.8.18 快站优先：覆盖的站点集合仍按配置顺序取（慢站不会被永久排除），
+        // 只在这批里按历史响应耗时排「谁先发」。batch.index 保留配置原顺序，
+        // 所以最终结果的站点次序不受调度影响。
+        let window = Array(pool.prefix(max(1, maxSites)).enumerated())
+        let ranked = window.sorted { a, b in
+            if a.element.key == preferredSiteKey { return true }
+            if b.element.key == preferredSiteKey { return false }
+            let la = SiteHealth.shared.latencyMs(a.element.key)
+            let lb = SiteHealth.shared.latencyMs(b.element.key)
+            let va = la > 0 ? la : 1200   // 未知站按 1.2s 中等速度
+            let vb = lb > 0 ? lb : 1200
+            if va != vb { return va < vb }
+            return a.offset < b.offset
         }
-        let targets = Array(pool.prefix(max(1, maxSites)))
-        guard !targets.isEmpty else { return [] }
+        guard !ranked.isEmpty else { return [] }
 
         let t0 = Date()
-
-        // 1.8.10：1.8.9 诊断里，进播放页前 1.5 秒还有一次跨站聚合搜索
-        // （`记 搜索 … 跳过冷却 15 站`），而播放页起播时它很可能仍在飞。
-        // 用开/完配对让判别器能判断「起播时是否有整站级重活并发」。
-        // defer 保证所有 return 分支都收口，进程被杀时自然只剩「开」。
-        SessionTrace.mark("开 重活 跨站搜索 \(keyword) 站=\(targets.count)")
-        // 1.8.14：1.8.13 诊断里进程正死在「开 重活」后 2.4 秒，而这段既没有
-        // 播放心跳也没有 spike 采样。重活期间把 App 级心跳加密到 200ms，
-        // 并标上 work/stage，下一轮就能看到崩前整段内存曲线。
-        AppRuntimeState.shared.beginWork()
-        AppRuntimeState.shared.set(stage: "search")
-        AppHeartbeat.shared.setFast(true)
-        AppHeartbeat.shared.mark("事件 开重活 跨站搜索 \(keyword) 站=\(targets.count)")
-        defer {
-            AppHeartbeat.shared.setFast(false)
-            AppRuntimeState.shared.endWork()
-            AppRuntimeState.shared.set(stage: "home")
-            AppHeartbeat.shared.mark("事件 完重活 跨站搜索 \(keyword)")
-            SessionTrace.mark("完 重活 跨站搜索 \(keyword)")
-        }
-
         let kw = keyword
         let per = max(1, limitPerSite)
-        let indexed = Array(targets.enumerated())
-        let width = max(1, min(concurrency, indexed.count))
-
-        // 1.8.4：滑动窗口取代「固定 12 个一批」。
-        // 旧写法 `for await batch in group` 要等整批都回来才开下一批，一批里只要
-        // 混进一个 5 秒超时的坏站，整批就被拖满 5 秒 —— 5 批 = 25 秒，和真机
-        // 23.3 秒实测完全对上。现在谁先完成谁空出槽位、立刻补下一个站，
-        // 坏站只占一个槽，不再拖住别的站。
-        var batches: [Batch] = []
         let siteTimeout: TimeInterval = 3
+
+        // 1.8.18 自适应并发：起步 6 路，连续快站逐步升到上限；一有失败就收，
+        // 不让十几个慢站同时压在端上 Node。滑动窗口谁先完成谁空槽补位。
+        let ceiling = max(2, concurrency)
+        var width = min(ceiling, 6)
+        var active = 0
         var cursor = 0
+        var batches: [Batch] = []
 
         await withTaskGroup(of: FetchResult.self) { group in
-            func addNext() {
-                guard cursor < indexed.count else { return }
-                let (idx, site) = indexed[cursor]
+            func addNext() -> Bool {
+                guard cursor < ranked.count else { return false }
+                let slot = ranked[cursor]
                 cursor += 1
                 group.addTask {
-                    await Self.fetchOne(idx: idx, site: site, kw: kw,
-                                        per: per, timeout: siteTimeout)
+                    await Self.fetchOne(idx: slot.offset, site: slot.element,
+                                        kw: kw, per: per, timeout: siteTimeout)
                 }
+                return true
             }
 
-            for _ in 0..<width { addNext() }
+            while active < width, addNext() { active += 1 }
 
             while let r = await group.next() {
-                SiteHealth.shared.note(r.key, ok: !r.failed, reason: r.reason)
-                if let b = r.batch { batches.append(b) }
-
-                // 1.8.2：页面已退 / 搜索被新词取代 → 收手，别占着重活闸
+                active -= 1
+                SiteHealth.shared.note(r.key, ok: !r.failed,
+                                       reason: r.reason, latency: r.ms)
+                // 快站连续返回 → 加并发；出现失败 → 立刻收，别堆慢站
+                if r.failed {
+                    width = max(2, width - 2)
+                } else if r.ms < 1.2 {
+                    width = min(ceiling, width + 2)
+                }
+                if let b = r.batch {
+                    batches.append(b)
+                    // 1.8.18 流式：这一站的结果立刻交给上层上屏，不等其余站
+                    if let onPartial = onPartial {
+                        let chunk = Self.makeResults(batch: b, keyword: kw,
+                                                     preferredSiteKey: preferredSiteKey)
+                        if !chunk.isEmpty { onPartial(chunk) }
+                    }
+                }
+                // 页面已退 / 搜索被新词取代 → 收手，别占着重活闸
                 if Task.isCancelled { group.cancelAll(); break }
-                // 1.8.12：播放页已起播 → 让出 Node 资源。整站搜索的 V8 堆与
-                // AVAsset 装载在同一进程抢内存，1.8.11 两条曲线同步涨了 40MB+，
-                // 随后进程在 AVPlayerItem 装载阶段被终止。
+                // 播放页已起播 → 让出 Node 资源，不再补新站
                 if await HeavyWorkGate.shared.isCancelRequested() {
-                    SessionTrace.mark("略 重活 播放页起播，主动收手")
                     group.cancelAll()
                     break
                 }
-                // 1.8.3：总时间预算到点 → 取消在飞的，用已拿到的结果出报告
+                // 总时间预算到点 → 取消在飞的，用已拿到的结果收尾
                 if budget > 0, Date().timeIntervalSince(t0) >= budget {
                     group.cancelAll()
                     break
                 }
-                addNext()
+                while active < width, addNext() { active += 1 }
             }
         }
         SiteHealth.shared.flush()
@@ -259,16 +269,11 @@ enum CrossSiteResolver {
         var out: [SiteSearchResult] = []
         var seen = Set<String>()
         for batch in ordered {
-            let bias = (batch.site.key == preferredSiteKey) ? -1_000_000 : 0
-            for (itemIdx, item) in batch.items.enumerated() {
-                let key = "\(batch.site.key)#\(item.vodId)"
-                guard seen.insert(key).inserted else { continue }
-                out.append(SiteSearchResult(
-                    item: item,
-                    site: batch.site,
-                    relevance: matchRelevance(title: item.vodName, query: keyword),
-                    order: bias + batch.index * 1000 + itemIdx
-                ))
+            let chunk = makeResults(batch: batch, keyword: keyword,
+                                    preferredSiteKey: preferredSiteKey)
+            for r in chunk {
+                guard seen.insert(r.id).inserted else { continue }
+                out.append(r)
             }
         }
         out.sort { a, b in
@@ -276,6 +281,29 @@ enum CrossSiteResolver {
             return a.order < b.order
         }
         if out.count > limitTotal { out = Array(out.prefix(limitTotal)) }
+        return out
+    }
+
+    /// 单站结果 → 站内去重并按相关度排序。流式增量与最终汇总共用同一套次序。
+    private static func makeResults(batch: Batch, keyword: String,
+                                    preferredSiteKey: String?) -> [SiteSearchResult] {
+        let bias = (batch.site.key == preferredSiteKey) ? -1_000_000 : 0
+        var seen = Set<String>()
+        var out: [SiteSearchResult] = []
+        for (itemIdx, item) in batch.items.enumerated() {
+            let key = "\(batch.site.key)#\(item.vodId)"
+            guard seen.insert(key).inserted else { continue }
+            out.append(SiteSearchResult(
+                item: item,
+                site: batch.site,
+                relevance: matchRelevance(title: item.vodName, query: keyword),
+                order: bias + batch.index * 1000 + itemIdx
+            ))
+        }
+        out.sort { a, b in
+            if a.relevance != b.relevance { return a.relevance > b.relevance }
+            return a.order < b.order
+        }
         return out
     }
 

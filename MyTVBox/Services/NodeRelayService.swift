@@ -221,50 +221,31 @@ final class NodeRelayService {
     /// 连发 3 次、触发换源风暴，却完全看不出是哪一步。现在逐分支写具体原因：
     /// 2ms 就返回的一定是本地 guard 或 URL 拼接，网络超时不会这么快。
     func resolvePlay(_ urlString: String) async -> (URL, [String: String])? {
-        guard urlString.hasPrefix(Self.playScheme) else {
-            SessionTrace.mark("败 取流 原因=不是 mytvboxnode://play 占位"); return nil
-        }
-        guard let comps = URLComponents(string: urlString) else {
-            SessionTrace.mark("败 取流 原因=URLComponents 无法解析占位 URL"); return nil
-        }
+        guard urlString.hasPrefix(Self.playScheme) else { return nil }
+        guard let comps = URLComponents(string: urlString) else { return nil }
         var q: [String: String] = [:]
         for item in comps.queryItems ?? [] { q[item.name] = item.value ?? "" }
-        guard let key = q["site"], !key.isEmpty else {
-            SessionTrace.mark("败 取流 原因=缺 site 参数（参数项 \(q.count)）"); return nil
-        }
-        guard let id = q["id"], !id.isEmpty else {
-            SessionTrace.mark("败 取流 原因=缺 id 参数（参数项 \(q.count)）"); return nil
-        }
+        guard let key = q["site"], !key.isEmpty else { return nil }
+        guard let id = q["id"], !id.isEmpty else { return nil }
         let type = q["type"] ?? "3"
         let base = (q["base"].flatMap { Self.normalize($0) }) ?? baseURL
-        guard let base, !base.isEmpty else {
-            SessionTrace.mark("败 取流 原因=无可用 baseURL"); return nil
-        }
+        guard let base, !base.isEmpty else { return nil }
         let endpoint = base + "/spider/" + key + "/" + type + "/play"
         // 1.8.13：/play 是崩溃高发窗口（1.8.12 死在「请求在飞、未见返回」）。
-        // 开 100ms 高频内存采样；defer 保证成功 / 失败 / 抛错都会写 END。
-        // 进程若被 SIGKILL，spike.log 里就留下一个没有 END 的窗口，
-        // 峰值与「单次最大跃升」能在下一轮诊断里直接读到。
-        SpikeProbe.shared.start("/play " + key)
-        defer { SpikeProbe.shared.stop("/play " + key) }
+        // 1.8.18：取证探针已移除，/play 只做取流
         let r: [String: Any]
         do {
             r = try await postJSON(endpoint, body: ["id": id], timeout: 20)
         } catch {
-            SessionTrace.mark("败 取流 原因=" + String(String(describing: error).prefix(90)))
             return nil
         }
         guard let u = r["url"] as? String, !u.isEmpty else {
-            SessionTrace.mark("败 取流 原因=/play 响应缺 url 字段（返回键: "
-                              + String(r.keys.joined(separator: ",").prefix(60)) + "）")
             return nil
         }
         guard let url = URL(string: u), url.scheme != nil else {
-            SessionTrace.mark("败 取流 原因=url 字段不是合法绝对地址 · " + Self.urlShape(u))
             return nil
         }
         // 1.8.11：成功也要留痕，才能和「发起 /play」配成对
-        SessionTrace.mark("记 取流 /play 成功 · " + Self.urlShape(u))
         var headers: [String: String] = [:]
         if let h = r["header"] as? [String: Any] {
             for (k, v) in h { headers[k] = "\(v)" }
@@ -307,7 +288,6 @@ final class NodeRelayService {
         // /play 正常只回几 KB JSON；若回了几 MB，说明有线路把整段内容塞进响应，
         // 光是 data(for:) 的这一次分配就够把 phys_footprint 顶上去。
         if data.count > 4 * 1024 * 1024 {
-            SessionTrace.mark("阻 取流 响应体 \(data.count / 1024)KB 超过 4MB，丢弃")
             throw NetworkError.decodingFailed("Node 响应体过大 \(data.count) B")
         }
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0

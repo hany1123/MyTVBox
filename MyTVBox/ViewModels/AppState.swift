@@ -152,17 +152,14 @@ final class AppState: ObservableObject {
         let t = kw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         if lastJumpKeyword == t, let at = lastJumpAt, Date().timeIntervalSince(at) < 6 {
-            SessionTrace.mark("略 跳搜索 \(t)（6 秒内重复）")
             return
         }
         lastJumpKeyword = t
         lastJumpAt = Date()
-        SessionTrace.mark("开 跳搜索 \(t)")
         DispatchQueue.main.asyncAfter(deadline: .now() + max(0, delay)) { [weak self] in
             guard let self else { return }
             self.pendingSearchKeyword = t
             self.selectedTab = 2
-            SessionTrace.mark("完 跳搜索 \(t)")
         }
     }
     /// 当前订阅若是多仓，这里是可切换的子仓库列表
