@@ -68,9 +68,6 @@ struct DiagnosticsView: View {
             // 1.8.10：原生信号崩溃（CrashGuard 抓不到的那一类）
             kv("上次原生信号", SignalGuard.lastSignal() ?? "未捕获到")
             kv("signal 监听", SignalGuard.status())
-            // 1.8.15：贴诊断时一眼看出跑的是稳定模式还是完整聚合
-            kv("稳定模式", StableMode.shared.summary)
-            kv("起播闸门", PlaybackGate.shared.statusText())
             kv("App 版本", appVersion)
         }
         .padding(14)

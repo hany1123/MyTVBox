@@ -74,8 +74,6 @@ struct MainTabView: View {
 /// 设置 Tab：包含"接口管理"入口
 private struct SettingsTab: View {
     @EnvironmentObject var appState: AppState
-    /// 1.8.15：与 StableMode.shared 读写同一个偏好设置键
-    @AppStorage(StableMode.defaultsKey) private var stableMode = true
 
     /// 从 Info.plist 读取，避免手写版本号跟工程配置脱节
     private var appVersion: String {
@@ -109,42 +107,9 @@ private struct SettingsTab: View {
                         }
                         .buttonStyle(.plain)
 
-                        // 1.8.15：稳定模式开关。默认开，关掉即回到 1.8.14 完整聚合。
-                        SectionHeader(title: "稳定性", code: "02")
-                            .padding(.top, 8)
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Toggle(isOn: $stableMode) {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text("稳定模式（推荐）")
-                                        .font(TVBoxTheme.text(15, weight: .semibold))
-                                        .foregroundStyle(TVBoxTheme.textPrimary)
-                                    Text("起播前等请求收口 · 播放期禁跨站搜索 · 关自动换源")
-                                        .font(TVBoxTheme.mono(10))
-                                        .foregroundStyle(TVBoxTheme.textSecondary)
-                                }
-                            }
-                            .tint(TVBoxTheme.accent)
-                            Text(stableMode
-                                 ? "已开启：优先不闪退。搜索并发 2 站 / 最多 8 站，点详情不再自动全网找源。"
-                                 : "已关闭：恢复自动跨站接管、后台聚合与自动换源（1.8.14 行为）。")
-                                .font(TVBoxTheme.mono(10))
-                                .foregroundStyle(TVBoxTheme.textMuted)
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
-                        .background(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .fill(TVBoxTheme.surface)
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .stroke(TVBoxTheme.stroke, lineWidth: 1)
-                        )
-
                         // 1.8.1：诊断入口从站点选择器搬到这里 —— 站点列表为空时
                         // 那个入口本身进不去，恰恰是最需要诊断的时候。
-                        SectionHeader(title: "诊断", code: "03")
+                        SectionHeader(title: "诊断", code: "02")
                             .padding(.top, 8)
 
                         NavigationLink {
@@ -160,7 +125,7 @@ private struct SettingsTab: View {
                         }
                         .buttonStyle(.plain)
 
-                        SectionHeader(title: "关于", code: "04")
+                        SectionHeader(title: "关于", code: "03")
                             .padding(.top, 8)
 
                         infoRow(icon: "info.circle", title: "版本", value: appVersion)
