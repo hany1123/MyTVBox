@@ -588,6 +588,8 @@ final class SpiderEngine {
         out.append("上次原生信号  : "
                    + (SignalGuard.lastSignal()
                       ?? "未捕获到（SIGABRT / SIGSEGV / SIGBUS / SIGTRAP）"))
+        // 1.8.11：「未捕获到」要能区分真没发生与 handler 没装（假阴性）
+        out.append("signal 监听    : " + SignalGuard.status())
 
         out.append("")
         out.append("--- 端上 Node 运行时 ---")

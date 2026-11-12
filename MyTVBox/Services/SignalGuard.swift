@@ -113,6 +113,19 @@ enum SignalGuard {
         return lines.last(where: { $0.hasPrefix("SIGNAL ") })
     }
 
+    /// 1.8.11：「上次原生信号 未捕获到」有两种可能 —— 真的没发生信号崩溃，
+    /// 或者 handler 压根没装上（假阴性）。把安装状态与 boot 计数一起给出，
+    /// 诊断里才能区分这两者。
+    static func status() -> String {
+        let s = (try? String(contentsOf: logFile, encoding: .utf8)) ?? ""
+        let lines = s.components(separatedBy: "\n")
+        let boots = lines.filter { $0 == "=== boot ===" }.count
+        let hits = lines.filter { $0.hasPrefix("SIGNAL ") }.count
+        return installed
+            ? "已注册 6 个信号 · 累计 \(boots) 次启动 / \(hits) 次信号"
+            : "未安装（install 未被调用）"
+    }
+
     static func clear() {
         try? FileManager.default.removeItem(at: logFile)
     }

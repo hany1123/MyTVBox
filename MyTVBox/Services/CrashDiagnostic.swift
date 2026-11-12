@@ -200,11 +200,56 @@ enum CrashDiagnostic {
             out.append("心跳覆盖度        : 0 条（\(scopeName)没有播放心跳；可能没进播放页）")
         } else {
             out.append("心跳覆盖度        : \(beats.count) 条（\(scopeName)最近一次播放） · 首条 \(beats.first ?? "") · 末条 \(beats.last ?? "")")
-            out.append("     说明          : 按 2 秒采样，末条之后本应还有下一条；缺了就是进程在那一瞬间没了")
+            out.append("     说明          : "
+                       + (scope.contains(where: { $0.contains("完 心跳") })
+                          ? "有「完 心跳」，本轮心跳是正常收尾，不是被杀断的"
+                          : "按 2 秒采样，末条之后本应还有下一条；缺了就是进程在那一瞬间没了"))
         }
         out.append("播放结局          : "
                    + (playScope.last(where: { $0.contains("完 播放") })
                       ?? "本次播放没有「完 播放」（未正常收尾）"))
+
+        // 1.8.11：老大「首次进入闪退了一次」，但崩完又正常播了一次 ——
+        // 本轮 4 条心跳让 useCurrent 取了本轮，首次闪退那一轮被整个盖掉。
+        // 这里**并列**再给一份上一轮判读，两份都保留，不再二选一。
+        out.append("")
+        out.append("--- 上一轮独立判读（首次闪退轮，避免被本轮正常播放覆盖）---")
+        if lastSession.isEmpty {
+            out.append("上一轮          : 无记录（本版首次启动 / 日志已被裁剪）")
+        } else {
+            let prevLast = lastSession.last ?? ""
+            let pBeats = playbackBeats(lastSession)
+            let pRss = pBeats.compactMap { rssMB(from: $0) }
+            let pFoot = pBeats.compactMap { footMB(from: $0) }
+            out.append("上一轮范围      : \(lastSession.count) 行 · 末行 \(prevLast)")
+            let memText = pRss.isEmpty
+                ? "无播放心跳（崩溃可能发生在非播放状态）"
+                : "RSS \(pRss.first ?? 0)→\(pRss.last ?? 0)MB · foot "
+                  + (pFoot.isEmpty ? "未记录"
+                     : "\(pFoot.first ?? 0)→\(pFoot.last ?? 0)MB（峰值 \(pFoot.max() ?? 0)MB）")
+            out.append("上一轮内存      : " + memText + " · 心跳 \(pBeats.count) 条")
+            out.append("上一轮心跳结局  : "
+                       + (lastSession.contains(where: { $0.contains("完 心跳") })
+                          ? "有「完 心跳」→ 播放页主动收尾，心跳不是被杀断的"
+                          : "**无「完 心跳」→ 进程在播放中被直接终止**"))
+            out.append("上一轮播放结局  : "
+                       + (lastSession.last(where: { $0.contains("完 播放") })
+                          ?? "没有「完 播放」（未正常收尾）"))
+            let pFails = lastSession.filter { $0.contains("败 播放") || $0.contains("败 取流") }
+            out.append("上一轮失败事件  : \(pFails.count) 条"
+                       + (pFails.isEmpty ? "" : " · 末条 " + (pFails.last ?? "")))
+            let pOpen = lastSession.filter { $0.contains("开 重活") }.count
+            let pClose = lastSession.filter { $0.contains("完 重活") }.count
+            out.append("上一轮重活配对  : 开 \(pOpen) / 完 \(pClose)")
+            let bootLine = boot.map { all[$0] }
+            if let gap = gapToBoot(from: prevLast, bootLine: bootLine) {
+                out.append("距本次启动      : \(gap) 秒（本次启动行 \(bootLine ?? "")）")
+                if lastSession.contains(where: { $0.contains("完 心跳") }), gap <= 60 {
+                    out.append("     判读          : **播放页与心跳都已正常收尾，却仍在 \(gap) 秒后重启** → 崩溃发生在**非播放状态**，现有播放心跳覆盖不到这段取证空窗")
+                    out.append("     下一步        : 补 App 级轻量心跳（不绑播放页），或先看本轮新加的 `/play 失败原因` 与 signal 安装自检")
+                }
+            }
+        }
 
         out.append("证据不足时不下结论：请连同 node.log 关键行与本段一起复制给我。")
         out.append("")
@@ -219,6 +264,27 @@ enum CrashDiagnostic {
             return lines
         }
         return Array(lines[(i + 1)...])
+    }
+
+    /// 1.8.11：从面包屑行首的 `HH:mm:ss.SSS` 读出当天秒数，
+    /// 用来算「上一轮末行 → 本次启动」的间隔。跨午夜时结果为负，返回 nil。
+    private static func clockSeconds(_ line: String) -> Int? {
+        guard let t = line.split(separator: " ").first else { return nil }
+        let parts = t.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              let h = Int(String(parts[0])),
+              let m = Int(String(parts[1])) else { return nil }
+        guard let secPart = parts[2].split(separator: ".").first,
+              let s = Int(String(secPart)) else { return nil }
+        return h * 3600 + m * 60 + s
+    }
+
+    private static func gapToBoot(from line: String, bootLine: String?) -> Int? {
+        guard let b = bootLine,
+              let t0 = clockSeconds(line),
+              let t1 = clockSeconds(b) else { return nil }
+        let gap = t1 - t0
+        return gap >= 0 ? gap : nil
     }
 
     /// 只取「最后一次开 播放」之后的心跳，避免把多轮播放的 RSS 混成一条曲线

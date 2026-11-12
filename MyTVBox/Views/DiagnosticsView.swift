@@ -67,6 +67,7 @@ struct DiagnosticsView: View {
             kv("fetch 兼容层", NodeRuntime.shared.fetchShimText)
             // 1.8.10：原生信号崩溃（CrashGuard 抓不到的那一类）
             kv("上次原生信号", SignalGuard.lastSignal() ?? "未捕获到")
+            kv("signal 监听", SignalGuard.status())
             kv("App 版本", appVersion)
         }
         .padding(14)

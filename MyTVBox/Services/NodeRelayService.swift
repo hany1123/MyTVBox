@@ -216,26 +216,60 @@ final class NodeRelayService {
     // MARK: - 播放取流
 
     /// 解析 `mytvboxnode://play?...`，调 /play 换出真实 m3u8 + 请求头
+    /// 1.8.11：以前每个 guard 和 `try?` 都把失败塌成一个 `nil`，Swift 侧只能写
+    /// 「取流失败（/play 无有效 URL）」。1.8.10 诊断里 `/play 结束 2ms 失败`
+    /// 连发 3 次、触发换源风暴，却完全看不出是哪一步。现在逐分支写具体原因：
+    /// 2ms 就返回的一定是本地 guard 或 URL 拼接，网络超时不会这么快。
     func resolvePlay(_ urlString: String) async -> (URL, [String: String])? {
-        guard urlString.hasPrefix(Self.playScheme),
-              let comps = URLComponents(string: urlString) else { return nil }
+        guard urlString.hasPrefix(Self.playScheme) else {
+            SessionTrace.mark("败 取流 原因=不是 mytvboxnode://play 占位"); return nil
+        }
+        guard let comps = URLComponents(string: urlString) else {
+            SessionTrace.mark("败 取流 原因=URLComponents 无法解析占位 URL"); return nil
+        }
         var q: [String: String] = [:]
         for item in comps.queryItems ?? [] { q[item.name] = item.value ?? "" }
-        guard let key = q["site"], !key.isEmpty,
-              let id = q["id"], !id.isEmpty else { return nil }
+        guard let key = q["site"], !key.isEmpty else {
+            SessionTrace.mark("败 取流 原因=缺 site 参数（参数项 \(q.count)）"); return nil
+        }
+        guard let id = q["id"], !id.isEmpty else {
+            SessionTrace.mark("败 取流 原因=缺 id 参数（参数项 \(q.count)）"); return nil
+        }
         let type = q["type"] ?? "3"
         let base = (q["base"].flatMap { Self.normalize($0) }) ?? baseURL
-        guard let base, !base.isEmpty else { return nil }
-        guard let r = try? await postJSON(
-            base + "/spider/" + key + "/" + type + "/play",
-            body: ["id": id], timeout: 20),
-              let u = r["url"] as? String, !u.isEmpty,
-              let url = URL(string: u) else { return nil }
+        guard let base, !base.isEmpty else {
+            SessionTrace.mark("败 取流 原因=无可用 baseURL"); return nil
+        }
+        let endpoint = base + "/spider/" + key + "/" + type + "/play"
+        let r: [String: Any]
+        do {
+            r = try await postJSON(endpoint, body: ["id": id], timeout: 20)
+        } catch {
+            SessionTrace.mark("败 取流 原因=" + String(String(describing: error).prefix(90)))
+            return nil
+        }
+        guard let u = r["url"] as? String, !u.isEmpty else {
+            SessionTrace.mark("败 取流 原因=/play 响应缺 url 字段（返回键: "
+                              + String(r.keys.joined(separator: ",").prefix(60)) + "）")
+            return nil
+        }
+        guard let url = URL(string: u), url.scheme != nil else {
+            SessionTrace.mark("败 取流 原因=url 字段不是合法绝对地址 · " + Self.urlShape(u))
+            return nil
+        }
+        // 1.8.11：成功也要留痕，才能和「发起 /play」配成对
+        SessionTrace.mark("记 取流 /play 成功 · " + Self.urlShape(u))
         var headers: [String: String] = [:]
         if let h = r["header"] as? [String: Any] {
             for (k, v) in h { headers[k] = "\(v)" }
         }
         return (url, headers)
+    }
+
+    /// 脱敏：只保留 scheme / host / path 前缀，不落带 token 的完整直链
+    private static func urlShape(_ s: String) -> String {
+        guard let u = URL(string: s) else { return "(不可解析)" }
+        return "\(u.scheme ?? "(无scheme)")://\(u.host ?? "(无host)")\(u.path.prefix(40))"
     }
 
     // MARK: - HTTP
