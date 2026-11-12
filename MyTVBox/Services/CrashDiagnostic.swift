@@ -65,8 +65,18 @@ enum CrashDiagnostic {
         }
         out.append("     判据          : 后台心跳继续、主线程时间戳不动 = 主线程被卡住 ≥10s 被 watchdog 杀")
 
-        // 3. Node V8 abort
-        if fatal {
+        // 3. Node 侧：必须先区分「根本没启动」和「运行中崩」，否则会误判
+        // 1.8.6：rc=9 是 Node 的 kInvalidCommandLineArgument。node_start 直接返回时
+        // main.js 一行都没跑，此时不是 V8 abort，而是本机源整体不可用。
+        let rt = NodeRuntime.shared
+        let startFailed = (rt.nodeDidExit && (rt.lastExitCode ?? 0) != 0)
+            || nodeLog.contains("node_start exited rc=9")
+        if startFailed {
+            out.append("[3] Node V8 abort  : 不适用 —— Node 根本没启动（node_start 退出码 "
+                       + "\(rt.lastExitCode.map(String.init) ?? "9")，启动参数/运行时失败）")
+            out.append("     本机源        : 端口无监听 → /config 与 /spider 必然连不上；站点列表只是配置缓存，不是可用站点")
+            out.append("     处理          : 设置 → 诊断 → 重启本机内核；若仍失败请完全退出 App 冷启动")
+        } else if fatal {
             out.append("[3] Node V8 abort  : node.log 出现 FATAL → 高度可疑（Node 与 App 同进程，abort 会带走整个 App）")
         } else if nodeExit {
             out.append("[3] Node V8 abort  : 看到 Node EXIT，但未见 FATAL")

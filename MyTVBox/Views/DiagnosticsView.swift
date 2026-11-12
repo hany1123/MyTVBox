@@ -58,6 +58,12 @@ struct DiagnosticsView: View {
             kv("海报缓存", "420px 缩略 · 96 张 / 28MB")
             kv("站点健康", "\(SiteHealth.shared.coolingKeys().count) 站冷却中")
             kv("进程内存", MemoryProbe.summary())
+            // 1.8.6：把「Node 到底起没起来」摆到概览第一行区，别让人对着
+            // 97 个缓存站点猜为什么首页 NO CONTENT
+            kv("Node 启动", NodeRuntime.shared.bootFailureText
+               ?? (NodeRuntime.shared.nodeDidExit
+                   ? "已退出（rc=\(NodeRuntime.shared.lastExitCode.map(String.init) ?? "?")）"
+                   : (NodeRuntime.shared.isReady ? "已就绪" : "未就绪")))
             kv("App 版本", appVersion)
         }
         .padding(14)
@@ -96,6 +102,27 @@ struct DiagnosticsView: View {
             }
             .buttonStyle(.plain)
             .disabled(running)
+
+            // 1.8.6：Node 启动失败（rc=9）或运行中退出后，一键重引导
+            Button {
+                NodeRuntime.shared.restartNode()
+                SessionTrace.mark("手 重启本机内核")
+            } label: {
+                Label("重启本机内核（Node 退出后）", systemImage: "arrow.clockwise")
+                    .font(TVBoxTheme.text(13, weight: .semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(TVBoxTheme.surface)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(TVBoxTheme.stroke, lineWidth: 1)
+                    )
+                    .foregroundStyle(TVBoxTheme.warn)
+            }
+            .buttonStyle(.plain)
 
             // 1.8.3：内存吃紧时手动释放海报位图，不重启也能缓一口气
             Button {

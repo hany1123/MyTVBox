@@ -29,6 +29,24 @@ final class NodeRuntime {
     private(set) var port: UInt16 = UInt16(NodeRuntime.defaultPort)
     private(set) var isReady = false
 
+    // 1.8.6：node_start 是**阻塞**调用，它返回就等于 Node 事件循环已经结束。
+    // 以前完全不记这件事，结果 Node 死了 Swift 还以为端口活着，一直发 /config。
+    // rc=9 是 Node 的 kInvalidCommandLineArgument（本机实测 `node --非法flag` → 9），
+    // 1.8.5 给 NODE_OPTIONS 加的 --expose-gc 在端上 nodejs-mobile v18.20.4 不被接受，
+    // 于是 main.js 一行没跑、整个本机源瘫痪。这些字段让失败可见、可诊断、可恢复。
+    private(set) var lastExitCode: Int32?
+    private(set) var nodeDidExit = false
+    private(set) var bootNote: String?
+
+    /// 给 UI/诊断读的一句话失败原因；nil 表示没有已知启动故障
+    var bootFailureText: String? {
+        guard nodeDidExit, let rc = lastExitCode else { return nil }
+        if rc == 9 {
+            return "本机内核启动失败（rc=9 · 启动参数不被接受）"
+        }
+        return "本机内核已退出（rc=\(rc)）"
+    }
+
     /// App 内部访问 Node 服务的基址。
     var baseURL: String { "http://127.0.0.1:\(port)" }
 
@@ -110,64 +128,118 @@ final class NodeRuntime {
         lock.lock()
         if booted { lock.unlock(); return }
         booted = true
+        nodeDidExit = false
+        lastExitCode = nil
+        bootNote = nil
+        isReady = false
+        localConfigTask = nil
         lock.unlock()
 
+        // 1.8.6：**同步**清掉上一次运行留下的就绪标记。
+        // 旧实现把删除放在后台线程里，而 waitUntilReady 主线程立刻开始轮询 ——
+        // 于是先读到上一次写的 ready.txt=18923，直接判定 isReady=true，
+        // 对着一个已经没人监听的端口狂发 /config。诊断里「node ready : YES」
+        // 却全是 Could not connect，就是这么来的。
+        try? FileManager.default.removeItem(at: readyFile)
+        try? FileManager.default.removeItem(at: kernelLogFile)
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-
-            do {
-                try self.installProjectIfNeeded()
-            } catch {
-                NSLog("[NodeRuntime] 安装资源失败: \(error.localizedDescription)")
-                self.appendLog("FATAL install: \(error.localizedDescription)")
-                return
-            }
-
-            let mainPath = self.workDir.appendingPathComponent("main.js").path
-            guard FileManager.default.fileExists(atPath: mainPath) else {
-                self.appendLog("FATAL: main.js 不存在 \(mainPath)")
-                return
-            }
-
-            // 环境变量交给 bundle 读
-            setenv("PORT", "\(NodeRuntime.defaultPort)", 1)
-            setenv("HOST", "127.0.0.1", 1)
-            setenv("NODE_ENV", "production", 1)
-            setenv("HOME", self.workDir.path, 1)
-
-            // 1.7.1 把这个值压到 128 MB 想防 Jetsam，但方向反了：
-            // V8 撞到堆上限是 `FATAL ERROR: Reached heap limit` → **abort 整个进程**，
-            // 表现就是「点开一部片直接闪退」，比 Jetsam 更频繁也更难查。
-            // 1.7.7 放到 512 MB（前台 App 的 Jetsam 水位远高于此），峰值内存改由
-            // 「跨站搜索分批（CrossSiteResolver concurrency）」控制，不再靠压堆。
-            // 1.8.5：加 `--expose-gc`，让 main.js 在高水位时主动 full GC。
-            // Node 与 AVPlayer 同进程，播放时 V8 堆不回收会和视频缓冲叠加。
-            setenv("NODE_OPTIONS", "--max-old-space-size=512 --expose-gc", 1)
-
-            // C 的 argv 必须以 NULL 结尾，argc 不含这个 NULL。
-            // 少写这个 nil 会导致 node_start 读越界，表现为启动即崩或卡死。
-            var args: [UnsafeMutablePointer<CChar>?] = [
-                strdup("node"),
-                strdup(mainPath),
-                nil
-            ]
-            defer { args.forEach { if let p = $0 { free(p) } } }
-
-            NSLog("[NodeRuntime] node_start -> \(mainPath)")
-            let rc = node_start(Int32(args.count - 1), &args)
-            NSLog("[NodeRuntime] node_start 退出 rc=\(rc)")
-            self.appendLog("node_start exited rc=\(rc)")
+            self?.launchNode()
         }
+    }
+
+    /// 真正调用 node_start 的地方（阻塞在本后台线程，直到 Node 事件循环结束）。
+    private func launchNode() {
+        do {
+            try installProjectIfNeeded()
+        } catch {
+            NSLog("[NodeRuntime] 安装资源失败: \(error.localizedDescription)")
+            appendLog("FATAL install: \(error.localizedDescription)")
+            markExited(rc: -1, note: "安装资源失败: \(error.localizedDescription)")
+            return
+        }
+
+        let mainPath = workDir.appendingPathComponent("main.js").path
+        guard FileManager.default.fileExists(atPath: mainPath) else {
+            appendLog("FATAL: main.js 不存在 \(mainPath)")
+            markExited(rc: -1, note: "main.js 不存在")
+            return
+        }
+
+        // 环境变量交给 bundle 读
+        setenv("PORT", "\(NodeRuntime.defaultPort)", 1)
+        setenv("HOST", "127.0.0.1", 1)
+        setenv("NODE_ENV", "production", 1)
+        setenv("HOME", workDir.path, 1)
+
+        // 1.7.1 把堆上限压到 128 MB 想防 Jetsam，方向反了：V8 撞到堆上限会
+        // `FATAL ERROR: Reached heap limit` → abort 整个进程。1.7.7 改 512 MB。
+        // 1.8.5 加的 `--expose-gc` 在端上 nodejs-mobile v18.20.4 不被接受：
+        // node_start 直接以 **rc=9（kInvalidCommandLineArgument）** 返回，
+        // main.js 一行都没执行 → 本机源全瘫、界面停在「内核启动中…」。
+        // 1.8.6：回到 1.8.4 已实测可启动的唯一参数。以后往 NODE_OPTIONS
+        // 里加任何 flag，都必须先在真机确认 node_start 仍返回 0。
+        setenv("NODE_OPTIONS", "--max-old-space-size=512", 1)
+
+        // C 的 argv 必须以 NULL 结尾，argc 不含这个 NULL。
+        // 少写这个 nil 会导致 node_start 读越界，表现为启动即崩或卡死。
+        var args: [UnsafeMutablePointer<CChar>?] = [
+            strdup("node"),
+            strdup(mainPath),
+            nil
+        ]
+        defer { args.forEach { if let p = $0 { free(p) } } }
+
+        NSLog("[NodeRuntime] node_start -> \(mainPath)")
+        let rc = node_start(Int32(args.count - 1), &args)
+        NSLog("[NodeRuntime] node_start 退出 rc=\(rc)")
+        appendLog("node_start exited rc=\(rc)")
+        markExited(rc: rc, note: rc == 9
+                   ? "rc=9 启动参数不被接受（NODE_OPTIONS）"
+                   : "Node 事件循环结束")
+    }
+
+    /// 1.8.6：Node 退出是**硬事实**，立刻复位所有「就绪」假象并留现场。
+    private func markExited(rc: Int32, note: String) {
+        lock.lock()
+        nodeDidExit = true
+        lastExitCode = rc
+        bootNote = note
+        isReady = false
+        localConfigTask = nil
+        lock.unlock()
+        try? FileManager.default.removeItem(at: readyFile)
+        SessionTrace.mark("败 Node 启动 rc=\(rc) \(note)")
+    }
+
+    /// 1.8.6：手动/回前台自愈。node_start 已退出时复位状态再引导一次。
+    /// 注意：nodejs-mobile 不保证同一进程能二次初始化，所以这里**只在明确失败后**
+    /// 由用户动作或回前台触发一次，不做无人值守的循环重启。
+    func restartNode() {
+        appendLog("restartNode: 重新引导端上内核")
+        SessionTrace.mark("记 重启内核")
+        lock.lock()
+        booted = false
+        nodeDidExit = false
+        lastExitCode = nil
+        bootNote = nil
+        isReady = false
+        localConfigTask = nil
+        lock.unlock()
+        startIfNeeded()
     }
 
     // MARK: - 等待就绪
 
-    /// 轮询 ready.txt，直到 Node 起好或超时。
+    /// 轮询 ready.txt **并真的敲一次 /health**，直到 Node 起好或超时。
+    /// 1.8.6：只读文件会把上一次运行残留的 ready.txt 当成「端口活着」。
     @discardableResult
     func waitUntilReady(timeout: TimeInterval = 90) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if let p = currentReadyPort() {
+            // node_start 已返回 = Node 已经结束，别再傻等 120 秒
+            if nodeDidExit { isReady = false; return false }
+            if let p = currentReadyPort(), await healthOK(p) {
                 port = p
                 isReady = true
                 return true
@@ -178,11 +250,36 @@ final class NodeRuntime {
         return false
     }
 
+    /// 1.8.6：真实端口探测。严格校验 /health 的 name 指纹，
+    /// 避免把别的进程占用的 18923 误当成猫爪源。
+    private func healthOK(_ p: UInt16) async -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:\(p)/health") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 1.5
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.setValue("close", forHTTPHeaderField: "Connection")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (obj["name"] as? String) == "CatVodSpiderios" else { return false }
+            return true
+        } catch {
+            return false
+        }
+    }
+
     /// 已就绪则直接返回，否则等。用于从后台回前台的重连场景。
     @discardableResult
     func ensureReady(timeout: TimeInterval = 90) async -> Bool {
-        if isReady, currentReadyPort() != nil { return true }
-        startIfNeeded()
+        // 1.8.6：isReady 也必须用真实 /health 复核，不能看标志位就放行
+        if isReady, await healthOK(port) { return true }
+        isReady = false
+        if nodeDidExit {
+            restartNode()
+        } else {
+            startIfNeeded()
+        }
         return await waitUntilReady(timeout: timeout)
     }
 
@@ -209,7 +306,9 @@ final class NodeRuntime {
         }
         let task = Task<Data?, Never> { [weak self] in
             guard let self else { return nil }
-            guard self.isReady else { return nil }
+            // 1.8.6：node_start 已退出就不再发 /config —— 旧版会一直重试到超时，
+            // 日志里刷满 Could not connect，还把「失败」写进本机源状态。
+            guard self.isReady, !self.nodeDidExit else { return nil }
             guard let url = URL(string: self.baseURL + "/config") else { return nil }
             var req = URLRequest(url: url)
             req.timeoutInterval = timeout

@@ -583,6 +583,11 @@ final class SpiderEngine {
         out.append("")
         out.append("--- 端上 Node 运行时 ---")
         out.append("node ready    : \(rt.isReady ? "YES" : "NO")")
+        // 1.8.6：node_start 是阻塞调用，它返回 = Node 已经结束。
+        // 以前完全不记退出码，才会出现「node ready YES 却全连不上」的假象。
+        out.append("node 已退出   : \(rt.nodeDidExit ? "YES" : "NO")")
+        out.append("node 退出码   : \(rt.lastExitCode.map(String.init) ?? "—")（9=启动参数不被接受）")
+        out.append("node 启动故障 : \(rt.bootFailureText ?? "无")")
         out.append("node baseURL  : \(rt.baseURL)")
         out.append("relay baseURL : " + (NodeRelayService.shared.baseURL ?? "nil"))
         // 1.8.5：12 行只够看到 undici 栈的尾巴，看不到错误首行和内存曲线

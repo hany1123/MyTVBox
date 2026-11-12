@@ -33,6 +33,20 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { phase in
             guard phase == .active else { return }
+            // 1.8.6：Node 明确退出过（最典型是 rc=9 启动参数被拒）时，
+            // 回前台自动重引导一次，并重新拉配置 —— 不用用户自己找按钮。
+            // nodejs-mobile 不保证同进程可二次初始化，所以只做一次、失败就交给
+            // 设置页的明确提示让用户冷启动。
+            if NodeRuntime.shared.nodeDidExit {
+                NodeRuntime.shared.restartNode()
+                foregroundReloading = true
+                Task {
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    _ = await appState.loadConfigWithRetry(attempts: 3, delay: 1.5)
+                    foregroundReloading = false
+                }
+                return
+            }
             // 1.7.7：回前台还是 0 站点（后台被系统回收过、或首次加载没赶上），
             // 自动补一次 —— 不用再去「订阅源」里手点某一条。
             guard NodeRuntime.shared.isReady,

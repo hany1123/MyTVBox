@@ -165,6 +165,9 @@ struct MyTVBoxApp: App {
             ok = await NodeRuntime.shared.waitUntilReady(timeout: 60)
         }
         guard ok else {
+            // 1.8.6：waitUntilReady 现在遇到 nodeDidExit 会立刻返回，
+            // 这里留一条明确轨迹，诊断里就能看出「是启动失败」而不是「加载慢」
+            SessionTrace.mark("败 端上 Node 未就绪（后续只加载其它源）")
             NSLog("[App] 端上 Node 启动失败，日志:\n%@", NodeRuntime.shared.tailLog())
             // 1.7.7：Node 没起来也绝不能把界面留在「0 个站点」——
             // ContentView 那边已经因为「有本机源」而跳过了抢先加载，这里要是也直接

@@ -445,7 +445,10 @@ struct SubscriptionView: View {
     }
 
     /// 标题只在「确认过」的前提下才敢下结论，避免内核没起来时瞎猜
+    /// 1.8.6：node_start 已经明确退出过就直说失败，别再写「内核启动中…」
+    /// —— 那个文案让用户白等，而实际端口根本没有监听。
     private var activeTitle: String {
+        if let failure = NodeRuntime.shared.bootFailureText { return failure }
         if active.md5.isEmpty { return "内核启动中…" }
         return active.isRemote ? "运行中：下载的内核" : "运行中：App 自带内核"
     }
@@ -463,9 +466,11 @@ struct SubscriptionView: View {
                     Text(activeTitle)
                         .font(TVBoxTheme.text(14, weight: .semibold))
                         .foregroundStyle(TVBoxTheme.textPrimary)
-                    Text(active.md5.isEmpty
-                         ? "内核还没起来，稍等一下"
-                         : "\(NodeRuntime.sizeText(active.bytes)) · md5 \(active.md5.prefix(8))…")
+                    Text(NodeRuntime.shared.bootFailureText != nil
+                         ? "端口没有监听，本机源不可用 · 点【重启内核】或完全退出 App 重开"
+                         : (active.md5.isEmpty
+                            ? "内核还没起来，稍等一下"
+                            : "\(NodeRuntime.sizeText(active.bytes)) · md5 \(active.md5.prefix(8))…"))
                         .font(TVBoxTheme.mono(10))
                         .foregroundStyle(TVBoxTheme.textMuted)
                 }
@@ -526,6 +531,27 @@ struct SubscriptionView: View {
                     }
                     .buttonStyle(.plain)
                 }
+
+                // 1.8.6：node_start 明确失败后给一个能立刻按的恢复入口。
+                // 旧版只有「内核启动中…」一行字，用户只能干等或重装。
+                Button {
+                    NodeRuntime.shared.restartNode()
+                    kernelTick += 1
+                    kernelNotice = "已在当前进程重新引导端上内核，稍后会自动重新拉取配置。\n\n若仍显示启动失败，请完全退出 App 再打开（nodejs-mobile 不保证同一进程可二次初始化）。"
+                    showKernelNotice = true
+                    Task {
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        _ = await appState.loadConfigWithRetry(attempts: 3, delay: 1.5)
+                    }
+                } label: {
+                    Text("重启内核")
+                        .font(TVBoxTheme.text(12, weight: .semibold))
+                        .foregroundStyle(TVBoxTheme.warn)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Capsule().stroke(TVBoxTheme.warn.opacity(0.5), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
 
                 Spacer()
             }
