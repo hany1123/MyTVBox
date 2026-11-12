@@ -290,7 +290,20 @@ final class AppState: ObservableObject {
 
     /// 已启用（参与合并）的订阅
     var enabledSubscriptions: [Subscription] {
-        subscriptions.filter { $0.isEnabled }
+        // 1.7.3：端上 Node 就绪后，「JS bundle 型」订阅（解析出来是 catpaw_* 站点）
+        // 必然跑不起来 —— 猫爪源是 Node 服务端包，JavaScriptCore 里没有 socket，
+        // 1.5.4~1.5.9 已经反复验证过这条路是死的。
+        // 订阅记录和开关状态都保留（用户随时能看见），只是不再参与加载：
+        // 既省掉一次 6.6 MB 下载 + JSC 预处理，也不会把这些永远报空的站点混进合并池。
+        subscriptions.filter { $0.isEnabled && !isSupersededByLocalNode($0) }
+    }
+
+    /// 该订阅是否已被「端上内核」接管（只有 Node 真正就绪时才成立，
+    /// Node 起不来时照旧加载，不能让用户彻底没站点）
+    func isSupersededByLocalNode(_ sub: Subscription) -> Bool {
+        guard NodeRuntime.shared.isReady else { return false }
+        if sub.url.hasPrefix("http://127.0.0.1:") { return false }
+        return CatPawConfigBuilder.isCatPawURL(sub.url)
     }
 
     /// 是否有可用于加载的订阅
@@ -457,6 +470,9 @@ final class AppState: ObservableObject {
             if spider == nil { spider = group.spider }
             if ijk == nil { ijk = group.ijk }
             for site in group.sites {
+                // 1.7.3：端上 Node 已就绪时，旧的 catpaw_* 站点（JSC 路线）一律不进合并池。
+                // 它们和 noderelay_* 指的是同一批站，留着只会让人点到空列表。
+                if NodeRuntime.shared.isReady, site.key.hasPrefix("catpaw_") { continue }
                 let unique = dedupeKey(site.key, used: &usedKeys)
                 let final = unique == site.key ? site : site.replacingKey(unique)
                 sites.append(final)

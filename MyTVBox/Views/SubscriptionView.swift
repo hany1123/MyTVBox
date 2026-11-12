@@ -164,6 +164,7 @@ struct SubscriptionView: View {
                         isActive: vm.activeId == sub.id,
                         siteCount: appState.siteCount(for: sub.id),
                         usableCount: appState.usableSiteCount(for: sub.id),
+                        isSuperseded: appState.isSupersededByLocalNode(sub),
                         onToggle: { newValue in
                             Task { await vm.setEnabled(sub, newValue) }
                         },
@@ -521,6 +522,8 @@ private struct SubscriptionRow: View {
     let siteCount: Int
     /// 该源贡献的可用站点数（排除 JAR 型）
     let usableCount: Int
+    /// 1.7.3：端上 Node 已就绪时，JS bundle 型订阅会被跳过（跑不起来）
+    var isSuperseded: Bool = false
     let onToggle: (Bool) -> Void
     let onTap: () -> Void
 
@@ -571,6 +574,18 @@ private struct SubscriptionRow: View {
                                     .padding(.vertical, 2)
                                     .background(TVBoxTheme.accent)
                                     .clipShape(Capsule())
+                            }
+
+                            if isSuperseded {
+                                Text("已由端上内核接管")
+                                    .font(TVBoxTheme.mono(9, weight: .bold))
+                                    .foregroundStyle(TVBoxTheme.warn)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(TVBoxTheme.warn.opacity(0.6), lineWidth: 1)
+                                    )
                             }
 
                             Spacer(minLength: 0)

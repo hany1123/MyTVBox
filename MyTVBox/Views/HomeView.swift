@@ -207,17 +207,32 @@ struct HomeView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "antenna.radiowaves.left.and.right.slash")
+        // 1.7.3：分两种情况说清楚。端上内核还在起的时候，界面不能只说「暂无内容」——
+        // 那会让人以为源坏了，实际是 6.6 MB bundle 在解释执行。
+        let nodeReady = NodeRuntime.shared.isReady
+        return VStack(spacing: 12) {
+            Image(systemName: nodeReady
+                  ? "antenna.radiowaves.left.and.right.slash"
+                  : "bolt.horizontal.circle")
                 .font(.system(size: 36, weight: .light))
                 .foregroundStyle(TVBoxTheme.textMuted)
-            Text("NO CONTENT")
+            Text(nodeReady ? "NO CONTENT" : "Booting kernel")
                 .font(TVBoxTheme.mono(11, weight: .heavy))
                 .tracking(3)
                 .foregroundStyle(TVBoxTheme.textSecondary)
-            Text("当前站点暂无内容")
+            Text(nodeReady
+                 ? "当前站点暂无内容"
+                 : "端上内核正在启动（首次约 10~60 秒）")
                 .font(TVBoxTheme.text(13))
                 .foregroundStyle(TVBoxTheme.textMuted)
+            if !nodeReady {
+                Text("首次要解释执行 6.6 MB 源码，慢是正常的。若一直停在这里，去「设置」里的站点诊断，把输出发我。")
+                    .font(TVBoxTheme.mono(10))
+                    .foregroundStyle(TVBoxTheme.textMuted)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3)
+                    .padding(.horizontal, 32)
+            }
         }
         .frame(maxWidth: .infinity)
     }

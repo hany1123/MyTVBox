@@ -155,5 +155,11 @@ struct MyTVBoxApp: App {
             appState.installLocalNodeSource(base: NodeRuntime.shared.baseURL)
         }
         NSLog("[App] 端上 Node 就绪: %@", NodeRuntime.shared.baseURL)
+
+        // 1.7.3：这一步之前是漏的，也是「站点全空」的真因。
+        // ContentView 的 .task 在 App 一启动就 loadConfig 了，那时 Node 还没起来，
+        // 只能拿老订阅（JS bundle 型 → catpaw_* 站点）解析出一堆跑不了的站点；
+        // Node 就绪装上本机源后如果不再重载，界面就永远停在旧结果上。
+        await appState.loadConfig()
     }
 }

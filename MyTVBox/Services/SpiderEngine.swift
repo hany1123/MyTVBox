@@ -514,6 +514,38 @@ final class SpiderEngine {
         let appVer = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let buildVer = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         out.append("=== MyTVBox " + appVer + " (build " + buildVer + ") Spider 诊断 ===")
+
+        // 1.7.3：先报端上 Node 状态。上一轮最大的问题就是「诊断里看不出 Node 到底起没起来」，
+        // 只能靠站点 key 前缀（catpaw_ = JSC 路线，noderelay_ = Node 路线）反推。
+        let rt = NodeRuntime.shared
+        out.append("")
+        out.append("--- 端上 Node 运行时 ---")
+        out.append("node ready    : \(rt.isReady ? "YES" : "NO")")
+        out.append("node baseURL  : \(rt.baseURL)")
+        out.append("relay baseURL : " + (NodeRelayService.shared.baseURL ?? "nil"))
+        let logTail = rt.tailLog(lines: 12)
+        out.append("node.log 尾部 :")
+        for line in logTail.split(separator: "\n", omittingEmptySubsequences: false) {
+            out.append("  " + line)
+        }
+        out.append("")
+        out.append("--- 站点路由 ---")
+        if let site {
+            let isNode = NodeRelayService.isNodeSite(site)
+            let isSpider = SpiderEngine.isSpiderSite(site)
+            let hasModule = SpiderContextManager.shared.moduleCode(for: site.key) != nil
+            out.append("isNodeSite    : \(isNode)")
+            if site.key.hasPrefix("catpaw_") {
+                out.append("  !! key 前缀 catpaw_ = 旧 JSC 路线，端上必然跑不起来；")
+                out.append("     正常应该是 noderelay_*（来自端上 Node 的 /config）")
+            }
+            out.append("isSpiderSite  : \(isSpider)")
+            out.append("有 moduleCode : \(hasModule)")
+        } else {
+            out.append("（未选中站点）")
+        }
+        out.append("")
+
         out.append("site.name     : \(site?.name ?? "nil")")
         out.append("site.key      : \(site?.key ?? "nil")")
         out.append("site.spiderKey: \(site?.spiderKey ?? "nil")")
@@ -526,8 +558,13 @@ final class SpiderEngine {
         guard let site,
               let code = SpiderContextManager.shared.moduleCode(for: site.key) else {
             out.append("")
-            out.append("!! 该站点没有注册 bundle（moduleCode）。")
-            out.append("若上面的 keys 里有相近 key，说明合并池改名后没同步。")
+            if let site, NodeRelayService.isNodeSite(site) {
+                out.append("该站点走端上 Node（POST \(NodeRelayService.shared.baseURL ?? "")/spider/…），")
+                out.append("不需要也不会注册 bundle —— 后面的 JSC 注入诊断对它没有意义。")
+            } else {
+                out.append("!! 该站点没有注册 bundle（moduleCode）。")
+                out.append("若上面的 keys 里有相近 key，说明合并池改名后没同步。")
+            }
             return out.joined(separator: "\n")
         }
 
