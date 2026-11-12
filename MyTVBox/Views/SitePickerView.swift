@@ -13,6 +13,10 @@ struct SitePickerView: View {
     @State private var showDiagnose = false
     @State private var diagnoseText = ""
     @State private var isDiagnosing = false
+    // 1.5.9：把 App 已经下载好的 6.6MB bundle 原文导出（系统分享面板）
+    @State private var showBundleShare = false
+    @State private var bundleShareURL: URL?
+    @State private var bundleExportHint = ""
 
     private var availableSites: [Site] {
         (appState.currentConfig?.sites ?? []).filter {
@@ -84,6 +88,28 @@ struct SitePickerView: View {
                             .foregroundStyle(TVBoxTheme.textPrimary)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Divider().padding(.vertical, 8)
+                        Text("拿不到诊断报告之外的 bundle 原文？直接导出：")
+                            .font(TVBoxTheme.text(12))
+                            .foregroundStyle(TVBoxTheme.textPrimary)
+                        Button {
+                            exportBundle()
+                        } label: {
+                            Label("导出 BUNDLE 原文（约 6 MB）", systemImage: "square.and.arrow.up")
+                                .font(TVBoxTheme.text(13, weight: .semibold))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(TVBoxTheme.accent)
+                        if !bundleExportHint.isEmpty {
+                            Text(bundleExportHint)
+                                .font(TVBoxTheme.mono(10))
+                                .foregroundStyle(TVBoxTheme.textPrimary)
+                                .textSelection(.enabled)
+                        }
+                        Text("选择「存储到文件」或发给自己，再把文件放到电脑桌面给我。")
+                            .font(TVBoxTheme.mono(10))
+                            .foregroundStyle(TVBoxTheme.textPrimary)
                     }
                     .padding(14)
                 }
@@ -106,6 +132,12 @@ struct SitePickerView: View {
                 }
             }
             .preferredColorScheme(.dark)
+            .sheet(isPresented: $showBundleShare) {
+                if let url = bundleShareURL {
+                    ActivityView(url: url)
+                        .preferredColorScheme(.dark)
+                }
+            }
         }
         .task {
             // 打开选择器时后台预热各站点首页，选定后立刻有画面
@@ -128,6 +160,27 @@ struct SitePickerView: View {
                 self.isDiagnosing = false
                 self.showDiagnose = true
             }
+        }
+    }
+
+    /// 1.5.9：App 里已经握着完整 bundle 原文，直接写临时文件走系统分享，
+    /// 省得老大去源站手动下载（Basic Auth / 302 / 混淆文件名都容易踩坑）。
+    private func exportBundle() {
+        guard let site = appState.currentSite,
+              let code = SpiderContextManager.shared.moduleCode(for: site.key) else {
+            bundleExportHint = "当前站点没有 bundle：先切到猫爪 T3 站点再试"
+            return
+        }
+        let hash = SpiderContextManager.shared.sourceHash(for: site.key) ?? "unknown"
+        let fileName = "catpaw_" + hash + ".js"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        do {
+            try code.write(to: url, atomically: true, encoding: .utf8)
+            bundleShareURL = url
+            bundleExportHint = "已就绪：\(fileName)，\(code.utf8.count) 字节 / MD5 \(hash)"
+            showBundleShare = true
+        } catch {
+            bundleExportHint = "写文件失败：\(error.localizedDescription)"
         }
     }
 
@@ -273,4 +326,17 @@ struct SitePickerView: View {
                 .stroke(TVBoxTheme.stroke, lineWidth: 1)
         )
     }
+}
+
+
+// MARK: - 1.5.9 系统分享（导出 bundle 原文）
+
+struct ActivityView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }

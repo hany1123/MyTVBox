@@ -127,6 +127,8 @@ final class CatPawConfigBuilder {
                let code = String(data: data, encoding: .utf8),
                !code.contains("<html>") {
                 print("[CatPawConfigBuilder] constructed 成功 (\(code.count) bytes)")
+                // 1.5.9：index.js.md5 的 hash 就是这份 bundle 的源指纹
+                SpiderContextManager.shared.setCurrentSourceHash(md5)
                 return code
             }
         }

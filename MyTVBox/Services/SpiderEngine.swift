@@ -71,7 +71,33 @@ final class SpiderEngine {
         // 6.6MB 的 esbuild bundle 只要有一处，整份脚本在**解析阶段**就被拒，
         // 一行都不会执行（真机诊断：SyntaxError: Invalid regular expression:
         // invalid group specifier name，注册表全空、TARGET NOT FOUND）。
-        let (patched, fixes) = Self.downgradeForJSC(jsCode)
+        // 1.5.9：用 .js.md5 的 hash 作源指纹，缓存「语法降级 + factory map」。
+        // 这两步每次都要扫 6.6MB，同一份 bundle 只要做一次。
+        let cacheKey = SpiderContextManager.shared.cacheKey(
+            forSpiderKey: spiderKey, codeLength: jsCode.utf8.count)
+        let patched: String
+        let fixes: Int
+        if let hit = SpiderContextManager.shared.preprocessedCode(for: cacheKey) {
+            patched = hit
+            fixes = 0
+        } else {
+            let p = Self.downgradeForJSC(jsCode)
+            patched = p.0
+            fixes = p.1
+            SpiderContextManager.shared.setPreprocessedCode(p.0, for: cacheKey)
+        }
+        // 1.5.9：源站每次重新混淆，按结构抠出 meta.key → 工厂函数名，
+        // 让 router 能精确实例化目标 spider，不再只靠碰运气的模块表扫描。
+        var factoryDict: [String: String] = [:]
+        if let hit = SpiderContextManager.shared.cachedFactoryMap(for: cacheKey) {
+            factoryDict = hit
+        } else {
+            for f in extractFactoryMap(from: jsCode) where !f.fn.isEmpty {
+                factoryDict[f.key] = f.fn
+            }
+            SpiderContextManager.shared.setCachedFactoryMap(factoryDict, for: cacheKey)
+        }
+        context.setObject(factoryDict, forKeyedSubscript: "__MTV_FACTORY_MAP__" as NSString)
         // webpack 打包脚本常在缺模块时抛异常，但已经把部分 spider
         // 注册到全局了 —— 不能一遇异常就整轮放弃，清掉异常继续尝试路由。
         context.evaluateScript(patched)
@@ -134,10 +160,12 @@ final class SpiderEngine {
                 if (__mtv_mod_cache__) return __mtv_mod_cache__;
                 var out = [], seen = [], mk = [];
                 try { mk = Object.keys(G); } catch (e) { __mtv_mod_cache__ = out; return out; }
-                var deadline = Date.now() + 6000;
-                for (var i = 0; i < mk.length && i < 500 && out.length < 80 && Date.now() < deadline; i++) {
+                var skip = G.__MTV_SKIP__ || [];
+                var deadline = Date.now() + 8000;
+                for (var i = 0; i < mk.length && i < 700 && out.length < 120 && Date.now() < deadline; i++) {
                     var mn = mk[i];
-                    if (!/^[A-Za-z_$][A-Za-z0-9_$]{0,6}$/.test(mn)) continue;
+                    if (!/^[A-Za-z_$][A-Za-z0-9_$]{0,8}$/.test(mn)) continue;
+                    if (skip.indexOf(mn) >= 0) continue;
                     var mf = null;
                     try { mf = G[mn]; } catch (e) { continue; }
                     if (typeof mf !== 'function' || mf === __mtv_stub__) continue;
@@ -166,6 +194,17 @@ final class SpiderEngine {
                 return out;
             }
             function pickSpider() {
+                // 1.5.9：源码静态抠出的 meta.key → 工厂名，抗混淆，优先级最高。
+                // 真机报告里 push 的工厂 Fx0 没被模块表探测到，但源码里明明白白。
+                var fmap = G.__MTV_FACTORY_MAP__ || {};
+                if (key && fmap[key]) {
+                    var ff = null;
+                    try { ff = G[fmap[key]]; } catch (e) {}
+                    if (typeof ff === 'function') {
+                        var builtFactory = materialize(ff);
+                        if (metaKey(builtFactory) === key) return builtFactory;
+                    }
+                }
                 // 1.5.4：多 spider bundle 会把各模块挂到注册表里，按 key 精确取
                 var regs = ['__JS_SPIDER__', '__SPIDERS__', 'spiders', '__spiders__',
                             'modules', '__MODULES__', 'spiderMap', 'SPIDERS',
@@ -386,6 +425,61 @@ final class SpiderEngine {
         }
     }
 
+    /// 1.5.9：从混淆过的 bundle 源码里静态抠出 `meta:{key:"K"` 对应的工厂函数名。
+    /// 真机两轮报告 bundle 分别是 6627774 / 6629280 字节，变量名全变（Wx0→Fx0），
+    /// 说明源站每次请求都重新混淆 —— 只能按结构提取，绝不能硬编码变量名。
+    /// 纯字符串扫描，不用 NSRegularExpression，避免 Swift 转义地狱与大串正则开销。
+    private func extractFactoryMap(from code: String, limit: Int = 90) -> [(key: String, fn: String)] {
+        var out: [(String, String)] = []
+        var seen = Set<String>()
+        var cursor = code.startIndex
+        let marker = "meta:{key:"
+        while out.count < limit, cursor < code.endIndex,
+              let r = code.range(of: marker, options: .literal,
+                                 range: cursor..<code.endIndex) {
+            var key = ""
+            var q = r.upperBound
+            if q < code.endIndex, code[q] == "\"" || code[q] == "'" {
+                let quote = code[q]
+                q = code.index(after: q)
+                let s = q
+                while q < code.endIndex, code[q] != quote { q = code.index(after: q) }
+                if q < code.endIndex, s < q { key = String(code[s..<q]) }
+            }
+            // 往前 500 字符内找最近的 `function NAME(`
+            let back = code.index(r.lowerBound, offsetBy: -500,
+                                  limitedBy: code.startIndex) ?? code.startIndex
+            let prefix = String(code[back..<r.lowerBound])
+            var fn = ""
+            if let fr = prefix.range(of: "function ", options: [.literal, .backwards]) {
+                var p = fr.upperBound
+                let s = p
+                while p < prefix.endIndex {
+                    let c = prefix[p]
+                    if c.isLetter || c.isNumber || c == "_" || c == "$" {
+                        p = prefix.index(after: p)
+                    } else { break }
+                }
+                if p > s {
+                    var after = p
+                    while after < prefix.endIndex, prefix[after] == " " {
+                        after = prefix.index(after: after)
+                    }
+                    if after < prefix.endIndex, prefix[after] == "(" {
+                        fn = String(prefix[s..<p])
+                    }
+                }
+            }
+            if !key.isEmpty, !seen.contains(key) {
+                seen.insert(key)
+                out.append((key, fn))
+            }
+            cursor = code.index(r.upperBound, offsetBy: 1,
+                                limitedBy: code.endIndex) ?? code.endIndex
+        }
+        return out
+    }
+
     /// 轻量 URL 扫描（不在 6.6MB 上跑正则，避免卡住诊断线程）
     private func extractURLs(from code: String, limit: Int) -> [String] {
         var out: [String] = []
@@ -417,7 +511,9 @@ final class SpiderEngine {
     /// 不依赖网络抓包，也不需要 Xcode 控制台。
     func diagnoseSync(site: Site?) -> String {
         var out: [String] = []
-        out.append("=== MyTVBox 1.5.7 Spider 诊断 ===")
+        let appVer = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let buildVer = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        out.append("=== MyTVBox " + appVer + " (build " + buildVer + ") Spider 诊断 ===")
         out.append("site.name     : \(site?.name ?? "nil")")
         out.append("site.key      : \(site?.key ?? "nil")")
         out.append("site.spiderKey: \(site?.spiderKey ?? "nil")")
@@ -436,6 +532,8 @@ final class SpiderEngine {
         }
 
         out.append("bundle 字节数    : \(code.utf8.count)")
+        out.append("bundle MD5      : " + (SpiderContextManager.shared.sourceHash(for: site.key) ?? "未知（本轮未走 .js.md5 索引）"))
+        out.append("预处理缓存键    : " + SpiderContextManager.shared.cacheKey(forSpiderKey: site.spiderKey, codeLength: code.utf8.count))
         out.append("")
         out.append("--- bundle HEAD (1200) ---")
         out.append(String(code.prefix(1200)))
@@ -460,6 +558,12 @@ final class SpiderEngine {
                                 "detailContent", "playerContent", "module.exports",
                                 "__JS_SPIDER__"],
                       perNeedle: 3, width: 200, into: &out)
+        // 1.5.9：源站每次重新混淆，按结构把 meta.key → 工厂名抠出来，
+        // 下一轮报告能直接对照「目标 key 的工厂在不在全局」。
+        let factories = extractFactoryMap(from: code)
+        out.append("")
+        out.append("--- FACTORY MAP（源码 meta.key → 工厂函数名）---")
+        out.append("共 " + String(factories.count) + " 个：" + factories.prefix(90).map { $0.key + ":" + ($0.fn.isEmpty ? "?" : $0.fn) }.joined(separator: ", "))
         let urls = extractURLs(from: code, limit: 80)
         out.append("")
         out.append("--- URL 样本 (\(urls.count)) ---")
@@ -486,6 +590,11 @@ final class SpiderEngine {
         out.append("--- 语法降级后注入（实际生效路径）---")
         out.append("lookbehind 降级处数: \(fixes)")
         let context = createContext()
+        let factoryNames = factories.map { $0.fn }.filter { !$0.isEmpty }
+        context.setObject(factoryNames, forKeyedSubscript: "__MTV_FACTORY_NAMES__" as NSString)
+        var factoryDict: [String: String] = [:]
+        for f in factories where !f.fn.isEmpty { factoryDict[f.key] = f.fn }
+        context.setObject(factoryDict, forKeyedSubscript: "__MTV_FACTORY_MAP__" as NSString)
         context.evaluateScript(patched)
         if let e = context.exception, !e.isUndefined {
             out.append("!! 降级后仍有异常: \(e.toString() ?? "unknown")")
@@ -581,10 +690,12 @@ final class SpiderEngine {
             var probed = [];
             try {
                 var mk = Object.keys(G);
+                var __pskip__ = G.__MTV_SKIP__ || [];
                 var __probe_deadline__ = Date.now() + 8000;
-                for (var mi = 0; mi < mk.length && mi < 400 && probed.length < 12 && Date.now() < __probe_deadline__; mi++) {
+                for (var mi = 0; mi < mk.length && mi < 700 && probed.length < 40 && Date.now() < __probe_deadline__; mi++) {
                     var mn = mk[mi];
-                    if (!/^[A-Za-z_$][A-Za-z0-9_$]{0,5}$/.test(mn)) continue;
+                    if (!/^[A-Za-z_$][A-Za-z0-9_$]{0,8}$/.test(mn)) continue;
+                    if (__pskip__.indexOf(mn) >= 0) continue;
                     var mf = G[mn];
                     if (typeof mf !== 'function' || mf === __mtv_stub__) continue;
                     try {
@@ -614,10 +725,12 @@ final class SpiderEngine {
             var __route_keys__ = [], __route_hit__ = null;
             try {
                 var rk = Object.keys(G);
-                var __r_deadline__ = Date.now() + 5000;
-                for (var ri = 0; ri < rk.length && ri < 500 && Date.now() < __r_deadline__; ri++) {
+                var __rskip__ = G.__MTV_SKIP__ || [];
+                var __r_deadline__ = Date.now() + 8000;
+                for (var ri = 0; ri < rk.length && ri < 700 && Date.now() < __r_deadline__; ri++) {
                     var rn = rk[ri];
-                    if (!/^[A-Za-z_$][A-Za-z0-9_$]{0,6}$/.test(rn)) continue;
+                    if (!/^[A-Za-z_$][A-Za-z0-9_$]{0,8}$/.test(rn)) continue;
+                    if (__rskip__.indexOf(rn) >= 0) continue;
                     var rf = null;
                     try { rf = G[rn]; } catch (e) { continue; }
                     if (typeof rf !== 'function' || rf === __mtv_stub__) continue;
@@ -641,7 +754,15 @@ final class SpiderEngine {
                     } catch (e) {}
                 }
             } catch (e) { lines.push('META ROUTE err: ' + e); }
-            lines.push('META ROUTE keys (' + __route_keys__.length + '): [' + __route_keys__.slice(0, 60).join(',') + ']');
+            var __fn_names__ = G.__MTV_FACTORY_NAMES__ || [];
+            var __fn_live__ = [];
+            for (var fi = 0; fi < __fn_names__.length && fi < 90; fi++) {
+                var fnm = __fn_names__[fi];
+                if (!fnm) continue;
+                __fn_live__.push(fnm + ':' + (typeof G[fnm]));
+            }
+            lines.push('FACTORY GLOBAL (' + __fn_live__.length + '): [' + __fn_live__.join(',') + ']');
+            lines.push('META ROUTE keys (' + __route_keys__.length + '): [' + __route_keys__.slice(0, 120).join(',') + ']');
             lines.push('META ROUTE hit for key=' + key + ': ' + (__route_hit__ ? 'YES' : 'NO'));
             if (__route_hit__) hit = __route_hit__;
             lines.push('TARGET: ' + (hit ? ('keys=[' + keys(hit).join(',') + '] fns=[' + fns(hit).join(',') + ']') : 'NOT FOUND'));
@@ -650,7 +771,10 @@ final class SpiderEngine {
                 if (typeof f === 'function') {
                     try {
                         var v = f.call(hit, { body: {}, extend: {} });
-                        if (v && typeof v.then === 'function') lines.push('HOME_RESULT: Promise');
+                        if (v && typeof v.then === 'function') {
+                            G.__mtv_home_promise__ = v;
+                            lines.push('HOME_RESULT: Promise (落地结果见下方)');
+                        }
                         else lines.push('HOME_RESULT: ' + String(JSON.stringify(v)).slice(0, 500));
                     } catch (e) { lines.push('HOME_RESULT ERROR: ' + e); }
                 } else {
@@ -667,6 +791,13 @@ final class SpiderEngine {
         if let e = context.exception, !e.isUndefined {
             out.append("!! probe 异常: \(e.toString() ?? "unknown")")
             context.exception = nil
+        }
+
+        // 1.5.9：把 home() 的 Promise 真正落地，报告里能看到分类/列表原文
+        if let p = context.objectForKeyedSubscript("__mtv_home_promise__"), !p.isUndefined {
+            _ = resolvePromiseLike(p, context: context)
+            let text = context.evaluateScript("(function(){ try { var s = JSON.stringify(__mtv_value__); return String(s === undefined ? __mtv_value__ : s).slice(0, 900); } catch(e) { return '落地失败: ' + e; } })()")?.toString() ?? "nil"
+            out.append("HOME_RESULT 落地: " + text)
         }
 
         let logs = context.objectForKeyedSubscript("__mtv_logs__")?.toArray() ?? []
@@ -963,7 +1094,43 @@ final class SpiderEngine {
             "};",
             "var setTimeout = function(fn){ try { if (typeof fn === 'function') fn(); } catch(e){} return 0; };",
             "var clearTimeout = function(){}; var setInterval = function(){ return 0; }; var clearInterval = function(){};",
-            "var Buffer = { from: function(s){ return { toString: function(enc){ return enc === 'base64' ? nativeBase64(String(s), false) : String(s); } }; }, alloc: function(n){ return new Array(n||0).fill(0); }, concat: function(a){ return [].concat.apply([], a || []); }, isBuffer: function(){ return false; }, byteLength: function(s){ return String(s).length; } };",
+            "var __mtv_bytes__ = function(n, src) {",
+            "  var a = new Uint8Array(Math.max(0, Number(n) || 0));",
+            "  if (typeof src === 'string') { for (var si = 0; si < a.length && si < src.length; si++) a[si] = src.charCodeAt(si) & 255; }",
+            "  a.write = function(s, off, len) { try { var t = String(s), k = Number(off) || 0, m = Math.min(len || t.length, a.length - k); for (var wi = 0; wi < m; wi++) a[k+wi] = t.charCodeAt(wi) & 255; return m; } catch(e) { return 0; } };",
+            "  a.toString = function(enc) { try { if (enc === 'base64') return nativeBase64(String.fromCharCode.apply(null, Array.prototype.slice.call(a, 0, 256)), false); if (enc === 'hex') { var hh=''; for (var hi=0; hi<a.length && hi<512; hi++) hh += ('0'+a[hi].toString(16)).slice(-2); return hh; } return String.fromCharCode.apply(null, Array.prototype.slice.call(a, 0, 4096)); } catch(e) { return ''; } };",
+            "  a.equals = function(b) { return String(a) === String(b); };",
+            "  a.copy = function(t) { try { t.set(a.subarray(0, Math.min(t.length, a.length))); } catch(e) {} return a.length; };",
+            "  a.readUInt8 = function(o) { return a[Number(o)||0] || 0; };",
+            "  a.writeUInt8 = function(v, o) { var k=Number(o)||0; a[k]=Number(v)&255; return k+1; };",
+            "  a.readUInt16LE = function(o) { var k=Number(o)||0; return (a[k]||0) | ((a[k+1]||0)<<8); };",
+            "  a.writeUInt16LE = function(v, o) { var k=Number(o)||0; a[k]=v&255; a[k+1]=(v>>8)&255; return k+2; };",
+            "  a.readUInt32LE = function(o) { var k=Number(o)||0; return ((a[k]||0)|((a[k+1]||0)<<8)|((a[k+2]||0)<<16)|((a[k+3]||0)<<24))>>>0; };",
+            "  a.writeUInt32LE = function(v, o) { var k=Number(o)||0; for(var qi=0; qi<4; qi++) a[k+qi]=(v>>>(qi*8))&255; return k+4; };",
+            "  a.toJSON = function(){ return { type: 'Buffer', data: Array.prototype.slice.call(a, 0, 512) }; };",
+            "  return a;",
+            "};",
+            "var __mtv_buf_base__ = function(n, src){ return __mtv_bytes__(n, src); };",
+            "__mtv_buf_base__.from = function(s, enc){ try { if (enc === 'base64') { var d = nativeBase64(String(s), true); return __mtv_bytes__(d.length, d); } if (s && s.length !== undefined && typeof s !== 'string') return __mtv_bytes__(s.length); return __mtv_bytes__(String(s).length, String(s)); } catch(e) { return __mtv_bytes__(0); } };",
+            "__mtv_buf_base__.alloc = function(n){ return __mtv_bytes__(n); };",
+            "__mtv_buf_base__.allocUnsafe = function(n){ return __mtv_bytes__(n); };",
+            "__mtv_buf_base__.allocUnsafeSlow = function(n){ return __mtv_bytes__(n); };",
+            "__mtv_buf_base__.concat = function(list){ try { var parts=(list||[]).map(function(x){ return (x && x.length !== undefined) ? Array.prototype.slice.call(x, 0, x.length) : []; }); var flat=[].concat.apply([], parts); var o=__mtv_bytes__(flat.length); for(var ci=0; ci<flat.length; ci++) o[ci]=flat[ci]&255; return o; } catch(e) { return __mtv_bytes__(0); } };",
+            "__mtv_buf_base__.isBuffer = function(x){ return !!(x && x instanceof Uint8Array); };",
+            "__mtv_buf_base__.byteLength = function(s){ try { return String(s).length; } catch(e) { return 0; } };",
+            "__mtv_buf_base__.compare = function(){ return 0; };",
+            "__mtv_buf_base__.poolSize = 8192;",
+            "var Buffer = new Proxy(__mtv_buf_base__, {",
+            "  get: function(t, k) {",
+            "    if (k in t) return t[k];",
+            "    if (k === Symbol.toPrimitive) return function(){ return ''; };",
+            "    if (k === 'then' || k === 'toJSON') return undefined;",
+            "    return function(){ return __mtv_bytes__(0); };",
+            "  },",
+            "  apply: function(t, thiz, a){ return __mtv_bytes__(Number(a[0])||0, typeof a[0]==='string' ? a[0] : undefined); },",
+            "  construct: function(t, a){ return __mtv_bytes__(Number(a[0])||0, typeof a[0]==='string' ? a[0] : undefined); },",
+            "  has: function(){ return true; }",
+            "});",
             "var btoa = function(s){ return nativeBase64(String(s), false); };",
             "var atob = function(s){ return nativeBase64(String(s), true); };",
             "function fetch(url, opts) {",
@@ -994,6 +1161,14 @@ final class SpiderEngine {
             "var navigator = { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X) AppleWebKit/605.1.15', platform: 'iPhone', language: 'zh-CN', appVersion: '16.3' };",
             "var location = { href: '', protocol: 'https:', host: '', hostname: '', pathname: '/', search: '' };",
             "var screen = { width: 1170, height: 2532 };",
+            "var setImmediate = function(f){ try { if (typeof f === 'function') f(); } catch(e){} return 0; };",
+            "var clearImmediate = function(){};",
+            "var queueMicrotask = function(f){ try { if (typeof f === 'function') f(); } catch(e){} };",
+            "var structuredClone = function(x){ try { return JSON.parse(JSON.stringify(x)); } catch(e) { return x; } };",
+            "var performance = { now: function(){ return Date.now(); }, timeOrigin: Date.now() };",
+            "if (typeof URL === 'undefined') { var URL = function(u){ this.href=String(u||''); this.search=''; this.searchParams={ get:function(){ return null; }, set:function(){} }; }; }",
+            "if (typeof URLSearchParams === 'undefined') { var URLSearchParams = function(s){ this._s=String(s||''); }; URLSearchParams.prototype.get=function(){ return null; }; URLSearchParams.prototype.set=function(){}; URLSearchParams.prototype.toString=function(){ return this._s; }; }",
+            "var __MTV_SKIP__ = ['nativeReq','nativeBase64','nativeMd5','nativeAesDecrypt','fetch','require','setTimeout','setInterval','clearTimeout','setImmediate','clearImmediate','queueMicrotask','print','btoa','atob','structuredClone','Buffer','URL','URLSearchParams','TextEncoder','TextDecoder','__mtv_stub__','__mtv_EE__','__mtv_ALS__','__mtv_log__','__mtv_bytes__','__mtv_buf_base__'];",
             "var TextEncoder = function(){}; TextEncoder.prototype.encode = function(s){ try { return Array.from(unescape(encodeURIComponent(String(s))), function(c){ return c.charCodeAt(0); }); } catch(e) { return []; } };",
             "var TextDecoder = function(){}; TextDecoder.prototype.decode = function(a){ try { return decodeURIComponent(escape(String.fromCharCode.apply(null, a))); } catch(e) { return ''; } };",
         ]
@@ -1257,6 +1432,11 @@ final class SpiderContextManager {
     static let shared = SpiderContextManager()
     private var contexts: [String: JSContext] = [:]
     private var moduleCodes: [String: String] = [:]
+    // 1.5.9：.js.md5 的 hash 是源指纹；同一份 bundle 的预处理结果全局复用
+    private var currentSourceHash: String?
+    private var hashByKey: [String: String] = [:]
+    private var preprocessed: [String: String] = [:]
+    private var factoryMaps: [String: [String: String]] = [:]
     // 多订阅并发加载 + 后台诊断会同时读写字典，之前是无锁的
     private let lock = NSLock()
     private init() {}
@@ -1274,6 +1454,46 @@ final class SpiderContextManager {
     func registerModuleCode(key: String, code: String) {
         lock.lock(); defer { lock.unlock() }
         moduleCodes[key] = code
+        if let h = currentSourceHash { hashByKey[key] = h }
+    }
+
+    // MARK: - 1.5.9 源指纹 / 预处理缓存
+
+    func setCurrentSourceHash(_ hash: String) {
+        lock.lock(); defer { lock.unlock() }
+        currentSourceHash = hash
+    }
+
+    func sourceHash(for key: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return hashByKey[key]
+    }
+
+    /// 注意：不能在这里调用同样加锁的 sourceHash(for:)，NSLock 非递归会死锁。
+    func cacheKey(forSpiderKey spiderKey: String?, codeLength: Int) -> String {
+        lock.lock(); defer { lock.unlock() }
+        if let sk = spiderKey, let h = hashByKey["catpaw_" + sk] { return h }
+        return "len_" + String(codeLength)
+    }
+
+    func preprocessedCode(for key: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return preprocessed[key]
+    }
+
+    func setPreprocessedCode(_ code: String, for key: String) {
+        lock.lock(); defer { lock.unlock() }
+        preprocessed[key] = code
+    }
+
+    func cachedFactoryMap(for key: String) -> [String: String]? {
+        lock.lock(); defer { lock.unlock() }
+        return factoryMaps[key]
+    }
+
+    func setCachedFactoryMap(_ map: [String: String], for key: String) {
+        lock.lock(); defer { lock.unlock() }
+        factoryMaps[key] = map
     }
 
     func moduleCode(for key: String) -> String? {
@@ -1290,5 +1510,6 @@ final class SpiderContextManager {
         lock.lock(); defer { lock.unlock() }
         contexts.removeValue(forKey: key)
         moduleCodes.removeValue(forKey: key)
+        hashByKey.removeValue(forKey: key)
     }
 }
