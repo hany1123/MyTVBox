@@ -662,12 +662,25 @@ struct VideoDetailView: View {
         // 一进详情 1 毫秒就出现「无线路」，看起来像瞬间失败 —— 其实接管还在跑。
         // 现在挪到接管之后，并把本站失败原因一起记下。
         if Task.isCancelled { return }
-        AppHeartbeat.shared.mark("事件 本站 detail 未拿到线路 → 跨站接管")
-        if await adoptDetailFromOtherSites(title: title) { return }
+        // 1.8.15 稳定模式：不再静默跑「两轮 16/60 站」的跨站接管。
+        // 1.8.14 诊断里这类接管正是播放开始后还在回 /detail 的来源。
+        if StableMode.shared.allowDetailAdoption {
+            AppHeartbeat.shared.mark("事件 本站 detail 未拿到线路 → 跨站接管")
+            if await adoptDetailFromOtherSites(title: title) { return }
+        } else {
+            SessionTrace.mark("略 详情 稳定模式：不做自动跨站接管")
+            AppHeartbeat.shared.mark("事件 稳定模式 跳过跨站接管")
+        }
         SessionTrace.mark("完 详情 \(title.isEmpty ? vodId : title) 无线路（\(failReason)）")
 
         if title.isEmpty {
             errorMessage = "没拿到这个条目的详情（id=\(vodId)），也没有片名可以拿去其它站搜。"
+        } else if StableMode.shared.enabled {
+            errorMessage = """
+            稳定模式已关闭自动找源：本片在当前站点没有可播线路。
+            请点「去搜索」，手动搜索「\(title)」并挑一个站点进入。
+            （要恢复自动全网找源，去「设置 → 稳定性」关掉稳定模式）
+            """
         } else if isRecommendWallItem {
             errorMessage = """
             「\(site.name)」只做推荐，条目本身不带片源，需要按片名到其它站找。
@@ -688,8 +701,14 @@ struct VideoDetailView: View {
         // 1.7.1：配置中心类站点的正文里带 http://<ip>:<port>/website，
         // 识别出来并把局域网 IP 换成端上 Node 的 127.0.0.1。
         self.configCenterURL = ConfigCenterURL.extract(from: d.vodContent ?? "")
-        // 后台加载其它站点的同片线路（不阻塞详情展示）
-        Task { await loadCrossSiteLines(title: d.vodName) }
+        // 1.8.15 稳定模式：不再在详情展示后悄悄再拉一轮跨站线路。
+        // 这轮会在用户点播放时仍在飞，1.8.14 诊断里正是它让 /detail 回包
+        // 一直持续到播放期。
+        if StableMode.shared.allowCrossSiteLines {
+            Task { await loadCrossSiteLines(title: d.vodName) }
+        } else {
+            SessionTrace.mark("略 详情 稳定模式：不后台拉跨站线路")
+        }
     }
 
     /// 并发试若干候选站点，谁先拿到可播线路就用谁。

@@ -66,6 +66,8 @@ final class NetworkManager {
 
     /// 本机源请求：放宽超时，不走重定向/Auth 那套
     func localData(from urlString: String) async throws -> Data {
+        PlaybackGate.shared.beginRequest()
+        defer { PlaybackGate.shared.endRequest() }
         guard let url = URLNormalizer.url(urlString) else { throw NetworkError.invalidURL }
         var request = URLRequest(url: url)
         request.setValue("application/json,text/plain,*/*", forHTTPHeaderField: "Accept")
@@ -76,6 +78,8 @@ final class NetworkManager {
 
     /// 发起请求并返回原始 Data
     func data(from urlString: String, timeout: TimeInterval? = nil) async throws -> Data {
+        PlaybackGate.shared.beginRequest()
+        defer { PlaybackGate.shared.endRequest() }
         guard let url = URLNormalizer.url(urlString) else { throw NetworkError.invalidURL }
         let request = makeRequest(url: url, timeout: timeout)
         let (data, response) = try await session.data(for: request)

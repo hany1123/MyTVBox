@@ -179,7 +179,10 @@ enum CrossSiteResolver {
         if skipped > 0 {
             SessionTrace.mark("记 搜索 \(keyword) 跳过冷却 \(skipped) 站")
         }
-        let targets = Array(pool.prefix(max(1, maxSites)))
+        // 1.8.15：底层统一收口。搜索页 / 详情接管 / 站点级换源三个调用点
+        // 都会经过这里，稳定模式下无论调用方写 16 还是 60，都按 8 站封顶。
+        let cap = min(maxSites, StableMode.shared.maxSites)
+        let targets = Array(pool.prefix(max(1, cap)))
         guard !targets.isEmpty else { return [] }
 
         let t0 = Date()
@@ -207,7 +210,7 @@ enum CrossSiteResolver {
         let kw = keyword
         let per = max(1, limitPerSite)
         let indexed = Array(targets.enumerated())
-        let width = max(1, min(concurrency, indexed.count))
+        let width = max(1, min(concurrency, StableMode.shared.searchConcurrency, indexed.count))
 
         // 1.8.4：滑动窗口取代「固定 12 个一批」。
         // 旧写法 `for await batch in group` 要等整批都回来才开下一批，一批里只要

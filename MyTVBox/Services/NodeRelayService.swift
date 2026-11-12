@@ -281,6 +281,8 @@ final class NodeRelayService {
     // MARK: - HTTP
 
     private func getJSON(_ urlString: String, timeout: TimeInterval) async throws -> [String: Any] {
+        PlaybackGate.shared.beginRequest()
+        defer { PlaybackGate.shared.endRequest() }
         guard let url = URL(string: urlString) else { throw NetworkError.invalidURL }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = "GET"
@@ -297,6 +299,8 @@ final class NodeRelayService {
 
     private func postJSON(_ urlString: String, body: [String: Any],
                           timeout: TimeInterval) async throws -> [String: Any] {
+        PlaybackGate.shared.beginRequest()
+        defer { PlaybackGate.shared.endRequest() }
         guard let url = URL(string: urlString) else { throw NetworkError.invalidURL }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = "POST"

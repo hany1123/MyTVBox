@@ -134,7 +134,11 @@ final class VideoPlayerViewModel: ObservableObject {
     /// 1.5.2 自动换源总开关（默认开）。用 object(forKey:) 判空，
     /// 避免 UserDefaults 尚未写入时 bool(forKey:) 返回 false 把默认行为改成关闭。
     private var autoSwitchEnabled: Bool {
-        (UserDefaults.standard.object(forKey: "MyTVBox.autoSwitchEnabled") as? Bool) ?? true
+        // 1.8.15 稳定模式：连「同片多线路自动切换」也关掉。
+        // 1.8.8 诊断里 failed 回调连发会在几秒内堆起十几条 AVURLAsset，
+        // 耗尽后又去启动整站级跨站搜索，这正是播放期最不该发生的事。
+        if StableMode.shared.enabled { return false }
+        return (UserDefaults.standard.object(forKey: "MyTVBox.autoSwitchEnabled") as? Bool) ?? true
     }
     /// 云端清洗失败过一次后，本次会话不再重复等待，避免每条线路都卡 3.5 秒
     private var cloudCleanFailed = false

@@ -45,6 +45,8 @@ struct VideoPlayerView: View {
     @State private var episodesVisible = true
     @State private var hideTask: Task<Void, Never>?
     @State private var isFullscreen = false
+    /// 1.8.15：起播被移到收口之后，页面先消失时要能取消它
+    @State private var startTask: Task<Void, Never>?
 
     init(playSource: PlaySource,
          allSources: [PlaySource],
@@ -208,24 +210,48 @@ struct VideoPlayerView: View {
             model.parseRules = state.currentConfig?.parses ?? []
             // JS Spider 站点的集地址要先过 play()
             model.spiderSite = site ?? state.currentSite
-            model.onCrossSiteFallback = { title, epIdx, progress, excluded in
-                let sites = state.currentConfig?.sites ?? []
-                return await CrossSiteResolver.findAlternative(
-                    title: title,
-                    in: sites,
-                    excludingKeys: excluded,
-                    episodeIndex: epIdx,
-                    progress: progress,
-                    preferredSiteKey: state.currentSite?.key
-                )
+            // 1.8.15 稳定模式：不注入「线路耗尽 → 整站搜同名片」兜底。
+            // 这条会在播放期拉起一轮跨站搜索，与 AVPlayer 同进程抢资源。
+            if StableMode.shared.allowCrossSiteFallback {
+                model.onCrossSiteFallback = { title, epIdx, progress, excluded in
+                    let sites = state.currentConfig?.sites ?? []
+                    return await CrossSiteResolver.findAlternative(
+                        title: title,
+                        in: sites,
+                        excludingKeys: excluded,
+                        episodeIndex: epIdx,
+                        progress: progress,
+                        preferredSiteKey: state.currentSite?.key
+                    )
+                }
+            } else {
+                model.onCrossSiteFallback = nil
+                SessionTrace.mark("略 播放 稳定模式：不注入站点级自动换源")
             }
-            // 1.8.12：起播前先请跨站聚合搜索收手。1.8.11 里 `完 重活` 落在
-            // 起播窗口内，Node RSS 与 App RSS 同步上涨，两条线一起把内存顶上去。
-            // 不改 model.start() 的时序，只发取消请求；搜索在下一次 group.next()
-            // 就会 break，通常几十毫秒内生效。
-            Task { await HeavyWorkGate.shared.requestCancelCurrent() }
-            SessionTrace.mark("记 播放 已请求取消在飞跨站搜索")
-            model.start()
+            // 1.8.15：本轮最关键的改动。
+            // 旧写法只「发一个取消请求」就立刻 model.start() —— 取消还在半路，
+            // /play 取流与 AVAsset 装载已经压上来。1.8.14 诊断里播放开始时
+            // work=1、Node /detail 回包持续到播放期，3 秒后进程被无声回收。
+            // 现在：先标记播放期（禁新重活）→ 等所有在飞 HTTP 请求归零 → 才起播。
+            if StableMode.shared.enabled {
+                PlaybackGate.shared.enterPlayback()
+                SessionTrace.mark("记 播放 稳定模式 起播前收口开始 · "
+                                  + PlaybackGate.shared.statusText())
+                self.startTask = Task { @MainActor in
+                    await PlaybackGate.shared.drainForPlayback(
+                        timeout: StableMode.shared.drainTimeout)
+                    guard !Task.isCancelled else {
+                        SessionTrace.mark("弃 播放 起播前页面已消失，不再起播")
+                        return
+                    }
+                    model.start()
+                }
+            } else {
+                // 完整模式：保留 1.8.12 的旧时序
+                Task { await HeavyWorkGate.shared.requestCancelCurrent() }
+                SessionTrace.mark("记 播放 已请求取消在飞跨站搜索")
+                model.start()
+            }
             scheduleAutoHide()
             TabBarVisibility.setHidden(true)
         }
@@ -235,8 +261,11 @@ struct VideoPlayerView: View {
             SessionTrace.mark("命 播放页消失")
             viewModel.saveProgress()
             hideTask?.cancel()
+            startTask?.cancel()
             TabBarVisibility.setHidden(false)
             PlaybackHeartbeat.shared.stop()
+            // 1.8.15：解除播放期，后面的页面才能重新排队做整站级重活
+            PlaybackGate.shared.leavePlayback()
             // 1.8.4：正常退出也要写「完」，否则下次诊断永远误报「崩在播放」
             SessionTrace.mark("完 播放 \(videoDetail.vodName) 正常退出")
         }

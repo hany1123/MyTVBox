@@ -37,6 +37,12 @@ actor HeavyWorkGate {
 
     /// 拿闸；被取消时返回 false（调用方直接放弃，不要再干活）
     func acquire() async -> Bool {
+        // 1.8.15 稳定模式：播放页存在时，任何整站级重活都不再排队。
+        // 1.8.14 诊断里 `完重活` 落在播放开始之后、Node /detail 回包持续到播放期，
+        // 就是这条没拦住 —— 光「请求取消」不等于「请求已经退场」。
+        if StableMode.shared.enabled, PlaybackGate.shared.isPlaybackActive {
+            return false
+        }
         if !busy {
             busy = true
             return true
