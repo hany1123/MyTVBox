@@ -11,6 +11,10 @@ struct SearchView: View {
     @FocusState private var isSearchFocused: Bool
     /// 1.4.7：结果带站点归属，跨站点同名片不再撞 ID
     @State private var results: [CrossSiteResolver.SiteSearchResult] = []
+    /// 1.8.3：一次只上屏 60 条。虽然 LazyVGrid 本身惰性，但「174 条结果」意味着
+    /// 用户可以一路滑出 174 张海报，图片解码缓存会一路涨到 Jetsam。
+    /// 改成显式分页：点「显示更多」再放 60 条，内存上限可控。
+    @State private var displayLimit: Int = 60
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
     @State private var hasSearched: Bool = false   // 是否已发起过搜索
@@ -388,9 +392,14 @@ struct SearchView: View {
         return order.map { SiteBucket(key: $0, name: names[$0] ?? $0, count: counts[$0] ?? 0) }
     }
 
-    private var filteredResults: [CrossSiteResolver.SiteSearchResult] {
+    private var allFilteredResults: [CrossSiteResolver.SiteSearchResult] {
         guard let f = siteFilter else { return results }
         return results.filter { $0.site.key == f }
+    }
+
+    /// 1.8.3：真正进 LazyVGrid 的只有前 `displayLimit` 条
+    private var filteredResults: [CrossSiteResolver.SiteSearchResult] {
+        Array(allFilteredResults.prefix(displayLimit))
     }
 
     private var resultColumns: [GridItem] {
@@ -448,6 +457,35 @@ struct SearchView: View {
                 .frame(maxWidth: .infinity)
             }
             .padding(.horizontal, 12)
+
+            // 1.8.3：分页按钮。命中 174 条时别一次性把 174 张海报摊开，
+            // 用户想看更多再点，每次只多 60 条。
+            let remaining = allFilteredResults.count - filteredResults.count
+            if remaining > 0 {
+                Button {
+                    displayLimit += 60
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 11, weight: .bold))
+                        Text("显示更多（还有 \(remaining) 条）")
+                            .font(TVBoxTheme.text(13, weight: .semibold))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(TVBoxTheme.surface)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(TVBoxTheme.stroke, lineWidth: 1)
+                    )
+                    .foregroundStyle(TVBoxTheme.accent)
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 12)
+            }
 
             if filteredResults.isEmpty {
                 Text("这个站点没有可用结果的预览")
@@ -575,6 +613,7 @@ struct SearchView: View {
         errorMessage = nil
         hasSearched = true
         results = []
+        displayLimit = 60
         siteFilter = nil
 
         // 快照当前配置，避免搜索过程中切站导致结果错位
@@ -603,14 +642,19 @@ struct SearchView: View {
             // 1.8.0 的轨迹里最后一行是「开 搜索 站=110」，之后就没了 —— 110 个站
             // 轮流进 Node 跑 spider，V8 堆一路涨到上限，进程被 abort（闪退）。
             // 60 站 × 每站 16 条已足够凑满 240 条结果，负载直接砍半。
+            // 1.8.3：总量 240 → 120、单站 16 → 12、总时限 14 秒。
+            // 1.8.1 真机实测「入夜不再」跑了 23.3 秒才出 174 条 —— 等太久用户会
+            // 反复点、反复开新搜索，也把高内存状态拉得更长。
+            let t0 = Date()
             let found = await CrossSiteResolver.search(
                 keyword: trimmed,
                 in: usable,
-                limitPerSite: 16,
-                limitTotal: 240,
+                limitPerSite: 12,
+                limitTotal: 120,
                 preferredSiteKey: preferred,
                 maxSites: 60,
-                concurrency: 12
+                concurrency: 12,
+                budget: 14
             )
             // 1.8.1：先判取消再记「完」。以前先记后判，被取代的搜索也会写一条
             // 「完 命中 N」，看日志时容易误判成两次搜索都成功了。
@@ -618,10 +662,15 @@ struct SearchView: View {
                 SessionTrace.mark("弃 搜索 \(trimmed)（被新搜索取代）")
                 return
             }
-            SessionTrace.mark("完 搜索 \(trimmed) 命中 \(found.count)")
+            let cost = Date().timeIntervalSince(t0)
+            SessionTrace.mark("完 搜索 \(trimmed) 命中 \(found.count) · \(String(format: "%.1f", cost))s")
             self.searchedSiteCount = usable.count
             self.results = found
             self.isLoading = false
+            // 1.8.3：再记一条「上屏」。1.8.1 的诊断里最后是 `完 搜索 命中 174`，
+            // 13 秒后进程重启、中间没有任何点击痕迹 —— 崩的就是结果上屏/刷海报，
+            // 但日志看不出来。有这条就能把「死在渲染」和「死在抓取」分开。
+            SessionTrace.mark("屏 搜索 \(trimmed) 上屏 \(min(found.count, 60))/\(found.count) 条")
         }
     }
 }

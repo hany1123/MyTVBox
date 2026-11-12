@@ -127,12 +127,13 @@ enum CrossSiteResolver {
                        limitTotal: Int = 120,
                        preferredSiteKey: String? = nil,
                        maxSites: Int = 24,
-                       concurrency: Int = 16) async -> [SiteSearchResult] {
+                       concurrency: Int = 16,
+                       budget: TimeInterval = 0) async -> [SiteSearchResult] {
         let result = await HeavyWorkGate.shared.run {
             await searchUngated(
                 keyword: keyword, in: sites, limitPerSite: limitPerSite,
                 limitTotal: limitTotal, preferredSiteKey: preferredSiteKey,
-                maxSites: maxSites, concurrency: concurrency)
+                maxSites: maxSites, concurrency: concurrency, budget: budget)
         }
         return result ?? []
     }
@@ -143,9 +144,12 @@ enum CrossSiteResolver {
                                       limitTotal: Int = 120,
                                       preferredSiteKey: String? = nil,
                                       maxSites: Int = 24,
-                                      concurrency: Int = 16) async -> [SiteSearchResult] {
+                                      concurrency: Int = 16,
+                                      budget: TimeInterval = 0) async -> [SiteSearchResult] {
         let targets = Array(usableSites(sites).prefix(max(1, maxSites)))
         guard !targets.isEmpty else { return [] }
+
+        let t0 = Date()
 
         let kw = keyword
         let per = max(1, limitPerSite)
@@ -168,7 +172,7 @@ enum CrossSiteResolver {
                     group.addTask {
                         do {
                             let items = try await APIService.shared.searchVideos(
-                                site: site, keyword: kw, timeout: 6
+                                site: site, keyword: kw, timeout: 5
                             )
                             return Batch(index: idx, site: site, items: Array(items.prefix(per)))
                         } catch {
@@ -184,6 +188,10 @@ enum CrossSiteResolver {
             }
             batches.append(contentsOf: part)
             start = end
+            // 1.8.3：总时限。1.8.1 真机「入夜不再」60 站跑满要 23.3 秒，
+            // 5 批里最慢那批往往只贡献几条边角结果，不值得让用户干等。
+            // budget 到点就收，已有批次照常出结果（0 = 不限，别处调用不变）。
+            if budget > 0, Date().timeIntervalSince(t0) >= budget { break }
         }
 
         let ordered = batches.sorted { $0.index < $1.index }

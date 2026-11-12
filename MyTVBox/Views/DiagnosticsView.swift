@@ -55,6 +55,7 @@ struct DiagnosticsView: View {
             kv("可用站点", "\(appState.usableSiteCount) 个")
             kv("启用接口", "\(appState.enabledSubscriptions.count) 个")
             kv("当前站点", siteLabel)
+            kv("海报缓存", "420px 缩略 · 96 张 / 28MB")
             kv("App 版本", appVersion)
         }
         .padding(14)
@@ -93,6 +94,27 @@ struct DiagnosticsView: View {
             }
             .buttonStyle(.plain)
             .disabled(running)
+
+            // 1.8.3：内存吃紧时手动释放海报位图，不重启也能缓一口气
+            Button {
+                RemoteImageLoader.shared.clearCache()
+                SessionTrace.mark("手 清理海报缓存")
+            } label: {
+                Label("清空海报缓存", systemImage: "photo.badge.arrow.down.fill")
+                    .font(TVBoxTheme.text(13, weight: .semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(TVBoxTheme.surface)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(TVBoxTheme.stroke, lineWidth: 1)
+                    )
+                    .foregroundStyle(TVBoxTheme.accent)
+            }
+            .buttonStyle(.plain)
 
             Text("会跑一遍内核启动、配置拉取、站点解析，数秒内出结果。崩溃类问题请把整段报告复制给我。")
                 .font(TVBoxTheme.mono(10))
