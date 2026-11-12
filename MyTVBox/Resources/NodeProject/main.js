@@ -63,6 +63,9 @@ process.on('unhandledRejection', (e) => {
             try {
                 log('fallback to builtin index.js');
                 mod = require(LOCAL);
+                // 1.7.6：回落成功就把 entry 改回内置，否则下面 kernel.txt 会
+                // 把「实际跑的内置」误记成「远程」—— 那正是用户在问的那件事。
+                entry = LOCAL;
                 log('builtin bundle loaded, exports=' + Object.keys(mod || {}).join(','));
             } catch (e2) {
                 log('FATAL require(builtin): ' + (e2 && e2.stack ? e2.stack : String(e2)));
