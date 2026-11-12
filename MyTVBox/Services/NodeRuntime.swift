@@ -182,6 +182,166 @@ final class NodeRuntime {
         return UInt16(t)
     }
 
+    // MARK: - 远程 bundle（1.7.2）
+    //
+    // 猫爪源的官方分发方式是「索引 + 内容」：
+    //   GET https://host/cat/index.js.md5  -> 32 字节 md5
+    //   GET https://host/cat/index.js      -> 6.6 MB bundle（md5 与之对应）
+    // 支持它之后，源更新时只要换个地址，App 自己拉新 bundle，不用重打包 IPA。
+
+    /// UserDefaults key：用户填的 bundle 索引地址（形如 .../index.js.md5）
+    static let remoteIndexKey = "MyTVBox.remoteSpiderIndexURL"
+
+    var remoteIndexURL: String? {
+        get { UserDefaults.standard.string(forKey: Self.remoteIndexKey) }
+        set {
+            if let v = newValue, !v.isEmpty {
+                UserDefaults.standard.set(v, forKey: Self.remoteIndexKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.remoteIndexKey)
+            }
+        }
+    }
+
+    /// 判断是不是猫爪源的 bundle 索引地址。只认 `.js.md5` 后缀，避免误伤普通订阅。
+    static func isBundleIndexURL(_ raw: String) -> Bool {
+        let lower = raw.lowercased()
+        guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else { return false }
+        return lower.hasSuffix(".js.md5")
+    }
+
+    private var remoteBundleFile: URL { workDir.appendingPathComponent("remote.js") }
+    private var remoteMD5File: URL { workDir.appendingPathComponent("remote.md5") }
+
+    /// 拉索引 → 和本地比对 → 需要时下载 bundle。
+    /// - Returns: `true` 表示 bundle 内容变了（调用方需要重启 Node 才生效）
+    @discardableResult
+    func syncRemoteBundle() async -> Bool {
+        guard let indexRaw = remoteIndexURL, Self.isBundleIndexURL(indexRaw),
+              let indexURL = URL(string: indexRaw) else {
+            return false
+        }
+
+        // workDir 可能还没建（sync 早于 installProjectIfNeeded 执行）
+        try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+
+        // 1) 拉远端 md5
+        let remoteMD5: String
+        do {
+            remoteMD5 = try await fetchText(indexURL)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+        } catch {
+            appendLog("remote: 拉 md5 失败 \(error.localizedDescription)")
+            return false
+        }
+        guard remoteMD5.count == 32, remoteMD5.allSatisfy({ $0.isHexDigit }) else {
+            appendLog("remote: md5 不是 32 位 hex: \(remoteMD5.prefix(60))")
+            return false
+        }
+
+        // 2) 和本地已下载的比
+        let localMD5 = (try? String(contentsOf: remoteMD5File, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if localMD5 == remoteMD5, FileManager.default.fileExists(atPath: remoteBundleFile.path) {
+            appendLog("remote: bundle 已是最新 (\(remoteMD5))")
+            return false
+        }
+
+        // 3) 下载 bundle：{base}/index.js
+        // indexRaw = https://host/cat/index.js.md5 → base = https://host/cat/
+        var base = indexRaw
+        if let r = base.range(of: "index.js.md5", options: [.backwards, .caseInsensitive]) {
+            base = String(base[base.startIndex..<r.lowerBound])
+        }
+        if !base.hasSuffix("/") { base += "/" }
+        guard let bundleURL = URL(string: base + "index.js") else { return false }
+
+        do {
+            let data = try await fetchData(bundleURL)
+            guard data.count > 1_000_000 else {
+                appendLog("remote: bundle 太小 (\(data.count) bytes)，放弃")
+                return false
+            }
+            // 校验：远端声明的 md5 必须和实际内容一致，否则可能是半截/被串改
+            let actual = Self.md5Hex(data)
+            guard actual == remoteMD5 else {
+                appendLog("remote: md5 不匹配 期望=\(remoteMD5) 实际=\(actual)")
+                return false
+            }
+            try data.write(to: remoteBundleFile, options: .atomic)
+            try? remoteMD5.write(to: remoteMD5File, atomically: true, encoding: .utf8)
+            appendLog("remote: 已更新 bundle \(data.count) bytes md5=\(remoteMD5)")
+            return true
+        } catch {
+            appendLog("remote: 下载 bundle 失败 \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// 清掉远程 bundle，回退到 App 内置的 index.js。
+    func clearRemoteBundle() {
+        try? FileManager.default.removeItem(at: remoteBundleFile)
+        try? FileManager.default.removeItem(at: remoteMD5File)
+        remoteIndexURL = nil
+    }
+
+    /// 远程内核的当前状态，供设置页展示。
+    struct RemoteBundleStatus {
+        /// 用户填的索引地址（形如 .../index.js.md5），没配则为 nil
+        let indexURL: String?
+        /// 已下载 bundle 的字节数，0 表示没有
+        let byteSize: Int
+        /// 已下载 bundle 的 md5
+        let md5: String
+        /// 是否真的有可用 bundle
+        var isInstalled: Bool { byteSize > 1_000_000 }
+    }
+
+    var remoteBundleStatus: RemoteBundleStatus {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: remoteBundleFile.path)
+        let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        let md5 = ((try? String(contentsOf: remoteMD5File, encoding: .utf8)) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return RemoteBundleStatus(indexURL: remoteIndexURL, byteSize: size, md5: md5)
+    }
+
+    /// 人读的大小文本
+    static func sizeText(_ bytes: Int) -> String {
+        if bytes <= 0 { return "—" }
+        return String(format: "%.1f MB", Double(bytes) / 1_048_576.0)
+    }
+
+    // MARK: - 网络与摘要小工具
+
+    private func fetchText(_ url: URL) async throws -> String {
+        let data = try await fetchData(url)
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func fetchData(_ url: URL) async throws -> Data {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 30
+        // 这些源站大多带 CDN，禁掉缓存避免拿到旧 md5
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw NSError(domain: "NodeRuntime", code: http.statusCode, userInfo: [
+                NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"
+            ])
+        }
+        return data
+    }
+
+    /// 计算 MD5（CommonCrypto，已在 bridging header 里引入）
+    static func md5Hex(_ data: Data) -> String {
+        var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
+        data.withUnsafeBytes { raw in
+            _ = CC_MD5(raw.baseAddress, CC_LONG(data.count), &digest)
+        }
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
     // MARK: - 诊断
 
     /// 读最近若干行 Node 日志，供诊断面板/错误提示用。

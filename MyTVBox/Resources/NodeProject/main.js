@@ -41,13 +41,36 @@ process.on('unhandledRejection', (e) => {
 
 (async () => {
     let mod;
+    // 1.7.2：优先用从「md5 索引地址」下载来的远程 bundle（remote.js），
+    // 没有才回落到 App 内置的 index.js。
+    const REMOTE = path.join(DIR, 'remote.js');
+    const LOCAL = path.join(DIR, 'index.js');
+    let entry = LOCAL;
     try {
-        log('loading index.js ...');
-        mod = require(path.join(DIR, 'index.js'));
-        log('bundle loaded, exports=' + Object.keys(mod || {}).join(','));
+        if (fs.existsSync(REMOTE) && fs.statSync(REMOTE).size > 1000000) {
+            entry = REMOTE;
+        }
+    } catch (e) { /* 读不到就用内置 */ }
+
+    try {
+        log('loading ' + entry + ' ...');
+        mod = require(entry);
+        log('bundle loaded from ' + path.basename(entry) + ', exports=' + Object.keys(mod || {}).join(','));
     } catch (e) {
-        log('FATAL require: ' + (e && e.stack ? e.stack : String(e)));
-        return;
+        log('FATAL require(' + path.basename(entry) + '): ' + (e && e.stack ? e.stack : String(e)));
+        // 远程 bundle 加载失败时回落到内置，避免整个源不可用
+        if (entry !== LOCAL) {
+            try {
+                log('fallback to builtin index.js');
+                mod = require(LOCAL);
+                log('builtin bundle loaded, exports=' + Object.keys(mod || {}).join(','));
+            } catch (e2) {
+                log('FATAL require(builtin): ' + (e2 && e2.stack ? e2.stack : String(e2)));
+                return;
+            }
+        } else {
+            return;
+        }
     }
 
     if (typeof mod.start !== 'function') {

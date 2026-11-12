@@ -135,6 +135,10 @@ struct MyTVBoxApp: App {
     /// 这里不需要改 1.6.0 的任何转发逻辑 —— `NodeRelayService` 本来就是
     /// 「说 Node 协议」的客户端，只是把 baseURL 从电脑 IP 换成 127.0.0.1。
     private func bootEmbeddedNode() async {
+        // 1.7.2：如果用户配了「bundle 索引地址」（xxx/index.js.md5），
+        // 先把远端源同步下来，再启动 Node —— 这样一次启动就能用上新版源。
+        await NodeRuntime.shared.syncRemoteBundle()
+
         NodeRuntime.shared.startIfNeeded()
 
         // iOS 上的 Node 是 interpreter-only（无 JIT），加载 6.6 MB bundle 偏慢，

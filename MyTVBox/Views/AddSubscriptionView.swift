@@ -25,6 +25,8 @@ struct AddSubscriptionView: View {
         case idle
         case checking
         case ok
+        /// 校验通过，但需要自定义说明（例如源内核下载完成）
+        case okDetail(String)
         case fail(String)
     }
 
@@ -179,6 +181,13 @@ struct AddSubscriptionView: View {
                     title: "连接成功",
                     detail: "已解析到合法配置，可以保存"
                 )
+            case .okDetail(let msg):
+                statusBanner(
+                    icon: "checkmark.seal.fill",
+                    color: TVBoxTheme.accent,
+                    title: "操作成功",
+                    detail: msg
+                )
             case .fail(let msg):
                 statusBanner(
                     icon: "exclamationmark.triangle.fill",
@@ -223,6 +232,7 @@ struct AddSubscriptionView: View {
         case .idle: return "idle"
         case .checking: return "checking"
         case .ok: return "ok"
+        case .okDetail(let m): return "okDetail:\(m)"
         case .fail(let m): return "fail:\(m)"
         }
     }
@@ -351,9 +361,17 @@ struct AddSubscriptionView: View {
         isSaving = true
         defer { isSaving = false }
 
+        let trimmedURL = url.trimmed
+
+        // 1.7.2：`.js.md5` 是猫爪源的「bundle 索引地址」，不是普通订阅。
+        // 它指向的是源本体（6.6 MB），拉到本地后由端上 Node 加载。
+        if NodeRuntime.isBundleIndexURL(trimmedURL) {
+            await handleBundleIndexURL(trimmedURL)
+            return
+        }
+
         // 先尝试加载验证
         validationState = .checking
-        let trimmedURL = url.trimmed
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayName = trimmedName.isEmpty ? autoName(from: trimmedURL) : trimmedName
 
@@ -397,6 +415,63 @@ struct AddSubscriptionView: View {
         } else {
             dismiss()
         }
+    }
+
+    /// 1.7.2：处理 `...../index.js.md5` 形式的「源内核索引地址」。
+    ///
+    /// 它**不是订阅**，而是猫爪源本体的分发接口：
+    /// `GET .../index.js.md5` 拿到 32 位 md5，`GET .../index.js` 拿到 6.6 MB 的 bundle。
+    /// 下载并校验后存到 Documents/nodejs-project/remote.js，端上 Node 启动时优先加载它。
+    /// 这样以后源更新，换个地址就行，不用重打包 IPA。
+    @MainActor
+    private func handleBundleIndexURL(_ target: String) async {
+        validationState = .checking
+        let beforeMD5 = NodeRuntime.shared.remoteBundleStatus.md5
+
+        NodeRuntime.shared.remoteIndexURL = target
+        let changed = await NodeRuntime.shared.syncRemoteBundle()
+        let status = NodeRuntime.shared.remoteBundleStatus
+
+        guard status.isInstalled else {
+            let msg = "没能从该地址拉到源内核（index.js）"
+            validationState = .fail(msg + " · 检查地址是否能直接下载文件")
+            errorText = """
+            \(msg)。
+
+            请确认：
+            · 该地址能直接下到 index.js（不是网页）
+            · index.js.md5 与 index.js 在同一目录
+            · 网络可直连（必要时挂代理）
+            """
+            showError = true
+            return
+        }
+
+        let sizeText = NodeRuntime.sizeText(status.byteSize)
+        validationState = .okDetail("源内核已就位 · \(sizeText) · md5 \(status.md5.prefix(8))…")
+
+        if changed {
+            noticeText = """
+            源内核已下载并校验通过（\(sizeText)）。
+
+            这是源本体，不是普通订阅 —— 已装到本机，「本机猫爪源」会自动用上它。
+
+            需要「完全退出 App」（后台卡片上滑划掉）再打开，才会切到新内核。
+            """
+        } else if !beforeMD5.isEmpty && beforeMD5 == status.md5 {
+            noticeText = """
+            源内核已是最新（\(sizeText)），无需更新。
+
+            md5：\(status.md5)
+            """
+        } else {
+            noticeText = """
+            源内核已就位（\(sizeText)）。
+
+            需要「完全退出 App」再打开才会生效。
+            """
+        }
+        showNotice = true
     }
 
     private func autoName(from url: String) -> String {

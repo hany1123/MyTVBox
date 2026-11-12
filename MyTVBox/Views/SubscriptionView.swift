@@ -24,6 +24,12 @@ struct SubscriptionView: View {
     @AppStorage("MyTVBox.autoSwitchEnabled")
     private var autoSwitchEnabled: Bool = true
 
+    /// 1.7.2 源内核（远程 bundle）状态刷新计数
+    @State private var kernelTick: Int = 0
+    @State private var kernelBusy: Bool = false
+    @State private var kernelNotice: String = ""
+    @State private var showKernelNotice: Bool = false
+
     var body: some View {
         ZStack {
             TVBoxTheme.atmosphere
@@ -82,6 +88,11 @@ struct SubscriptionView: View {
             Button("知道了", role: .cancel) { vm.showNotice = false }
         } message: {
             Text(vm.noticeMessage)
+        }
+        .alert("源内核", isPresented: $showKernelNotice) {
+            Button("知道了", role: .cancel) { showKernelNotice = false }
+        } message: {
+            Text(kernelNotice)
         }
         .task {
             vm.attach(appState: appState)
@@ -227,6 +238,17 @@ struct SubscriptionView: View {
                         .tracking(2)
                         .foregroundStyle(TVBoxTheme.textSecondary)
                 }
+            }
+
+            Section {
+                kernelSection
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            } header: {
+                Text("源内核")
+                    .font(TVBoxTheme.mono(11, weight: .heavy))
+                    .tracking(2)
+                    .foregroundStyle(TVBoxTheme.textSecondary)
             }
 
             Section {
@@ -377,6 +399,116 @@ struct SubscriptionView: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(TVBoxTheme.stroke, lineWidth: 1)
         )
+    }
+
+    // MARK: - 源内核（1.7.2）
+
+    private var kernel: NodeRuntime.RemoteBundleStatus {
+        // 依赖 kernelTick，操作后手动 +1 触发重算
+        _ = kernelTick
+        return NodeRuntime.shared.remoteBundleStatus
+    }
+
+    private var kernelSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: kernel.isInstalled ? "cpu.fill" : "cpu")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(kernel.isInstalled ? TVBoxTheme.accent : TVBoxTheme.textSecondary)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(kernel.isInstalled ? "远程内核 · 已启用" : "内置内核")
+                        .font(TVBoxTheme.text(14, weight: .semibold))
+                        .foregroundStyle(TVBoxTheme.textPrimary)
+                    Text(kernel.isInstalled
+                         ? "\(NodeRuntime.sizeText(kernel.byteSize)) · md5 \(kernel.md5.prefix(8))…"
+                         : "App 自带的源内核，随版本更新")
+                        .font(TVBoxTheme.mono(10))
+                        .foregroundStyle(TVBoxTheme.textMuted)
+                }
+
+                Spacer(minLength: 4)
+
+                if kernelBusy {
+                    ProgressView().tint(TVBoxTheme.accent)
+                }
+            }
+
+            if let u = kernel.indexURL, !u.isEmpty {
+                Text(u)
+                    .font(TVBoxTheme.mono(10))
+                    .foregroundStyle(TVBoxTheme.textMuted)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    Task { await checkKernelUpdate() }
+                } label: {
+                    Text(kernelBusy ? "检查中…" : "检查更新")
+                        .font(TVBoxTheme.text(12, weight: .semibold))
+                        .foregroundStyle(TVBoxTheme.accent)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Capsule().stroke(TVBoxTheme.accent.opacity(0.5), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .disabled(kernelBusy)
+
+                if kernel.isInstalled {
+                    Button {
+                        NodeRuntime.shared.clearRemoteBundle()
+                        kernelTick += 1
+                        kernelNotice = "已回退到 App 内置内核。\n\n完全退出 App 再打开后生效。"
+                        showKernelNotice = true
+                    } label: {
+                        Text("回退内置")
+                            .font(TVBoxTheme.text(12, weight: .semibold))
+                            .foregroundStyle(TVBoxTheme.warn)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Capsule().stroke(TVBoxTheme.warn.opacity(0.5), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+            }
+
+            Text("内核就是源本体（约 6.6 MB 的 index.js）。在「添加接口」里填 .../index.js.md5 即可让 App 自己拉新版，不用等我重新打包。")
+                .font(TVBoxTheme.mono(10))
+                .foregroundStyle(TVBoxTheme.textMuted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func checkKernelUpdate() async {
+        guard let url = NodeRuntime.shared.remoteIndexURL, !url.isEmpty else {
+            kernelNotice = """
+            还没有配置远程内核地址。
+
+            点右上角 + ，把 .../index.js.md5 这样的地址粘进去保存即可。
+            """
+            showKernelNotice = true
+            return
+        }
+
+        kernelBusy = true
+        let changed = await NodeRuntime.shared.syncRemoteBundle()
+        kernelBusy = false
+        kernelTick += 1
+
+        let s = NodeRuntime.shared.remoteBundleStatus
+        if !s.isInstalled {
+            kernelNotice = "拉取失败：地址不可达或返回内容不是内核。\n\n当前地址：\(url)"
+        } else if changed {
+            kernelNotice = "已更新到新内核（\(NodeRuntime.sizeText(s.byteSize))）。\n\n完全退出 App 再打开后生效。"
+        } else {
+            kernelNotice = "已是最新（\(NodeRuntime.sizeText(s.byteSize))），无需更新。"
+        }
+        showKernelNotice = true
     }
 }
 
