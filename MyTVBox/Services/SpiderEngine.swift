@@ -581,8 +581,13 @@ final class SpiderEngine {
                 out.append("  " + line)
             }
         } else {
-            out.append("上次崩溃记录  : 无（若是闪退，多半是内存被系统回收或 V8 堆溢出）")
+            out.append("上次崩溃记录  : 无（NSException 型；原生信号看下一条）")
         }
+        // 1.8.10：六类全排除后补的原生信号证据。signal.log 里只看「最后一次
+        // 启动之前」的 SIGNAL 行，也就是上一轮是不是被 SIGABRT/SIGSEGV 带走的。
+        out.append("上次原生信号  : "
+                   + (SignalGuard.lastSignal()
+                      ?? "未捕获到（SIGABRT / SIGSEGV / SIGBUS / SIGTRAP）"))
 
         out.append("")
         out.append("--- 端上 Node 运行时 ---")

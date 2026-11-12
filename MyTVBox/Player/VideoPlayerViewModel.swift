@@ -657,6 +657,12 @@ final class VideoPlayerViewModel: ObservableObject {
         if bump { playEpoch += 1 }
         let epoch = playEpoch
         let urlString = url.absoluteString
+        // 1.8.10：1.8.9 诊断里播放页起来后连 `记 播放 URL` 都没有 —— 崩在
+        // **起播/取流阶段**，旧埋点在这一段是全黑的。这里补入口，后面每条
+        // 取流分支补开始/结束，下一份诊断能直接定位卡在哪一步。
+        if bump {
+            SessionTrace.mark("记 播放 起播入口 · " + Self.urlDigest(url))
+        }
 
         // 1.5.1：mddcloud 内置源的剧集用自定义 scheme 占位，播放前先换真实 m3u8。
         if allowResolve, urlString.hasPrefix(MddCloudService.playScheme) {
@@ -692,9 +698,16 @@ final class VideoPlayerViewModel: ObservableObject {
             isBuffering = false
             errorMessage = nil
             showHint("正在获取播放地址…", hold: nil)
+            // 1.8.10：本机源主路径。/play 卡住或把 Node 侧带崩时，
+            // 旧轨迹只到「开 播放」，看不出请求有没有发出去、有没有回来。
+            SessionTrace.mark("记 播放 发起 /play 取流")
+            let playT0 = Date()
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let resolved = await NodeRelayService.shared.resolvePlay(urlString)
+                let playMs = Int(Date().timeIntervalSince(playT0) * 1000)
+                SessionTrace.mark("记 播放 /play 结束 \(playMs)ms "
+                                  + (resolved == nil ? "失败" : "成功"))
                 guard self.playEpoch == epoch else { return }
                 guard let resolved else {
                     self.showHint(nil)
@@ -863,6 +876,8 @@ final class VideoPlayerViewModel: ObservableObject {
         duration = 0
         errorMessage = nil
 
+        // 1.8.10：创建 AVPlayerItem 是原生层（AVFoundation / 解码器）真正介入的点
+        SessionTrace.mark("记 播放 创建 AVPlayerItem")
         let item = makeItem(for: url)
         player.replaceCurrentItem(with: item)
 
@@ -891,6 +906,11 @@ final class VideoPlayerViewModel: ObservableObject {
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+                // 1.8.10：status 回调有没有触发，能区分「崩在 asset 装载」与
+                // 「崩在首帧之后」。1.8.9 那一轮两种结局都看不到。
+                SessionTrace.mark("记 播放 item.status="
+                                  + (item.status == .readyToPlay ? "readyToPlay"
+                                     : (item.status == .failed ? "failed" : "unknown")))
                 switch item.status {
                 case .readyToPlay:
                     self.isLoading = false

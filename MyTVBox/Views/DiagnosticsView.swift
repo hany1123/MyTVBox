@@ -65,6 +65,8 @@ struct DiagnosticsView: View {
                    ? "已退出（rc=\(NodeRuntime.shared.lastExitCode.map(String.init) ?? "?")）"
                    : (NodeRuntime.shared.isReady ? "已就绪" : "未就绪")))
             kv("fetch 兼容层", NodeRuntime.shared.fetchShimText)
+            // 1.8.10：原生信号崩溃（CrashGuard 抓不到的那一类）
+            kv("上次原生信号", SignalGuard.lastSignal() ?? "未捕获到")
             kv("App 版本", appVersion)
         }
         .padding(14)
@@ -225,16 +227,18 @@ struct DiagnosticsView: View {
             Text("· 最近轨迹 —— 开/完/弃 的先后顺序；播放心跳带 rss 和主线程状态")
 
             Divider().padding(.vertical, 4)
-            Text("进程消失的 6 类可能原因")
+            Text("进程消失的 8 类可能原因")
                 .font(TVBoxTheme.text(13, weight: .semibold))
                 .foregroundStyle(TVBoxTheme.textPrimary)
-            Text("[1] Jetsam 内存回收  → 看心跳的 rss 曲线、内存警告次数")
+            Text("[1] Jetsam 内存回收  → 看心跳的 rss 与 foot 曲线（Jetsam 依据 phys_footprint）")
             Text("[2] Watchdog 主线程卡死 → 看心跳里有没有「主=卡」")
             Text("[3] Node V8 abort    → 看 node.log 有没有 FATAL / EXIT code")
-            Text("[4] AVFoundation 失败 → 看有没有「败 播放」")
+            Text("[4] AVFoundation 失败 → 看本次播放有没有「败 播放」")
             Text("[5] NSException      → 看 CrashGuard 的崩溃记录")
-            Text("[6] 切后台 / 主动结束 → 看有没有「命 进入后台 / 即将终止」")
-            Text("以上都不成立时，再看系统设置 → 隐私 → 分析与改进里的 Jetsam 日志。")
+            Text("[6] 切后台 / 主动结束 → 看「命 进入后台 / 播放页消失」")
+            Text("[7] 原生信号崩溃     → 看 signal.log（SIGABRT / SIGSEGV / SIGTRAP）")
+            Text("[8] 起播阶段 / 重活并发 → 看本次播放停在哪一步、跨站搜索是否还在飞")
+            Text("证据范围已收窄到最后一个完整会话；`启 启动` 是重开时间，不是死亡时刻。")
                 .foregroundStyle(TVBoxTheme.textMuted)
         }
         .font(TVBoxTheme.mono(10))

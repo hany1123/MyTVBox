@@ -3,15 +3,21 @@
 //  MyTVBox
 //
 //  1.8.5：老大要求「不要靠猜，把可能导致的原因列进去，全面排查」。
-//  iOS 上 App 进程消失至少 6 类原因，各有不同的可观测指纹。这里把每一类的
-//  **证据现状**逐条列进诊断，而不是先验地押一个结论：
+//  iOS 上 App 进程消失的原因逐项列「证据现状」，而不是先验押一个结论：
 //
-//   1 Jetsam(内存)      RSS 曲线 / 内存警告次数 / 心跳中断点
+//   1 Jetsam(内存)      RSS + phys_footprint 曲线 / 内存警告 / 心跳中断点
 //   2 Watchdog(主线程)  后台心跳仍在但主线程时间戳停摆（0x8badf00d）
 //   3 Node V8 abort     node.log 里 FATAL / Reached heap limit / EXIT code
 //   4 AVFoundation      「败 播放」/ item 失败通知
 //   5 NSException       CrashGuard 的 crash.log
-//   6 生命周期/主动退出  「命 进入后台 / 即将终止 / 回前台」
+//   6 生命周期/主动退出  「命 进入后台 / 播放页消失 / 回前台」
+//   7 原生信号          1.8.10 新增：SignalGuard 的 signal.log
+//                       （SIGABRT / SIGSEGV / SIGBUS / SIGTRAP，CrashGuard 抓不到）
+//   8 起播阶段/重活并发  1.8.10 新增：本次播放停在哪一步、整站搜索是否还在飞
+//
+//  1.8.10：1.8.9 把日志窗口放大到 240 行后，`previous` 会跨好几个会话，
+//  [4] 把 18:18 / 18:31 的旧 item.failed 当成「本次」、[6] 把 18:32 的
+//  「进入后台」也算进来。证据范围必须收窄到**最后一个完整会话**。
 //
 //  证据不足时明确写「未观测到」，不替用户下结论。
 //
@@ -21,23 +27,27 @@ import Foundation
 enum CrashDiagnostic {
 
     static func lines() -> [String] {
-        // 1.8.7：旧版只读 previousTail(40)。用户在**同一次会话**里打开诊断时，
-        // 本轮播放心跳全被丢掉 —— 1.8.6 诊断明明有 4 条「跳 播放」，
-        // 却报「[1] 证据不足 / 心跳覆盖度 0」。判别器自己制造了证据盲区。
-        // 1.8.9：心跳 3s→2s，80 行窗口只够 160 秒播放，会把「启 启动」分界线
-        // 和上一轮崩溃现场一起挤出日志。窗口放大到 240 行（≈8 分钟播放）。
+        // 1.8.7：本轮/上一轮双范围；1.8.9：窗口 80→240 行（2s 心跳）。
         let all = SessionTrace.recent(240)
         let boot = all.lastIndex(where: { $0.contains(SessionTrace.bootToken) })
         let current = boot.map { Array(all[($0 + 1)...]) } ?? all
         let previous = boot.map { Array(all[..<$0]) } ?? []
 
+        // 1.8.10：240 行能装下好几次启动，previous 不再是「上一轮」，
+        // 而是「本次启动之前的全部历史」。取其中最后一次启动之后的部分，
+        // 才是真正崩溃的那一轮现场。
+        let lastSession = Self.lastSession(from: previous)
         let curBeats = playbackBeats(current)
-        let prevBeats = playbackBeats(previous)
+        let prevBeats = playbackBeats(lastSession)
         // 本轮有心跳就用本轮；本轮没进播放页才退回上一轮的崩溃现场
         let useCurrent = !curBeats.isEmpty || prevBeats.isEmpty
-        let scope = useCurrent ? current : previous
+        let scope = useCurrent ? current : lastSession
         let scopeName = useCurrent ? "本轮" : "上一轮"
         let beats = useCurrent ? curBeats : prevBeats
+
+        // 本次播放范围：最后一次「开 播放」之后的所有行
+        let pStart = scope.lastIndex(where: { $0.contains("开 播放") }) ?? scope.startIndex
+        let playScope = Array(scope[pStart...])
 
         // 1.8.7：node.log 每 10s 一条 mem10，tail 40 行几乎全是内存样本。
         // 改用「本次启动之后」的全文关键行，FATAL 首行 / shim 状态 / rc=9 都不会被挤掉。
@@ -48,9 +58,9 @@ enum CrashDiagnostic {
         let rssList = beats.compactMap { rssMB(from: $0) }
         let warns = scope.filter { $0.contains("警 ") }
         let mainStall = beats.filter { $0.contains("主=卡") }
-        let both = current + previous
-        let playerFails = both.filter { $0.contains("败 播放") }
-        let life = both.filter { $0.contains("命 ") }
+        // 1.8.10：只看收窄后的会话，不再用 both（会把好几轮的旧失败混进来）
+        let playerFails = playScope.filter { $0.contains("败 播放") }
+        let life = scope.filter { $0.contains("命 ") }
 
         let fatal = nodeLog.contains("FATAL ERROR")
             || nodeLog.contains("Reached heap limit")
@@ -62,10 +72,10 @@ enum CrashDiagnostic {
 
         var out: [String] = []
         out.append("--- 崩溃原因判别（全量排查，逐项看证据）---")
-        out.append("证据范围      : 本轮 \(current.count) 行 / 上一轮 \(previous.count) 行 → 取「\(scopeName)」（心跳 \(beats.count) 条）")
+        out.append("证据范围      : 本轮 \(current.count) 行 / 启动前历史 \(previous.count) 行 → 收窄到最后一个完整会话 \(lastSession.count) 行 → 取「\(scopeName)」（心跳 \(beats.count) 条）")
         out.append("node.log 关键行: \(keyLines.count) 行（本次启动后全文提取，见报告下一段）")
 
-        // 1. Jetsam —— 1.8.9：必须同时看 RSS 与 phys_footprint
+        // 1. Jetsam —— 1.8.9 同时看 RSS 与 phys_footprint；1.8.10 给明确结论
         let footList = beats.compactMap { footMB(from: $0) }
         if rssList.isEmpty {
             out.append("[1] Jetsam/内存    : 证据不足（\(scopeName)没有播放心跳，看不到内存曲线）")
@@ -85,11 +95,16 @@ enum CrashDiagnostic {
             }
             out.append("[1] Jetsam/内存    : RSS \(first)→\(last)MB（\(scopeName)峰值 \(peak)MB，变化 \(trend >= 0 ? "+" : "")\(trend)MB）"
                        + " · \(footText) · 内存警告 \(warns.count) 次")
-            out.append("     判据          : **Jetsam 看 phys_footprint，不是 RSS**。AVPlayer 的硬件解码缓冲 / IOSurface / IOKit 映射不计入 resident_size；所以「RSS 平稳」不能排除内存被系统回收，要看 foot 是否一路爬升")
+            out.append("     判据          : Jetsam 依据 phys_footprint 杀进程，AVPlayer 的 IOSurface / IOKit / 硬件解码缓冲不计入 resident_size；阈值 40MB 跃升 / 400MB 绝对值是**参考量级**，不是硬判定")
             if !footList.isEmpty {
                 let fmin = footList.min() ?? 0
                 let fp = footList.max() ?? 0
-                out.append("     foot 判读      : 最低 \(fmin)MB / 峰值 \(fp)MB / 末条 \(footList.last ?? 0)MB，跃升 \(fp - fmin)MB；进程若在末条心跳后消失，重点看最后 2 秒采样窗口内的突发分配")
+                let jump = fp - fmin
+                out.append("     foot 判读      : 最低 \(fmin)MB / 峰值 \(fp)MB / 末条 \(footList.last ?? 0)MB，跃升 \(jump)MB")
+                out.append("     结论          : "
+                           + (jump < 40 && fp < 400
+                              ? "**按现有证据基本排除 Jetsam**（foot 全程平稳且绝对值不高，视频侧映射没有暴涨）"
+                              : "**高度可疑**（foot 出现明显跃升，优先查视频侧缓冲）"))
             } else {
                 out.append("     foot 判读      : 本版心跳应带 foot=；若为空请回报（task_vm_info 在该设备读取失败）")
             }
@@ -97,7 +112,7 @@ enum CrashDiagnostic {
 
         // 2. Watchdog
         if mainStall.isEmpty {
-            out.append("[2] Watchdog/主线程: 未观测到主线程停摆（心跳里没有「主=卡」）")
+            out.append("[2] Watchdog/主线程: 未观测到主线程停摆（心跳里没有「主=卡」）→ 基本排除")
         } else {
             out.append("[2] Watchdog/主线程: 观测到 \(mainStall.count) 次主线程停摆 → 高度可疑")
             out.append("     " + (mainStall.last ?? ""))
@@ -105,8 +120,6 @@ enum CrashDiagnostic {
         out.append("     判据          : 后台心跳继续、主线程时间戳不动 = 主线程被卡住 ≥10s 被 watchdog 杀")
 
         // 3. Node 侧：必须先区分「根本没启动」和「运行中崩」，否则会误判
-        // 1.8.6：rc=9 是 Node 的 kInvalidCommandLineArgument。node_start 直接返回时
-        // main.js 一行都没跑，此时不是 V8 abort，而是本机源整体不可用。
         let rt = NodeRuntime.shared
         let startFailed = (rt.nodeDidExit && (rt.lastExitCode ?? 0) != 0)
             || nodeLog.contains("node_start exited rc=9")
@@ -124,11 +137,11 @@ enum CrashDiagnostic {
         }
         out.append("     Node 内存样本 : \(nodeMemLines.count) 行（每 10s 一条）")
 
-        // 4. AVFoundation
+        // 4. AVFoundation —— 只看本次播放范围
         if playerFails.isEmpty {
-            out.append("[4] AVFoundation   : 未观测到「败 播放」（item failed / 播放到末尾失败）")
+            out.append("[4] AVFoundation   : 本次播放未观测到「败 播放」（旧轮的失败已不再计入）")
         } else {
-            out.append("[4] AVFoundation   : 观测到 \(playerFails.count) 条失败事件")
+            out.append("[4] AVFoundation   : 本次播放观测到 \(playerFails.count) 条失败事件")
             for l in playerFails.suffix(2) { out.append("     " + l) }
         }
 
@@ -139,25 +152,56 @@ enum CrashDiagnostic {
             out.append("[5] NSException    : CrashGuard 无记录 → 基本排除（ObjC/Swift 异常型崩溃）")
         }
 
-        // 6. 生命周期
+        // 6. 生命周期 —— 只看收窄后的会话
         if life.isEmpty {
-            out.append("[6] 生命周期/主动  : 未观测到「进入后台 / 即将终止」记录")
+            out.append("[6] 生命周期/主动  : 本轮未观测到「进入后台 / 播放页消失 / 回前台」")
         } else {
             out.append("[6] 生命周期/主动  : \(life.count) 条")
             for l in life.suffix(3) { out.append("     " + l) }
         }
+
+        // 7. 原生信号 —— 1.8.10：六类全排除后最大的盲区
+        if let sig = SignalGuard.lastSignal() {
+            out.append("[7] 原生信号      : 上一轮捕获到 `\(sig)` → **高度可疑**（AVFoundation / NodeMobile C++ / Swift runtime 断言）")
+        } else {
+            out.append("[7] 原生信号      : 未捕获到 SIGABRT / SIGSEGV / SIGBUS / SIGTRAP 记录")
+        }
+        out.append("     判据          : 这类崩溃不产生 NSException、不写 node.log FATAL，只有 signal handler 能留痕；SIGKILL 抓不到，但已由 foot 曲线排除 Jetsam")
+
+        // 8. 起播阶段 + 重活并发 —— 1.8.10：1.8.9 崩在「记 播放 URL」之前
+        let stageHits = playScope.filter { $0.contains("记 播放") || $0.contains("item.status=") }
+        let reachedReady = playScope.contains(where: { $0.contains("首帧就绪") })
+        let reachedItem = playScope.contains(where: { $0.contains("创建 AVPlayerItem") })
+        let reachedURL = playScope.contains(where: { $0.contains("记 播放 URL") })
+        let playStarted = playScope.contains(where: { $0.contains("发起 /play 取流") })
+        let playEnded = playScope.contains(where: { $0.contains("/play 结束") })
+        let stageText = reachedReady ? "首帧就绪之后"
+            : (reachedItem ? "已创建 AVPlayerItem、等 status"
+               : (reachedURL ? "已拿到播放 URL"
+                  : (playStarted ? (playEnded ? "/play 已返回、未拿到可播 URL"
+                                   : "**/play 取流请求在飞（未见返回）**")
+                     : "起播入口之前 / 非本机源解析")))
+        out.append("[8] 起播阶段      : 本次播放停在「\(stageText)」 · 阶段轨迹 \(stageHits.count) 条")
+        for l in stageHits.suffix(4) { out.append("     " + l) }
+        let openWork = scope.filter { $0.contains("开 重活") }.count
+        let closeWork = scope.filter { $0.contains("完 重活") }.count
+        out.append("     重活并发      : 整站级搜索 开 \(openWork) / 完 \(closeWork) → "
+                   + (openWork > closeWork
+                      ? "**起播时仍有未结束的跨站搜索**（与本机 Node 同进程）"
+                      : "无在飞重活"))
+        out.append("     心跳结局      : "
+                   + (scope.contains(where: { $0.contains("完 心跳") })
+                      ? "有「完 心跳」→ 播放页主动消失，心跳是正常收尾"
+                      : "**无「完 心跳」→ 进程被直接终止**，末条心跳即最后存活证据"))
+        out.append("     死亡时刻      : `启 启动` 是老大重开 App 的时间，不是进程消失时刻；以末条心跳为准")
 
         // 心跳覆盖度
         if beats.isEmpty {
             out.append("心跳覆盖度        : 0 条（\(scopeName)没有播放心跳；可能没进播放页）")
         } else {
             out.append("心跳覆盖度        : \(beats.count) 条（\(scopeName)最近一次播放） · 首条 \(beats.first ?? "") · 末条 \(beats.last ?? "")")
-            out.append("     说明          : 末条心跳的 t= 是最后一次采样；进程若在此之后消失，t≈消失时刻")
+            out.append("     说明          : 按 2 秒采样，末条之后本应还有下一条；缺了就是进程在那一瞬间没了")
         }
-        // 1.8.8：只看本次播放范围。旧版在 both（本轮+上一轮）里取最后一条
-        // 「完 播放」，1.8.7 崩溃那一轮却显示了上一轮的「正常退出」，误导判读。
-        let pStart = scope.lastIndex(where: { $0.contains("开 播放") }) ?? scope.startIndex
-        let playScope = Array(scope[pStart...])
         out.append("播放结局          : "
                    + (playScope.last(where: { $0.contains("完 播放") })
                       ?? "本次播放没有「完 播放」（未正常收尾）"))
@@ -165,6 +209,16 @@ enum CrashDiagnostic {
         out.append("证据不足时不下结论：请连同 node.log 关键行与本段一起复制给我。")
         out.append("")
         return out
+    }
+
+    /// 1.8.10：从「本次启动之前的全部历史」里切出最后一次启动之后的那一轮。
+    /// 240 行窗口能装下好几次启动，不加这一步就会把 18:18 / 18:31 的旧
+    /// `败 播放`、18:32 的「进入后台」当成崩溃轮的证据。
+    private static func lastSession(from lines: [String]) -> [String] {
+        guard let i = lines.lastIndex(where: { $0.contains(SessionTrace.bootToken) }) else {
+            return lines
+        }
+        return Array(lines[(i + 1)...])
     }
 
     /// 只取「最后一次开 播放」之后的心跳，避免把多轮播放的 RSS 混成一条曲线

@@ -184,6 +184,13 @@ enum CrossSiteResolver {
 
         let t0 = Date()
 
+        // 1.8.10：1.8.9 诊断里，进播放页前 1.5 秒还有一次跨站聚合搜索
+        // （`记 搜索 … 跳过冷却 15 站`），而播放页起播时它很可能仍在飞。
+        // 用开/完配对让判别器能判断「起播时是否有整站级重活并发」。
+        // defer 保证所有 return 分支都收口，进程被杀时自然只剩「开」。
+        SessionTrace.mark("开 重活 跨站搜索 \(keyword) 站=\(targets.count)")
+        defer { SessionTrace.mark("完 重活 跨站搜索 \(keyword)") }
+
         let kw = keyword
         let per = max(1, limitPerSite)
         let indexed = Array(targets.enumerated())

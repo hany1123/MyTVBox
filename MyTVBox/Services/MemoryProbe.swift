@@ -149,10 +149,17 @@ final class PlaybackHeartbeat {
 
     func stop() {
         lock.lock()
+        // 1.8.10：区分「心跳主动停」与「进程直接没了」。
+        // 诊断里若没有这条「完 心跳」，就说明末条心跳之后进程被杀，
+        // 而不是播放器视图被拆导致心跳正常收尾。
+        let wasRunning = mainTask != nil || bgTask != nil
         mainTask?.cancel(); mainTask = nil
         bgTask?.cancel(); bgTask = nil
         lastMainTick = nil
         lock.unlock()
+        if wasRunning {
+            SessionTrace.mark("完 心跳 主动停止（播放页消失 / 视图重建）")
+        }
     }
 
     private func touchMain() {

@@ -224,6 +224,9 @@ struct VideoPlayerView: View {
             TabBarVisibility.setHidden(true)
         }
         .onDisappear {
+            // 1.8.10：播放页消失本身是一等证据。崩溃时这条不会出现，
+            // 于是能把「进程被杀」与「SwiftUI 把视图拆了」区分开。
+            SessionTrace.mark("命 播放页消失")
             viewModel.saveProgress()
             hideTask?.cancel()
             TabBarVisibility.setHidden(false)
