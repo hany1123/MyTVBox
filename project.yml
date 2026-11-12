@@ -57,8 +57,8 @@ targets:
       properties:
         CFBundleDisplayName: NewBox
         CFBundleIdentifier: com.newbox.ios
-        CFBundleShortVersionString: "1.7.5"
-        CFBundleVersion: "20261112.22"
+        CFBundleShortVersionString: "1.7.6"
+        CFBundleVersion: "20261112.23"
         MinimumOSVersion: "16.0"
         UILaunchScreen: {}
         UIBackgroundModes:
