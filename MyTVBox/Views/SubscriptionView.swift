@@ -29,6 +29,8 @@ struct SubscriptionView: View {
     @State private var kernelBusy: Bool = false
     @State private var kernelNotice: String = ""
     @State private var showKernelNotice: Bool = false
+    /// 1.7.6 进页面后短暂轮询内核启动状态
+    @State private var kernelWatchTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -410,20 +412,35 @@ struct SubscriptionView: View {
         return NodeRuntime.shared.remoteBundleStatus
     }
 
+    /// 当前真正在用的内核；还没读到（Node 正在起）就退回内置的描述
+    private var active: NodeRuntime.ActiveKernel {
+        _ = kernelTick
+        return NodeRuntime.shared.activeKernel
+            ?? NodeRuntime.ActiveKernel(source: "index.js", bytes: 0, md5: "")
+    }
+
+    /// 标题只在「确认过」的前提下才敢下结论，避免内核没起来时瞎猜
+    private var activeTitle: String {
+        if active.md5.isEmpty { return "内核启动中…" }
+        return active.isRemote ? "运行中：下载的内核" : "运行中：App 自带内核"
+    }
+
     private var kernelSection: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // 1.7.6：这里显示的是「当前进程真正在跑的那份内核」，
+            // 而不是「下载了哪份」—— 两者在冷启动之前会不一样，必须分开说。
             HStack(spacing: 10) {
-                Image(systemName: kernel.isInstalled ? "cpu.fill" : "cpu")
+                Image(systemName: active.isRemote ? "cpu.fill" : "cpu")
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(kernel.isInstalled ? TVBoxTheme.accent : TVBoxTheme.textSecondary)
+                    .foregroundStyle(active.isRemote ? TVBoxTheme.accent : TVBoxTheme.textSecondary)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(kernel.isInstalled ? "远程内核 · 已启用" : "内置内核")
+                    Text(activeTitle)
                         .font(TVBoxTheme.text(14, weight: .semibold))
                         .foregroundStyle(TVBoxTheme.textPrimary)
-                    Text(kernel.isInstalled
-                         ? "\(NodeRuntime.sizeText(kernel.byteSize)) · md5 \(kernel.md5.prefix(8))…"
-                         : "App 自带的源内核，随版本更新")
+                    Text(active.md5.isEmpty
+                         ? "内核还没起来，稍等一下"
+                         : "\(NodeRuntime.sizeText(active.bytes)) · md5 \(active.md5.prefix(8))…")
                         .font(TVBoxTheme.mono(10))
                         .foregroundStyle(TVBoxTheme.textMuted)
                 }
@@ -432,6 +449,17 @@ struct SubscriptionView: View {
 
                 if kernelBusy {
                     ProgressView().tint(TVBoxTheme.accent)
+                }
+            }
+
+            if let pending = NodeRuntime.shared.pendingKernelMD5 {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(TVBoxTheme.warn)
+                    Text("已下载 md5 \(pending.prefix(8))… · 完全退出 App 再打开才生效")
+                        .font(TVBoxTheme.mono(10))
+                        .foregroundStyle(TVBoxTheme.warn)
                 }
             }
 
@@ -483,15 +511,31 @@ struct SubscriptionView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 6)
+        .onAppear { watchKernelBoot() }
+    }
+
+    /// 内核启动要几秒到几十秒，这段时间「运行中」会一直显示「启动中」。
+    /// 进来后轻量轮询 30 秒（每 2 秒一次，读一个几十字节的小文件），读到就停手。
+    private func watchKernelBoot() {
+        kernelWatchTask?.cancel()
+        kernelWatchTask = Task {
+            for _ in 0..<15 {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if Task.isCancelled { return }
+                await MainActor.run { kernelTick += 1 }
+                if let k = NodeRuntime.shared.activeKernel, !k.md5.isEmpty { return }
+            }
+        }
     }
 
     private func checkKernelUpdate() async {
+        // 1.7.6：没配地址就用内置的默认内核源，省得用户去记那一长串
+        if NodeRuntime.shared.remoteIndexURL == nil || NodeRuntime.shared.remoteIndexURL?.isEmpty == true {
+            NodeRuntime.shared.remoteIndexURL = NodeRuntime.defaultIndexURL
+            kernelTick += 1
+        }
         guard let url = NodeRuntime.shared.remoteIndexURL, !url.isEmpty else {
-            kernelNotice = """
-            还没有配置远程内核地址。
-
-            点右上角 + ，把 .../index.js.md5 这样的地址粘进去保存即可。
-            """
+            kernelNotice = "还没有配置远程内核地址。"
             showKernelNotice = true
             return
         }

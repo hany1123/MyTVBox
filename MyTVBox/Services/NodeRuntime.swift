@@ -45,6 +45,8 @@ final class NodeRuntime {
     }
 
     private var readyFile: URL { workDir.appendingPathComponent("ready.txt") }
+    /// 1.7.6：main.js 启动时写入「实际加载了哪份内核」
+    private var kernelLogFile: URL { workDir.appendingPathComponent("kernel.txt") }
     private var logFile: URL { workDir.appendingPathComponent("node.log") }
 
     // MARK: - 安装资源
@@ -77,6 +79,8 @@ final class NodeRuntime {
 
         // 清掉上一次运行的就绪标记，避免读到旧端口。
         try? fm.removeItem(at: readyFile)
+        // 内核记录也要清：不然「当前运行的内核」会显示上一次的旧值
+        try? fm.removeItem(at: kernelLogFile)
     }
 
     /// 资源可能在根目录，也可能在 NodeProject 子目录（取决于打包方式）。
@@ -192,6 +196,10 @@ final class NodeRuntime {
     /// UserDefaults key：用户填的 bundle 索引地址（形如 .../index.js.md5）
     static let remoteIndexKey = "MyTVBox.remoteSpiderIndexURL"
 
+    /// 1.7.6：内置的默认内核源。用户没填地址时，「检查更新」就用它 ——
+    /// 这样源更新了，点一下就行，不用记地址。
+    static let defaultIndexURL = "https://9280.kstore.vip/cat/index.js.md5"
+
     var remoteIndexURL: String? {
         get { UserDefaults.standard.string(forKey: Self.remoteIndexKey) }
         set {
@@ -304,6 +312,33 @@ final class NodeRuntime {
         let md5 = ((try? String(contentsOf: remoteMD5File, encoding: .utf8)) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return RemoteBundleStatus(indexURL: remoteIndexURL, byteSize: size, md5: md5)
+    }
+
+    /// 当前进程真正在跑的那份内核（由 main.js 写入 kernel.txt）
+    struct ActiveKernel {
+        let source: String   // "remote.js" 或 "index.js"
+        let bytes: Int
+        let md5: String
+        var isRemote: Bool { source == "remote.js" }
+    }
+
+    var activeKernel: ActiveKernel? {
+        guard let data = try? Data(contentsOf: kernelLogFile),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let src = obj["source"] as? String else { return nil }
+        return ActiveKernel(source: src,
+                            bytes: (obj["bytes"] as? NSNumber)?.intValue ?? 0,
+                            md5: (obj["md5"] as? String) ?? "")
+    }
+
+    /// 已经下载好、但还没被这次进程加载的内核（需要冷启动才生效）
+    var pendingKernelMD5: String? {
+        let downloaded = remoteBundleStatus.md5
+        guard remoteBundleStatus.isInstalled, !downloaded.isEmpty else { return nil }
+        // 只有确认了「本次真正加载的是哪份」才敢说需要冷启动。
+        // 内核还没起来时 kernel.txt 不存在，这时不下结论，免得一开机就误报。
+        guard let active = activeKernel else { return nil }
+        return active.md5 == downloaded ? nil : downloaded
     }
 
     /// 人读的大小文本

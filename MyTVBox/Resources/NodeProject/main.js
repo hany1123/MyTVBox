@@ -73,6 +73,24 @@ process.on('unhandledRejection', (e) => {
         }
     }
 
+    // 1.7.6：把「这次到底加载了哪一份内核」写成文件，供 App 的「源内核」区直接显示。
+    // 用户最想知道的一件事就是：我填的那个链接到底生效了没有。
+    // 注意它记录的是**当前进程真正加载的**那份，不是刚下载的那份。
+    try {
+        const crypto = require('crypto');
+        const buf = fs.readFileSync(entry);
+        const md5 = crypto.createHash('md5').update(buf).digest('hex');
+        fs.writeFileSync(path.join(DIR, 'kernel.txt'), JSON.stringify({
+            source: path.basename(entry),
+            bytes: buf.length,
+            md5: md5,
+            at: new Date().toISOString()
+        }), 'utf8');
+        log('kernel.txt: ' + path.basename(entry) + ' ' + buf.length + 'B md5=' + md5);
+    } catch (e) {
+        log('kernel.txt write failed: ' + (e && e.message ? e.message : String(e)));
+    }
+
     if (typeof mod.start !== 'function') {
         log('FATAL: bundle has no start()');
         return;
