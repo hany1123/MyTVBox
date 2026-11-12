@@ -280,6 +280,160 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
 })();
 
 // ---------------------------------------------------------------------------
+// 1.8.16：JSON.stringify 爆栈护栏（设备 .ips 实证，修的是根因）
+//
+// MyTVBox-2026-11-12-223646.ips：
+//   exception EXC_CRASH / SIGILL，termination "Illegal instruction: 4"
+//   崩溃线程 com.apple.root.user-initiated-qos 共 511 帧，其中
+//     475 帧 v8::internal::JsonStringifier::Serialize_<true/false>
+//      59 帧 SerializeJSReceiverSlow、1 帧 ApplyToJsonFunction
+//   崩溃 22:36:46.1169，距「RES-ABORT /spider/appv7xiaoningmeng/3/category
+//   ms=20160」仅 0.3 秒；主线程此时还在 CFRunLoop 里，栈里没有一帧
+//   MyTVBox 业务代码，foot 105→92MB 在下降。
+//
+// 结论：某个 spider 返回了极深 / 循环 / toJSON 自引用的对象，Node 侧
+// JSON.stringify 在 **C++ 层递归**（JsonStringifier::Serialize_），把 iOS
+// GCD 全局队列线程那几百 KB 的栈撑爆 → V8 SIGILL → 整个 App 进程被带走。
+// 不是 Jetsam、不是 Swift runtime trap、不是 AVPlayer，稳定模式 B 也管不到。
+//
+// 修法：在 require(bundle) 之前包装全局 JSON.stringify。
+//   ① 先用「不分配副本」的迭代式快扫查深度 / 循环 / toJSON 自引用；
+//      正常对象直接交给 V8 原生实现，零行为变化。
+//   ② 只有病态对象才走迭代式裁剪副本（截断深层、循环替换为标记），
+//      绝不把病态对象交给 V8 的递归 Serialize_。
+// 快扫与裁剪都用**显式栈**，自身不会递归爆栈。
+// ---------------------------------------------------------------------------
+(function installJSONStringifyGuard() {
+    const native = JSON.stringify;
+    if (typeof native !== 'function') return;
+    const MAX_DEPTH = 24;
+    const MAX_NODES = 30000;
+    const MAX_TOJSON = 64;
+
+    function isObj(v) {
+        return v !== null && typeof v === 'object';
+    }
+
+    // ① 快扫：只判断「会不会把 V8 的 C++ 递归撑爆」，不复制数据。
+    // chain 是单链表，只查当前路径上的祖先 —— 不同字段重复引用同一对象
+    // 是合法数据，不能误判成循环。
+    function scan(root) {
+        if (!isObj(root)) return null;
+        let nodes = 0, tojson = 0;
+        const stack = [{ v: root, d: 0, chain: null }];
+        while (stack.length) {
+            const it = stack.pop();
+            let v = it.v;
+            if (++nodes > MAX_NODES) return 'nodes>' + MAX_NODES;
+
+            if (isObj(v) && typeof v.toJSON === 'function') {
+                if (++tojson > MAX_TOJSON) return 'toJSON>' + MAX_TOJSON;
+                // 主动求值一次才能发现「toJSON 返回更深结构」这类自引用链。
+                // 用 try/catch 兜住有副作用的 toJSON；正常 Date/Buffer 无害。
+                try { v = v.toJSON(); }
+                catch (e) { return 'toJSON threw'; }
+                if (!isObj(v)) continue;
+            }
+            if (!isObj(v)) continue;
+
+            for (let c = it.chain; c; c = c.prev) {
+                if (c.v === v) return 'circular';
+            }
+            if (it.d >= MAX_DEPTH) return 'depth>' + MAX_DEPTH;
+
+            const chain = { v: v, prev: it.chain };
+            let keys;
+            try { keys = Object.keys(v); }
+            catch (e) { continue; }
+            for (let i = keys.length - 1; i >= 0; i--) {
+                let child;
+                try { child = v[keys[i]]; } catch (e2) { continue; }
+                if (isObj(child)) {
+                    stack.push({ v: child, d: it.d + 1, chain: chain });
+                }
+            }
+        }
+        return null;
+    }
+
+    // ② 裁剪：迭代式构造「深度受限、无循环」的纯数据副本。
+    // 不调用被覆盖后的 JSON.stringify，只调 native，避免自递归。
+    function sanitize(root) {
+        const holder = { v: null };
+        let nodes = 0, tojson = 0;
+        const stack = [{ v: root, dst: holder, key: 'v', d: 0, chain: null }];
+        while (stack.length) {
+            const it = stack.pop();
+            let v = it.v;
+            if (++nodes > MAX_NODES) { it.dst[it.key] = '[truncated]'; continue; }
+
+            if (isObj(v) && typeof v.toJSON === 'function') {
+                if (++tojson > MAX_TOJSON) { it.dst[it.key] = '[toJSON limit]'; continue; }
+                try { v = v.toJSON(it.key); }
+                catch (e) { v = '[toJSON error]'; }
+            }
+            if (v === null || typeof v === 'string' || typeof v === 'number'
+                || typeof v === 'boolean' || typeof v === 'undefined') {
+                it.dst[it.key] = (typeof v === 'number' && !isFinite(v)) ? null : v;
+                continue;
+            }
+            if (typeof v === 'bigint') { it.dst[it.key] = String(v); continue; }
+            if (typeof v === 'function' || typeof v === 'symbol') {
+                it.dst[it.key] = undefined; continue;
+            }
+            if (!isObj(v)) { it.dst[it.key] = String(v); continue; }
+
+            let cyclic = false;
+            for (let c = it.chain; c; c = c.prev) {
+                if (c.v === v) { cyclic = true; break; }
+            }
+            if (cyclic) { it.dst[it.key] = '[Circular]'; continue; }
+            if (it.d >= MAX_DEPTH) {
+                it.dst[it.key] = Array.isArray(v) ? [] : {};
+                continue;
+            }
+
+            const isArr = Array.isArray(v);
+            const dst = isArr ? [] : {};
+            it.dst[it.key] = dst;
+            const chain = { v: v, prev: it.chain };
+            let keys;
+            try { keys = isArr ? null : Object.keys(v); }
+            catch (e) { keys = []; }
+            if (isArr) {
+                for (let i = v.length - 1; i >= 0; i--) {
+                    stack.push({ v: v[i], dst: dst, key: i,
+                                 d: it.d + 1, chain: chain });
+                }
+            } else {
+                for (let i = keys.length - 1; i >= 0; i--) {
+                    stack.push({ v: v[keys[i]], dst: dst, key: keys[i],
+                                 d: it.d + 1, chain: chain });
+                }
+            }
+        }
+        return holder.v;
+    }
+
+    JSON.stringify = function (value, replacer, space) {
+        let why = null;
+        try { why = scan(value); }
+        catch (e) { /* 检查器自身异常，退回原生实现，不让护栏变成新故障点 */ }
+        if (why) {
+            log('BADJSON ' + why + ' · 已裁剪，避免 V8 Serialize_ 爆栈');
+            let safe;
+            try { safe = sanitize(value); }
+            catch (e2) { safe = { error: 'unsafe payload' }; }
+            try { return native.call(JSON, safe, replacer, space); }
+            catch (e3) { return '{}'; }
+        }
+        return native.apply(JSON, arguments);
+    };
+    log('json guard: installed (depth<=' + MAX_DEPTH
+        + ', nodes<=' + MAX_NODES + ', toJSON<=' + MAX_TOJSON + ')');
+})();
+
+// ---------------------------------------------------------------------------
 // 1.8.13：/play 在飞取证
 //
 // 1.8.12 的判别器只能说「/play 取流请求在飞（未见返回）」，因为 Swift 侧
