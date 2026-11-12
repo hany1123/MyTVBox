@@ -19,15 +19,15 @@ final class RemoteImageLoader {
 
     private init() {
         let cfg = URLSessionConfiguration.default
-        cfg.httpMaximumConnectionsPerHost = 24
+        cfg.httpMaximumConnectionsPerHost = 10
         cfg.timeoutIntervalForRequest = 20
         cfg.timeoutIntervalForResource = 30
         // 海报地址里带 cache=86400，让它走系统缓存；重复进来不用再下
         cfg.requestCachePolicy = .returnCacheDataElseLoad
         session = URLSession(configuration: cfg)
 
-        cache.countLimit = 300          // 最多 300 张
-        cache.totalCostLimit = 80 << 20 // ≈80 MB
+        cache.countLimit = 160          // 1.8.0：300 → 160，配合内存收紧
+        cache.totalCostLimit = 48 << 20 // 1.8.0：80 → 48 MB
     }
 
     func cached(_ url: URL) -> UIImage? {

@@ -135,6 +135,23 @@ final class AppState: ObservableObject {
     @Published var selectedTab: Int = 0
     /// 详情页「去搜索」时带给搜索页的关键字，搜索页取走后置 nil
     @Published var pendingSearchKeyword: String?
+
+    /// 1.8.0：跳搜索页的唯一出口。
+    ///
+    /// 之前是「关详情 + 切 Tab + 塞关键词」在同一帧里做。SwiftUI 会在视图更新期间
+    /// 拆掉正在 dismiss 的 NavigationStack，iOS 16 上表现为**点豆瓣电影直接闪退**。
+    /// 现在统一成：调用方先 dismiss，隔一拍（放过转场）再切 Tab 并带关键词。
+    func jumpToSearch(keyword kw: String, after delay: TimeInterval = 0.35) {
+        let t = kw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        SessionTrace.mark("开 跳搜索 \(t)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, delay)) { [weak self] in
+            guard let self else { return }
+            self.pendingSearchKeyword = t
+            self.selectedTab = 2
+            SessionTrace.mark("完 跳搜索 \(t)")
+        }
+    }
     /// 当前订阅若是多仓，这里是可切换的子仓库列表
     @Published var availableRepos: [RepoLink] = []
     @Published var activeRepoURL: String?

@@ -533,6 +533,19 @@ final class SpiderEngine {
         // 1.7.8：/config 到底慢在哪一步，直接看这两行
         out.append("本机源配置    : " + LocalSourceCache.lastProbe)
         out.append("配置缓存      : " + LocalSourceCache.describe())
+        // 1.8.0：闪退定位 —— 上次最后停在哪个动作上（`开` 之后没有对应的 `完`）
+        if let step = SessionTrace.interruptedStep() {
+            out.append("上次最后停在  : \(step)（这一步没走完）")
+        } else {
+            out.append("上次最后停在  : （无记录）")
+        }
+        let marks = SessionTrace.recent(8)
+        if !marks.isEmpty {
+            out.append("最近轨迹      :")
+            for line in marks {
+                out.append("  " + line)
+            }
+        }
         if let crash = CrashGuard.lastReport() {
             out.append("上次崩溃记录  :")
             for line in crash.split(separator: "\n").suffix(24) {

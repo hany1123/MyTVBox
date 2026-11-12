@@ -187,6 +187,8 @@ struct VideoPlayerView: View {
             }
         }
         .onAppear {
+            // 1.8.0：面包屑 —— 播放页是闪退高发区（AVPlayer + 端上 Node 同进程）
+            SessionTrace.mark("开 播放 \(videoDetail.vodName) 线路 \(allSources.count)")
             // 注入站点级换源：线路全部耗尽时，去当前配置的其它 CMS 站点找同名片
             // @StateObject 的 wrappedValue 在 View 内会被解析成 Binding，
             // 先取出实例引用再改其属性，避免 dynamicMember 下标报错

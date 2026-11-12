@@ -115,15 +115,15 @@ enum CrossSiteResolver {
     ///   1.7.7：以前是把 200 个站一次性全 `addTask` 出去 —— 端上 Node 那边等于同时
     ///   发起 200 个上游请求，每个都持有整页 HTML/JSON，V8 堆撞上限直接
     ///   `FATAL ERROR: Reached heap limit` → **整个 App 进程被 abort，表现就是闪退**。
-    ///   分批后峰值内存与连接数都可控；24 路是「比 48 条连接略低、又不太拖时间」的取值，
-    ///   98 个站约 5 批、总耗时只比以前多一两秒。
+    ///   分批后峰值内存与连接数都可控；16 路是 1.8.0 再压一档的取值（24 路仍偏多，
+    ///   98 个站约 7 批，代价是总耗时多几秒，换来内存峰值明显下降）。
     static func search(keyword: String,
                        in sites: [Site],
                        limitPerSite: Int = 12,
                        limitTotal: Int = 120,
                        preferredSiteKey: String? = nil,
                        maxSites: Int = 24,
-                       concurrency: Int = 24) async -> [SiteSearchResult] {
+                       concurrency: Int = 16) async -> [SiteSearchResult] {
         let targets = Array(usableSites(sites).prefix(max(1, maxSites)))
         guard !targets.isEmpty else { return [] }
 

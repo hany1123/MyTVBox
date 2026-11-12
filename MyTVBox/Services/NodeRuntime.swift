@@ -217,27 +217,43 @@ final class NodeRuntime {
             // 每次新建连接的开销可以忽略，直接 close 最稳。
             req.setValue("close", forHTTPHeaderField: "Connection")
             let t0 = Date()
-            do {
-                let (data, _) = try await URLSession.shared.data(for: req)
-                let cost = Date().timeIntervalSince(t0)
-                self.appendLog(String(format: "warmup /config %.1fs %d bytes", cost, data.count))
-                if data.count > 200 {
-                    LocalSourceCache.save(data)
-                    LocalSourceCache.note(String(format: "预热成功 %.1fs · %d 字节", cost, data.count))
+            var lastError: Error?
+            // 1.8.0：连接被拒时补一次。实测过「ready 了但 TCP 还没接受连接」的瞬间
+            // （`Could not connect to the server.` 0.0s），等一下就能连上。
+            for attempt in 0..<2 {
+                do {
+                    let (data, _) = try await URLSession.shared.data(for: req)
+                    let cost = Date().timeIntervalSince(t0)
+                    self.appendLog(String(format: "config %.1fs %d bytes (try %d)",
+                                          cost, data.count, attempt + 1))
+                    if data.count > 200 {
+                        LocalSourceCache.save(data)
+                        LocalSourceCache.note(String(format: "成功 %.1fs · %d 字节", cost, data.count))
+                    }
+                    return data
+                } catch {
+                    lastError = error
+                    let code = (error as? URLError)?.code
+                    let retriable = (code == .cannotConnectToHost
+                                     || code == .networkConnectionLost
+                                     || code == .notConnectedToInternet)
+                    if retriable, attempt == 0 {
+                        self.appendLog("config 连接失败（\(error.localizedDescription)），1 秒后重试")
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        continue
+                    }
+                    break
                 }
-                return data
-            } catch {
-                let cost = Date().timeIntervalSince(t0)
-                self.appendLog(String(format: "warmup /config %.1fs 失败: %@", cost,
-                                      error.localizedDescription))
-                LocalSourceCache.note(String(format: "预热失败 %.1fs · %@", cost,
-                                             error.localizedDescription))
-                // 失败要清掉单飞占位，否则「重新加载」永远拿到同一个失败结果
-                self.lock.lock()
-                self.localConfigTask = nil
-                self.lock.unlock()
-                return nil
             }
+            let cost = Date().timeIntervalSince(t0)
+            let desc = lastError?.localizedDescription ?? "unknown"
+            self.appendLog(String(format: "config %.1fs 失败: %@", cost, desc))
+            LocalSourceCache.note(String(format: "失败 %.1fs · %@", cost, desc))
+            // 失败要清掉单飞占位，否则「重新加载」永远拿到同一个失败结果
+            self.lock.lock()
+            self.localConfigTask = nil
+            self.lock.unlock()
+            return nil
         }
         localConfigTask = task
         lock.unlock()

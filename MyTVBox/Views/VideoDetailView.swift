@@ -543,9 +543,9 @@ struct VideoDetailView: View {
                 // 一键把用户送到搜索页，别让人卡在这一页。
                 if let kw = (previewItem?.vodName ?? detail?.vodName), !kw.isEmpty {
                     Button("去搜索") {
-                        appState.pendingSearchKeyword = kw
+                        // 1.8.0：同样是「先关，再切 Tab」
                         dismiss()
-                        appState.selectedTab = 2
+                        appState.jumpToSearch(keyword: kw)
                     }
                     .font(PlayerTheme.sans(13, weight: .heavy))
                     .foregroundColor(PlayerTheme.textHigh)
@@ -602,6 +602,7 @@ struct VideoDetailView: View {
 
         let title = previewItem?.vodName ?? detail?.vodName ?? ""
         diag("站点 \(site.key) · vodId=\(vodId) · 标题=\(title)")
+        SessionTrace.mark("开 详情 \(title.isEmpty ? vodId : title)")
         diag(isRecommendWallItem ? "判定：推荐墙条目 → 直接跨站找片源" : "判定：普通条目 → 先问本驿站")
 
         // 1.7.5：豆瓣这类推荐墙，直接跳到「全站聚合搜索」。
@@ -609,9 +610,11 @@ struct VideoDetailView: View {
         // 也没法挑。跳过去能按站点筛选，和 MiraPlay 一致。
         if autoSearchOnOpen, isRecommendWallItem, !title.isEmpty {
             diag("推荐墙条目 → 跳转全站搜索「\(title)」")
-            appState.pendingSearchKeyword = title
-            appState.selectedTab = 2
+            // 1.8.0：先退详情，再隔一拍切 Tab。
+            // 同一帧里「关导航栈 + 切 Tab」会让 SwiftUI 在视图更新中拆掉正在
+            // dismiss 的 NavigationStack —— 这就是「点豆瓣电影直接闪退」。
             dismiss()
+            appState.jumpToSearch(keyword: title)
             return
         }
 
@@ -637,6 +640,7 @@ struct VideoDetailView: View {
             }
         }
 
+        SessionTrace.mark("完 详情 \(title.isEmpty ? vodId : title) 无线路")
         if await adoptDetailFromOtherSites(title: title) { return }
 
         if title.isEmpty {
@@ -655,6 +659,7 @@ struct VideoDetailView: View {
     private func applyDetail(_ d: VideoDetail) {
         self.detail = d
         let parsed = d.parsePlaySources()
+        SessionTrace.mark("完 详情 \(d.vodName) 线路 \(parsed.count)")
         self.sources = parsed
         self.selectedSourceIndex = 0
         // 1.7.1：配置中心类站点的正文里带 http://<ip>:<port>/website，

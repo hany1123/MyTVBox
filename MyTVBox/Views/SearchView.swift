@@ -592,16 +592,20 @@ struct SearchView: View {
                 self.isLoading = false
                 return
             }
+            // 1.8.0：面包屑。闪退时进程直接消失，下次启动靠这行定位「死在哪一步」。
+            SessionTrace.mark("开 搜索 \(trimmed) 站=\(usable.count)")
             // 1.7.5：搜索页就是要「全站聚合」，别只搜前 24 个。
-            // 每站取 30 条（MiraPlay 音乐站动辄 30 条），总量放宽到 400。
+            // 1.8.0：每站 30 → 16、总量 400 → 240。海报张数直接决定内存峰值，
+            // 24 站并发时每站 30 条会把 700+ 张封面同时排队解码，容易顶到 Jetsam。
             let found = await CrossSiteResolver.search(
                 keyword: trimmed,
                 in: usable,
-                limitPerSite: 30,
-                limitTotal: 400,
+                limitPerSite: 16,
+                limitTotal: 240,
                 preferredSiteKey: preferred,
                 maxSites: 200
             )
+            SessionTrace.mark("完 搜索 \(trimmed) 命中 \(found.count)")
             guard !Task.isCancelled else { return }
             self.searchedSiteCount = usable.count
             self.results = found
