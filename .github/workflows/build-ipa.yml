@@ -16,7 +16,10 @@ permissions:
 jobs:
   build:
     name: Build Unsigned IPA
-    runs-on: macos-15
+    # 1.8.14：原 macos-15（arm64）在 public 仓库长期排队拿不到 runner
+    # （"jobs targeting macOS arm64 runners may experience longer queue times"），
+    # private 的 ci 仓库又撞上账户支出限额。换同版本 Intel 标签，避开 arm64 队列。
+    runs-on: macos-15-intel
 
     steps:
       - name: Checkout code
