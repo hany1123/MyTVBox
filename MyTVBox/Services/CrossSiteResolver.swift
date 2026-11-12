@@ -52,6 +52,8 @@ enum CrossSiteResolver {
         let batch: Batch?
         let failed: Bool
         let key: String
+        /// 1.8.7：失败原因文本，交给 SiteHealth 存起来供诊断判读
+        let reason: String
     }
 
     private static func fetchOne(idx: Int, site: Site, kw: String,
@@ -61,9 +63,10 @@ enum CrossSiteResolver {
                 site: site, keyword: kw, timeout: timeout)
             return FetchResult(batch: Batch(index: idx, site: site,
                                             items: Array(items.prefix(per))),
-                               failed: false, key: site.key)
+                               failed: false, key: site.key, reason: "")
         } catch {
-            return FetchResult(batch: nil, failed: true, key: site.key)
+            let why = String(error.localizedDescription.prefix(120))
+            return FetchResult(batch: nil, failed: true, key: site.key, reason: why)
         }
     }
 
@@ -209,7 +212,7 @@ enum CrossSiteResolver {
             for _ in 0..<width { addNext() }
 
             while let r = await group.next() {
-                SiteHealth.shared.note(r.key, ok: !r.failed)
+                SiteHealth.shared.note(r.key, ok: !r.failed, reason: r.reason)
                 if let b = r.batch { batches.append(b) }
 
                 // 1.8.2：页面已退 / 搜索被新词取代 → 收手，别占着重活闸

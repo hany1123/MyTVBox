@@ -67,6 +67,8 @@ final class NodeRuntime {
     private var readyFile: URL { workDir.appendingPathComponent("ready.txt") }
     /// 1.7.6：main.js 启动时写入「实际加载了哪份内核」
     private var kernelLogFile: URL { workDir.appendingPathComponent("kernel.txt") }
+    /// 1.8.7：main.js 写入「fetch 兼容层有没有装」，独立文件，不用在日志里翻
+    private var shimFile: URL { workDir.appendingPathComponent("shim.txt") }
     private var logFile: URL { workDir.appendingPathComponent("node.log") }
 
     // MARK: - 安装资源
@@ -142,6 +144,8 @@ final class NodeRuntime {
         // 却全是 Could not connect，就是这么来的。
         try? FileManager.default.removeItem(at: readyFile)
         try? FileManager.default.removeItem(at: kernelLogFile)
+        // 1.8.7：shim.txt 也是「本次进程」的状态，不能读到上一次的
+        try? FileManager.default.removeItem(at: shimFile)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.launchNode()
@@ -572,6 +576,36 @@ final class NodeRuntime {
         }
         let all = s.split(separator: "\n", omittingEmptySubsequences: false)
         return all.suffix(lines).joined(separator: "\n")
+    }
+
+    /// 1.8.7：node.log 每 10 秒一条 mem10，tail 40 行几乎全是内存样本 ——
+    /// 1.8.6 的诊断里 `fetch shim: installed`、FATAL 首行、`node_start rc=` 全被挤出视野，
+    /// 只留下一串看不懂的 undici 栈帧。这里**按本次启动之后**全文提取关键行。
+    func keyLogLines(sinceLastBoot: Bool = true, limit: Int = 60) -> [String] {
+        guard let s = try? String(contentsOf: logFile, encoding: .utf8) else { return [] }
+        var lines = s.split(separator: "\n").map(String.init)
+        if sinceLastBoot, let boot = lines.lastIndex(where: { $0.contains("=== boot ===") }) {
+            lines = Array(lines[boot...])
+        }
+        let keys = ["=== boot ===", "fetch shim:", "WARN fetch-shim", "FATAL",
+                    "EXIT code=", "node_start exited rc=", "READY on port",
+                    "kernel.txt", "config ", "mem HIGH", "install:"]
+        let hits = lines.filter { line in keys.contains { line.contains($0) } }
+        return Array(hits.suffix(limit))
+    }
+
+    /// 1.8.7：端上 Node 写的 fetch 兼容层状态（独立文件，不必翻日志）
+    var fetchShimText: String {
+        guard let data = try? Data(contentsOf: shimFile),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "未记录（内核未启动或旧版残留）"
+        }
+        let installed = (obj["installed"] as? Bool) ?? false
+        let hasWasm = (obj["hasWebAssembly"] as? Bool) ?? false
+        let at = (obj["at"] as? String) ?? ""
+        let time = at.split(separator: "T").dropFirst().first.map { String($0.prefix(8)) } ?? at
+        if installed { return "已安装（本机无 WebAssembly）· \(time) UTC" }
+        return "跳过（本机 WebAssembly=\(hasWasm ? "YES" : "NO")）· \(time) UTC"
     }
 
     private func appendLog(_ msg: String) {

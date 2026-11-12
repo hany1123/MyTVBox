@@ -50,8 +50,24 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
 // 有限重定向、text()/json()/arrayBuffer()。
 // ---------------------------------------------------------------------------
 (function installHttpFetchShim() {
-    if (typeof globalThis.WebAssembly !== 'undefined') {
+    // 1.8.7：把「有没有装 shim」写成独立文件，Swift 诊断直接读，
+    // 不用在每 10 秒一条 mem10 的日志里翻（1.8.6 诊断里就是被挤掉了）。
+    function writeShim(installed, hasWasm) {
+        try {
+            const d = (typeof DIR !== 'undefined') ? DIR
+                    : (typeof __dirname !== 'undefined' ? __dirname : '.');
+            fs.writeFileSync(require('path').join(d, 'shim.txt'), JSON.stringify({
+                installed: installed,
+                hasWebAssembly: hasWasm,
+                node: process.version,
+                at: new Date().toISOString()
+            }), 'utf8');
+        } catch (e) { /* 只读环境也要能跑，写不了不影响主流程 */ }
+    }
+    const hasWasm = typeof globalThis.WebAssembly !== 'undefined';
+    if (hasWasm) {
         log('fetch shim: skipped (WebAssembly available)');
+        writeShim(false, true);
         return;
     }
     const http = require('http');
@@ -171,6 +187,7 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
         return once(url, opts, 5);
     };
     log('fetch shim: installed (WebAssembly missing → http/https fallback)');
+    writeShim(true, false);
 })();
 
 process.on('uncaughtException', (e) => {

@@ -536,13 +536,17 @@ final class SpiderEngine {
         // 1.8.5：进程真实物理内存（含 V8 堆 + 视频缓冲 + 位图），判 Jetsam 的基准
         out.append("进程内存      : " + MemoryProbe.summary())
         // 1.8.4：老大问「慢是不是某些站点没加载」—— 直接把被跳过的坏站列出来
-        let cooling = SiteHealth.shared.coolingKeys()
+        let cooling = SiteHealth.shared.coolingDetails()
         out.append("站点健康      : " + (cooling.isEmpty
             ? "无冷却站（每个站都参与搜索）"
             : "冷却 \(cooling.count) 站（连续失败 ≥3 次，10 分钟内跳过）"))
         if !cooling.isEmpty {
-            out.append("冷却站点      : " + cooling.prefix(12).joined(separator: ", ")
-                       + (cooling.count > 12 ? " …" : ""))
+            // 1.8.7：把失败原因一起列出来，才能区分「站点自己挂了」和
+            // 「端上 fetch 兼容层没覆盖到」—— 1.8.6 只有名单，20 个冷却站无从判读
+            for d in cooling.prefix(12) {
+                out.append("  冷却站      : \(d.key) · 失败 \(d.fails) 次 · \(d.reason)")
+            }
+            if cooling.count > 12 { out.append("              : …另有 \(cooling.count - 12) 站") }
             out.append("              : 这些站每次搜索都要等满超时，是「慢」的主因；成功一次会自动解禁")
         }
         // 1.8.0：闪退定位 —— 上次最后停在哪个动作上（`开` 之后没有对应的 `完`）
@@ -590,6 +594,18 @@ final class SpiderEngine {
         out.append("node 启动故障 : \(rt.bootFailureText ?? "无")")
         out.append("node baseURL  : \(rt.baseURL)")
         out.append("relay baseURL : " + (NodeRelayService.shared.baseURL ?? "nil"))
+        // 1.8.7：shim 状态独立成文件，不用在 mem10 刷屏的日志里翻
+        out.append("fetch 兼容层  : " + rt.fetchShimText)
+        // 1.8.7：先给「本次启动后」的全文关键行，再给尾部原文。
+        // 1.8.6 的 tail 40 行被 mem10 占满，FATAL 首行 / shim 安装标记全被挤掉，
+        // 只留下一串看不懂的 undici 栈帧 —— 这正是「有证据但读不到」。
+        let keyLines = rt.keyLogLines()
+        out.append("node.log 关键行（本次启动后全文提取，\(keyLines.count) 行）:")
+        if keyLines.isEmpty {
+            out.append("  (无)")
+        } else {
+            for line in keyLines { out.append("  " + line) }
+        }
         // 1.8.5：12 行只够看到 undici 栈的尾巴，看不到错误首行和内存曲线
         let logTail = rt.tailLog(lines: 40)
         out.append("node.log 尾部 :")

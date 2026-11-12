@@ -13,6 +13,10 @@
 //  这里只记「抛错/超时」，不记「正常返回空结果」（那只是没这部片，站是好的）。
 //  连续失败 3 次的站冷却 10 分钟，期间搜索直接跳过；成功一次立刻清零。
 //
+//  1.8.7：只列「哪些站被冷却」不够判断原因 —— 1.8.6 诊断里冷却站从 6 个涨到
+//  20 个，但看不出是站点自己挂了、超时，还是端上 fetch 兼容层没覆盖到。
+//  现在把最后一次错误文本一起存下来，诊断里直接列出「站 + 失败次数 + 原因」。
+//
 
 import Foundation
 
@@ -24,6 +28,16 @@ final class SiteHealth {
         var fails: Int = 0
         var successes: Int = 0
         var lastFail: TimeInterval = 0
+        /// 1.8.7：最后一次失败的错误文本。用 Optional，旧版 UserDefaults
+        /// 里没有这个 key 的记录也能正常解码，不会让整张表失效。
+        var lastReason: String? = nil
+    }
+
+    /// 给诊断看的一条冷却记录
+    struct CoolingDetail {
+        let key: String
+        let fails: Int
+        let reason: String
     }
 
     private let lock = NSLock()
@@ -48,15 +62,20 @@ final class SiteHealth {
     }
 
     /// ok = 拿到了响应（哪怕 0 条）；false = 抛错/超时
-    func note(_ key: String, ok: Bool) {
+    /// - Parameter reason: 失败时的错误文本（只留前 120 字），成功时忽略
+    func note(_ key: String, ok: Bool, reason: String? = nil) {
         lock.lock()
         var r = table[key] ?? Rec()
         if ok {
             r.fails = 0
             r.successes += 1
+            r.lastReason = nil
         } else {
             r.fails += 1
             r.lastFail = Date().timeIntervalSince1970
+            if let reason, !reason.isEmpty {
+                r.lastReason = String(reason.prefix(120))
+            }
         }
         table[key] = r
         dirty = true
@@ -77,10 +96,18 @@ final class SiteHealth {
 
     /// 给诊断看：当前冷却中的站点
     func coolingKeys() -> [String] {
+        coolingDetails().map { $0.key }
+    }
+
+    /// 1.8.7：带失败原因，能区分「站点超时」「上游 404」「端上 fetch 报错」
+    func coolingDetails() -> [CoolingDetail] {
         lock.lock(); defer { lock.unlock() }
         let now = Date().timeIntervalSince1970
         return table.filter { $0.value.fails >= failThreshold && now - $0.value.lastFail < cooldown }
-            .map { $0.key }.sorted()
+            .map { CoolingDetail(key: $0.key,
+                                 fails: $0.value.fails,
+                                 reason: $0.value.lastReason ?? "(旧记录无错误文本)") }
+            .sorted { $0.key < $1.key }
     }
 
     func reset() {

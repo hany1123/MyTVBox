@@ -64,6 +64,7 @@ struct DiagnosticsView: View {
                ?? (NodeRuntime.shared.nodeDidExit
                    ? "已退出（rc=\(NodeRuntime.shared.lastExitCode.map(String.init) ?? "?")）"
                    : (NodeRuntime.shared.isReady ? "已就绪" : "未就绪")))
+            kv("fetch 兼容层", NodeRuntime.shared.fetchShimText)
             kv("App 版本", appVersion)
         }
         .padding(14)
