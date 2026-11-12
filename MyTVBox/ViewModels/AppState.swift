@@ -166,6 +166,8 @@ final class AppState: ObservableObject {
 
     static let defaultSubscriptionName = "内置源"
     static let defaultSubscriptionURL = BuiltinSources.defaultURL
+    /// 1.7.0：App 内置 Node 运行时提供的猫爪源（127.0.0.1，不需要电脑）
+    static let localNodeSourceName = "本机猫爪源"
 
     init() {
         loadSubscriptions()
@@ -219,6 +221,39 @@ final class AppState: ObservableObject {
             activeSubscriptionId = sub.id
         }
         saveSubscriptions()
+    }
+
+    // MARK: - 1.7.0 端上 Node 源
+
+    /// 端上 Node 就绪后，把本机源挂成一个订阅（幂等）。
+    ///
+    /// 用 `127.0.0.1` 前缀识别「本机源」：如果之前挂过但端口变了（源在端口
+    /// 被占用时会自动 +1），这里会就地更新 URL 而不是再加一条重复订阅。
+    func installLocalNodeSource(base: String) {
+        var norm = base
+        while norm.hasSuffix("/") { norm.removeLast() }
+        guard !norm.isEmpty else { return }
+        let configURL = norm + "/config"
+
+        if let idx = subscriptions.firstIndex(where: { $0.url.hasPrefix("http://127.0.0.1:") }) {
+            guard subscriptions[idx].url != configURL else { return }
+            subscriptions[idx].url = configURL
+            subscriptions[idx].isEnabled = true
+            saveSubscriptions()
+            return
+        }
+
+        let sub = Subscription(name: Self.localNodeSourceName,
+                               url: configURL,
+                               isEnabled: true)
+        subscriptions.insert(sub, at: 0)
+        activeSubscriptionId = sub.id
+        saveSubscriptions()
+    }
+
+    /// 本机源是否已经挂上（用于启动流程判断要不要重新拉配置）。
+    var hasLocalNodeSource: Bool {
+        subscriptions.contains { $0.url.hasPrefix("http://127.0.0.1:") }
     }
 
     func removeSubscription(_ id: UUID) {

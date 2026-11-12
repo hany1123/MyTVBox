@@ -26,3 +26,6 @@ Package.resolved
 
 ## Logs
 *.log
+
+## 1.7.0 端上 Node 运行时（CI 构建时现拉，51 MB，不进仓库）
+NodeMobile.xcframework/

@@ -115,11 +115,41 @@ enum OrientationManager {
 struct MyTVBoxApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var appState = AppState()
+    /// 保证端上 Node 只引导一次（视图重建时 .task 可能再次触发）
+    @State private var nodeBootTriggered = false
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(appState)
+                .task {
+                    guard !nodeBootTriggered else { return }
+                    nodeBootTriggered = true
+                    await bootEmbeddedNode()
+                }
         }
+    }
+
+    /// 1.7.0：启动 App 内置的 Node 运行时，就绪后自动挂上本机猫爪源。
+    ///
+    /// 这里不需要改 1.6.0 的任何转发逻辑 —— `NodeRelayService` 本来就是
+    /// 「说 Node 协议」的客户端，只是把 baseURL 从电脑 IP 换成 127.0.0.1。
+    private func bootEmbeddedNode() async {
+        NodeRuntime.shared.startIfNeeded()
+
+        // iOS 上的 Node 是 interpreter-only（无 JIT），加载 6.6 MB bundle 偏慢，
+        // 首次启动给足 120 秒；之后就绪标记已在，会很快返回。
+        let ok = await NodeRuntime.shared.waitUntilReady(timeout: 120)
+        guard ok else {
+            NSLog("[App] 端上 Node 启动失败，日志:\n%@", NodeRuntime.shared.tailLog())
+            return
+        }
+
+        NodeRelayService.shared.baseURL = NodeRuntime.shared.baseURL
+
+        await MainActor.run {
+            appState.installLocalNodeSource(base: NodeRuntime.shared.baseURL)
+        }
+        NSLog("[App] 端上 Node 就绪: %@", NodeRuntime.shared.baseURL)
     }
 }

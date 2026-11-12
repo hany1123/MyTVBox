@@ -6,8 +6,8 @@ options:
   xcodeVersion: "15.0"
 settings:
   base:
-    MARKETING_VERSION: "1.6.0"
-    CURRENT_PROJECT_VERSION: "20261111.16"
+    MARKETING_VERSION: "1.7.0"
+    CURRENT_PROJECT_VERSION: "20261112.17"
     DEVELOPMENT_TEAM: ""
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
@@ -23,8 +23,20 @@ targets:
         excludes:
           - "Info.plist"
           - "MyTVBox-Bridging-Header.h"
+          # 排除掉，改用下面的 folder reference 单独加，避免资源被收录两次
+          - "Resources/NodeProject"
     resources:
       - MyTVBox/Assets.xcassets
+      # 端上 Node 项目：整目录作为 folder reference 拷进 Bundle，
+      # 运行时由 NodeRuntime 复制到 Documents 再交给 node_start。
+      - path: MyTVBox/Resources/NodeProject
+        type: folder
+    dependencies:
+      # 1.7.0 端上 Node 运行时（nodejs-mobile v18.20.4，动态库，54.9 MB）
+      # CI 在 xcodegen 之前下载解压到仓库根目录。
+      - framework: NodeMobile.xcframework
+        embed: true
+        codeSign: false
     settings:
       base:
         INFOPLIST_FILE: MyTVBox/Info.plist
@@ -36,13 +48,15 @@ targets:
         CODE_SIGNING_REQUIRED: "NO"
         DEVELOPMENT_TEAM: ""
         SWIFT_OBJC_BRIDGING_HEADER: "MyTVBox/MyTVBox-Bridging-Header.h"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        OTHER_LDFLAGS: "$(inherited) -lc++"
     info:
       path: MyTVBox/Info.plist
       properties:
         CFBundleDisplayName: NewBox
         CFBundleIdentifier: com.newbox.ios
-        CFBundleShortVersionString: "1.6.0"
-        CFBundleVersion: "20261111.16"
+        CFBundleShortVersionString: "1.7.0"
+        CFBundleVersion: "20261112.17"
         MinimumOSVersion: "16.0"
         UILaunchScreen: {}
         UIBackgroundModes:
