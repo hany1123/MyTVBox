@@ -46,6 +46,27 @@ enum CrossSiteResolver {
         let items: [VideoItem]
     }
 
+    /// 1.8.4：一次站点搜索的结果 + 「这个站是不是真的失败了」。
+    /// 只有抛错/超时才算失败；正常返回空列表只是「没这部片」，不能拉黑。
+    private struct FetchResult: @unchecked Sendable {
+        let batch: Batch?
+        let failed: Bool
+        let key: String
+    }
+
+    private static func fetchOne(idx: Int, site: Site, kw: String,
+                                 per: Int, timeout: TimeInterval) async -> FetchResult {
+        do {
+            let items = try await APIService.shared.searchVideos(
+                site: site, keyword: kw, timeout: timeout)
+            return FetchResult(batch: Batch(index: idx, site: site,
+                                            items: Array(items.prefix(per))),
+                               failed: false, key: site.key)
+        } catch {
+            return FetchResult(batch: nil, failed: true, key: site.key)
+        }
+    }
+
     // MARK: - 站点筛选
 
     /// 可用于 CMS 搜索的站点：排除 JAR 型、无 http api、显式标注不可搜索的站点
@@ -146,7 +167,16 @@ enum CrossSiteResolver {
                                       maxSites: Int = 24,
                                       concurrency: Int = 16,
                                       budget: TimeInterval = 0) async -> [SiteSearchResult] {
-        let targets = Array(usableSites(sites).prefix(max(1, maxSites)))
+        // 1.8.4：跳过「连续失败」的坏站。老大问「慢是不是某些站点没加载导致的」——
+        // 正是。以前每搜一次都要重新撞一遍这些站，每次都白等一个超时。
+        let all = usableSites(sites)
+        let healthy = all.filter { !SiteHealth.shared.isCooling($0.key) }
+        let pool = healthy.isEmpty ? all : healthy   // 全被冷却了就照常全量，别把结果搜没了
+        let skipped = all.count - pool.count
+        if skipped > 0 {
+            SessionTrace.mark("记 搜索 \(keyword) 跳过冷却 \(skipped) 站")
+        }
+        let targets = Array(pool.prefix(max(1, maxSites)))
         guard !targets.isEmpty else { return [] }
 
         let t0 = Date()
@@ -156,43 +186,43 @@ enum CrossSiteResolver {
         let indexed = Array(targets.enumerated())
         let width = max(1, min(concurrency, indexed.count))
 
+        // 1.8.4：滑动窗口取代「固定 12 个一批」。
+        // 旧写法 `for await batch in group` 要等整批都回来才开下一批，一批里只要
+        // 混进一个 5 秒超时的坏站，整批就被拖满 5 秒 —— 5 批 = 25 秒，和真机
+        // 23.3 秒实测完全对上。现在谁先完成谁空出槽位、立刻补下一个站，
+        // 坏站只占一个槽，不再拖住别的站。
         var batches: [Batch] = []
-        var start = 0
-        while start < indexed.count {
-            // 1.8.2：页面已经退了（详情页被 dismiss / 搜索被新词取代）就别再往下扫了。
-            // 不判取消的话，跨站接管会把 60 个站跑完还占着闸，用户接下来的搜索只能排队。
-            if Task.isCancelled { break }
-            let end = min(start + width, indexed.count)
-            let slice = Array(indexed[start..<end])
-            let part: [Batch] = await withTaskGroup(
-                of: Batch?.self,
-                returning: [Batch].self
-            ) { group in
-                for (idx, site) in slice {
-                    group.addTask {
-                        do {
-                            let items = try await APIService.shared.searchVideos(
-                                site: site, keyword: kw, timeout: 5
-                            )
-                            return Batch(index: idx, site: site, items: Array(items.prefix(per)))
-                        } catch {
-                            return nil
-                        }
-                    }
+        let siteTimeout: TimeInterval = 3
+        var cursor = 0
+
+        await withTaskGroup(of: FetchResult.self) { group in
+            func addNext() {
+                guard cursor < indexed.count else { return }
+                let (idx, site) = indexed[cursor]
+                cursor += 1
+                group.addTask {
+                    await Self.fetchOne(idx: idx, site: site, kw: kw,
+                                        per: per, timeout: siteTimeout)
                 }
-                var collected: [Batch] = []
-                for await batch in group {
-                    if let batch = batch { collected.append(batch) }
-                }
-                return collected
             }
-            batches.append(contentsOf: part)
-            start = end
-            // 1.8.3：总时限。1.8.1 真机「入夜不再」60 站跑满要 23.3 秒，
-            // 5 批里最慢那批往往只贡献几条边角结果，不值得让用户干等。
-            // budget 到点就收，已有批次照常出结果（0 = 不限，别处调用不变）。
-            if budget > 0, Date().timeIntervalSince(t0) >= budget { break }
+
+            for _ in 0..<width { addNext() }
+
+            while let r = await group.next() {
+                SiteHealth.shared.note(r.key, ok: !r.failed)
+                if let b = r.batch { batches.append(b) }
+
+                // 1.8.2：页面已退 / 搜索被新词取代 → 收手，别占着重活闸
+                if Task.isCancelled { group.cancelAll(); break }
+                // 1.8.3：总时间预算到点 → 取消在飞的，用已拿到的结果出报告
+                if budget > 0, Date().timeIntervalSince(t0) >= budget {
+                    group.cancelAll()
+                    break
+                }
+                addNext()
+            }
         }
+        SiteHealth.shared.flush()
 
         let ordered = batches.sorted { $0.index < $1.index }
         var out: [SiteSearchResult] = []

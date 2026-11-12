@@ -112,7 +112,10 @@ final class APIService {
                       timeout: TimeInterval? = nil) async throws -> [VideoItem] {
         if NodeRelayService.isNodeSite(site) {
             let body: [String: Any] = ["wd": keyword, "page": 1]
-            let r = try? await NodeRelayService.shared.call(
+            // 1.8.4：不再用 `try?` 吞错。以前「站点超时」和「站点没这部片」
+            // 都返回空数组，CrossSiteResolver 分不清，于是坏站永远不会被拉黑，
+            // 每次搜索都重新白等一次超时（这就是慢的根因）。
+            let r = try await NodeRelayService.shared.call(
                 site: site, method: "search", body: body,
                 timeout: timeout ?? 20)
             let resp: APIResponse? = decodeSpider(r)

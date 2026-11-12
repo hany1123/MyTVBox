@@ -56,6 +56,7 @@ struct DiagnosticsView: View {
             kv("启用接口", "\(appState.enabledSubscriptions.count) 个")
             kv("当前站点", siteLabel)
             kv("海报缓存", "420px 缩略 · 96 张 / 28MB")
+            kv("站点健康", "\(SiteHealth.shared.coolingKeys().count) 站冷却中")
             kv("App 版本", appVersion)
         }
         .padding(14)
@@ -101,6 +102,27 @@ struct DiagnosticsView: View {
                 SessionTrace.mark("手 清理海报缓存")
             } label: {
                 Label("清空海报缓存", systemImage: "photo.badge.arrow.down.fill")
+                    .font(TVBoxTheme.text(13, weight: .semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(TVBoxTheme.surface)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(TVBoxTheme.stroke, lineWidth: 1)
+                    )
+                    .foregroundStyle(TVBoxTheme.accent)
+            }
+            .buttonStyle(.plain)
+
+            // 1.8.4：万一某个站被误拉黑（临时网络抖动），一键恢复全量搜索
+            Button {
+                SiteHealth.shared.reset()
+                SessionTrace.mark("手 重置站点健康记录")
+            } label: {
+                Label("重置站点健康（恢复全量搜索）", systemImage: "arrow.uturn.backward")
                     .font(TVBoxTheme.text(13, weight: .semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 11)

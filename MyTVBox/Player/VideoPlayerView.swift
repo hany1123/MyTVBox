@@ -189,6 +189,10 @@ struct VideoPlayerView: View {
         .onAppear {
             // 1.8.0：面包屑 —— 播放页是闪退高发区（AVPlayer + 端上 Node 同进程）
             SessionTrace.mark("开 播放 \(videoDetail.vodName) 线路 \(allSources.count)")
+            // 1.8.4：进播放页先把海报位图全释放（最多 28MB），
+            // 给马上要来的视频解码缓冲腾地方。
+            RemoteImageLoader.shared.clearCache()
+            SessionTrace.mark("记 播放 已释放海报缓存")
             // 注入站点级换源：线路全部耗尽时，去当前配置的其它 CMS 站点找同名片
             // @StateObject 的 wrappedValue 在 View 内会被解析成 Binding，
             // 先取出实例引用再改其属性，避免 dynamicMember 下标报错
@@ -218,6 +222,8 @@ struct VideoPlayerView: View {
             viewModel.saveProgress()
             hideTask?.cancel()
             TabBarVisibility.setHidden(false)
+            // 1.8.4：正常退出也要写「完」，否则下次诊断永远误报「崩在播放」
+            SessionTrace.mark("完 播放 \(videoDetail.vodName) 正常退出")
         }
     }
 

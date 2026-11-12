@@ -6,8 +6,8 @@ options:
   xcodeVersion: "15.0"
 settings:
   base:
-    MARKETING_VERSION: "1.8.3"
-    CURRENT_PROJECT_VERSION: "20261112.30"
+    MARKETING_VERSION: "1.8.4"
+    CURRENT_PROJECT_VERSION: "20261112.31"
     DEVELOPMENT_TEAM: ""
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
@@ -57,8 +57,8 @@ targets:
       properties:
         CFBundleDisplayName: NewBox
         CFBundleIdentifier: com.newbox.ios
-        CFBundleShortVersionString: "1.8.3"
-        CFBundleVersion: "20261112.30"
+        CFBundleShortVersionString: "1.8.4"
+        CFBundleVersion: "20261112.31"
         MinimumOSVersion: "16.0"
         UILaunchScreen: {}
         UIBackgroundModes:

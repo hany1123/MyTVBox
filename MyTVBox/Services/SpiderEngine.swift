@@ -533,13 +533,25 @@ final class SpiderEngine {
         // 1.7.8：/config 到底慢在哪一步，直接看这两行
         out.append("本机源配置    : " + LocalSourceCache.lastProbe)
         out.append("配置缓存      : " + LocalSourceCache.describe())
+        // 1.8.4：老大问「慢是不是某些站点没加载」—— 直接把被跳过的坏站列出来
+        let cooling = SiteHealth.shared.coolingKeys()
+        out.append("站点健康      : " + (cooling.isEmpty
+            ? "无冷却站（每个站都参与搜索）"
+            : "冷却 \(cooling.count) 站（连续失败 ≥3 次，10 分钟内跳过）"))
+        if !cooling.isEmpty {
+            out.append("冷却站点      : " + cooling.prefix(12).joined(separator: ", ")
+                       + (cooling.count > 12 ? " …" : ""))
+            out.append("              : 这些站每次搜索都要等满超时，是「慢」的主因；成功一次会自动解禁")
+        }
         // 1.8.0：闪退定位 —— 上次最后停在哪个动作上（`开` 之后没有对应的 `完`）
         // 1.8.2：只认「本次启动线之前」的内容，且必须同时给出上一轮最后一行。
         // 上一版只找 `开 `，最后一行是 `弃 搜索` 时就报「无记录」—— 恰是崩溃现场。
         if let step = SessionTrace.interruptedStep() {
             out.append("上次最后停在  : \(step)（这一步没走完 → 崩在这里）")
         } else if let last = SessionTrace.previousLastLine() {
-            out.append("上次最后停在  : \(last)（正常收尾，不是崩在这一步）")
+            // 1.8.4：措辞改中性。末行是 `弃/记/完` 不代表一定正常收尾 ——
+            // 进程完全可能死在那一行之后、下一个动作还没来得及写「开」。
+            out.append("上次最后停在  : \(last)（上一轮末行；若仍闪退，则崩在这条之后）")
         } else {
             out.append("上次最后停在  : （本版首次启动，还没有上一轮记录）")
         }

@@ -3,6 +3,7 @@ import AVKit
 import AVFoundation
 import Combine
 import SwiftUI
+import UIKit
 
 @MainActor
 final class VideoPlayerViewModel: ObservableObject {
@@ -114,8 +115,10 @@ final class VideoPlayerViewModel: ObservableObject {
 
     // MARK: - 播放参数
 
-    /// 预读缓冲时长（秒）。系统默认 0 = 自适应，通常只留 2~3 秒，稍微抖一下就卡
-    private let forwardBufferSeconds: Double = 6
+    /// 预读缓冲时长（秒）。1.8.4：6 → 2。
+    /// 端上 Node 与 AVPlayer 在**同一个进程**里，6 秒预读会让视频缓冲区
+    /// 长期占着几十 MB；播放页实测 9 秒就被系统回收，先把它压到够用的 2 秒。
+    private let forwardBufferSeconds: Double = 2
     /// 超过这个时间还没 readyToPlay 就提示线路慢
     private let slowLineThreshold: Double = 12
     /// 连续缓冲超过这个时间就自动换一条线路（1.4.9 从 20s 收紧到 12s，
@@ -154,6 +157,20 @@ final class VideoPlayerViewModel: ObservableObject {
 
         configureAudioSession()
         attachObservers()
+
+        // 1.8.4：播放页收到内存警告时主动释放 asset 缓存 / 取消预热。
+        // 视频缓冲是可重建的，进程被 Jetsam 杀掉才是不可逆的。
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.cancelPrewarm()
+                self.assetCache.removeAll()
+                self.assetOrder.removeAll()
+                SessionTrace.mark("警 播放页内存警告 → 清 asset 缓存")
+            }
+        }
     }
 
     deinit {
@@ -444,9 +461,13 @@ final class VideoPlayerViewModel: ObservableObject {
 
     private func makeItem(for url: URL) -> AVPlayerItem {
         let item = AVPlayerItem(asset: makeAsset(for: url))
-        // 多留点预读，减少抖动导致的卡顿（只影响后台预读，不影响起播）
         item.preferredForwardBufferDuration = forwardBufferSeconds
-        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        // 1.8.4：限制 HLS 变体峰值码率。猫爪源不少线路是 4K/高码率 master playlist，
+        // AVPlayer 默认会挑它能扛的最高档 —— 解码缓冲区 + Node 的 V8 堆同时顶上来，
+        // 就是播放页被 Jetsam 的典型姿势。3 Mbps 足够手机/投影清晰播放。
+        item.preferredPeakBitRate = 3_000_000
+        // 暂停时不再继续吃带宽/内存预读（旧值 true 会在后台一直缓冲）
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
         return item
     }
 
@@ -462,14 +483,10 @@ final class VideoPlayerViewModel: ObservableObject {
         // 放进 asset 缓存，切集时直接复用
         _ = makeAsset(for: url)
 
-        let urlString = url.absoluteString
-        prewarmTask?.cancel()
-        prewarmTask = Task {
-            // 只解析不播放，失败静默；系统会因此对同 host 建立并保留连接
-            guard let target = URL(string: urlString) else { return }
-            let asset = AVURLAsset(url: target)
-            _ = try? await asset.load(.isPlayable)
-        }
+        // 1.8.4：删掉「再建一个 AVURLAsset 并 load(.isPlayable)」这一步。
+        // 旧版在起播后 3 秒就会额外拉一条 HLS playlist，等于和正在缓冲的主流
+        // 抢带宽、抢内存；1.8.3 真机崩在「开 播放」后约 9 秒，正好落在这个窗口。
+        // 现在只保留上面那一步轻量缓存，切集仍然能省掉 asset 构造。
     }
 
     private func cancelPrewarm() {
@@ -840,6 +857,9 @@ final class VideoPlayerViewModel: ObservableObject {
                     self.isLoading = false
                     self.slowLineHint = nil
                     self.slowTimer?.cancel()
+                    // 1.8.4：补上「完 播放」。旧版只有「开 播放」没有配对，
+                    // 于是只要用户最后进过播放器，诊断就永远误报「崩在播放」。
+                    SessionTrace.mark("完 播放 \(self.videoDetail.vodName) 首帧就绪")
                     let dur = item.duration.seconds
                     if dur.isFinite { self.duration = dur }
                     // 1.5.2 稳健续播：等可 seek 区间就绪、带 completion 校验、失败重试
@@ -850,11 +870,13 @@ final class VideoPlayerViewModel: ObservableObject {
                     if let h = self.autoSwitchHint, h.hasPrefix("正在"), self.hintClearTask == nil {
                         self.showHint(h, hold: 1.2)
                     }
-                    // 起播稳定后再预热下一集，避免和当前流抢带宽
-                    Task { [weak self] in
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    // 起播稳定后再预热下一集，避免和当前流抢带宽。
+                    // 1.8.4：3 秒 → 20 秒，别在刚起播的内存高峰上再叠一件事。
+                    prewarmTask?.cancel()
+                    prewarmTask = Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: 20_000_000_000)
                         guard !Task.isCancelled else { return }
-                        self?.prewarmNextEpisode()
+                        await MainActor.run { self?.prewarmNextEpisode() }
                     }
                 case .failed:
                     self.isLoading = false
