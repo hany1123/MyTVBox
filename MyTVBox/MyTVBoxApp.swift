@@ -29,6 +29,10 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // 这类不产生 NSException，CrashGuard 永远抓不到。
         SignalGuard.install()
 
+        // 1.8.13：/play 高频内存采样日志的启动分界线。写在 bootToken 之前，
+        // 这样上一轮没有 END 的 spike 窗口能被明确切成「崩溃轮」。
+        SpikeProbe.shared.boot()
+
         // 1.8.2：写启动分界线。诊断里「上一轮最后一行」只认这条线之前的内容，
         // 否则本次会话里正在飞的 `开 搜索` 会被误报成上次闪退。
         SessionTrace.mark(SessionTrace.bootToken)

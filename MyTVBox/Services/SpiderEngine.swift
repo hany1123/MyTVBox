@@ -619,6 +619,23 @@ final class SpiderEngine {
         for line in logTail.split(separator: "\n", omittingEmptySubsequences: false) {
             out.append("  " + line)
         }
+        // 1.8.13：/play 轨迹单独成段，不塞进 60 行关键行窗口（mem1 每秒一条会挤掉 FATAL）
+        let playTrace = rt.playTraceLines()
+        out.append("node /play 轨迹（本次启动后，\(playTrace.count) 行）:")
+        if playTrace.isEmpty {
+            out.append("  (无 · 本次启动还没发起过取流 / createServer 包装未生效)")
+        } else {
+            for line in playTrace { out.append("  " + line) }
+        }
+        // 崩溃发生在上一轮，重开 App 才看得到诊断 —— 只给「本次」会全是空的
+        let prevTrace = rt.previousPlayTraceLines(limit: 45)
+        out.append("node /play 轨迹（上一轮，\(prevTrace.count) 行）:")
+        if prevTrace.isEmpty {
+            out.append("  (无 · 本版首次启动 / 日志被清理)")
+        } else {
+            for line in prevTrace { out.append("  " + line) }
+        }
+        out.append("/play 高频取样 : " + (SpikeProbe.shared.recentWindows(1).last?.describe ?? "无窗口（本次启动还没发起过取流）"))
         out.append("")
         // 1.8.5：不再押单一假设，把 6 类原因的证据逐项列出来
         out.append(contentsOf: CrashDiagnostic.lines())

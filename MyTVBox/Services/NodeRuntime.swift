@@ -594,6 +594,35 @@ final class NodeRuntime {
         return Array(hits.suffix(limit))
     }
 
+    /// 1.8.13：本次启动后 /play 相关的全部轨迹（REQ / RES / FETCH / BIGBODY / mem1）。
+    /// 与 keyLogLines 分开 —— mem1 在 /play 窗口内每秒一条，若混进 60 行关键行
+    /// 窗口，会把 FATAL 首行、shim 状态、rc=9 全挤掉（BF2 的坑不能再踩一次）。
+    func playTraceLines(sinceLastBoot: Bool = true, limit: Int = 90) -> [String] {
+        guard let s = try? String(contentsOf: logFile, encoding: .utf8) else { return [] }
+        var lines = s.split(separator: "\n").map(String.init)
+        if sinceLastBoot, let boot = lines.lastIndex(where: { $0.contains("=== boot ===") }) {
+            lines = Array(lines[boot...])
+        }
+        return Self.traceHits(lines, limit: limit)
+    }
+
+    /// 上一轮（倒数第二个 boot 到最后一个 boot 之间）的 /play 轨迹。
+    /// 崩溃发生在上一轮，用户重开 App 才看得到诊断 —— 只看「本次启动后」会全是空的。
+    func previousPlayTraceLines(limit: Int = 90) -> [String] {
+        guard let s = try? String(contentsOf: logFile, encoding: .utf8) else { return [] }
+        let lines = s.split(separator: "\n").map(String.init)
+        let boots = lines.indices.filter { lines[$0].contains("=== boot ===") }
+        guard boots.count >= 2 else { return [] }
+        let slice = Array(lines[boots[boots.count - 2]..<boots[boots.count - 1]])
+        return Self.traceHits(slice, limit: limit)
+    }
+
+    private static func traceHits(_ lines: [String], limit: Int) -> [String] {
+        let keys = ["REQ ", "RES ", "RES-ABORT", "FETCH ", "FETCHERR ",
+                    "BIGBODY", "MEM1 ", "mem1 ", "WARN reqtrace"]
+        return Array(lines.filter { line in keys.contains { line.contains($0) } }.suffix(limit))
+    }
+
     /// 1.8.7：端上 Node 写的 fetch 兼容层状态（独立文件，不必翻日志）
     var fetchShimText: String {
         guard let data = try? Data(contentsOf: shimFile),

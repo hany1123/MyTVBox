@@ -90,12 +90,35 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
         return out;
     }
 
-    function unpack(buf, enc) {
+    // 1.8.13：响应体硬上限。1.8.12 诊断里进程死在「/play 取流请求在飞」，
+    // 而 Node 侧原来的 chunks.push(d) 没有任何上限 —— 只要某个线路返回的不是
+    // JSON/m3u8 而是**视频流本身**，或者一个 gzip 压缩比极高的响应，
+    // Buffer.concat + zlib.*Sync 会在亚秒级把 phys_footprint 推高几百 MB，
+    // 随即被 Jetsam 以 SIGKILL 杀掉。1 秒一条的播放心跳根本采不到这个尖峰，
+    // 于是诊断看到「foot 111→110MB 平稳」却仍崩 —— 这是取证粒度问题，不是排除。
+    const MAX_BODY = 8 * 1024 * 1024;
+    const MAX_DECOMPRESSED = 16 * 1024 * 1024;
+
+    function shape(url) {
         try {
-            if (enc === 'gzip') return zlib.gunzipSync(buf);
-            if (enc === 'deflate') return zlib.inflateSync(buf);
-            if (enc === 'br') return zlib.brotliDecompressSync(buf);
-        } catch (e) { /* 解压失败就按原文处理 */ }
+            const u = new URLCtor(url);
+            // 脱敏：只留 host + path 前缀，不落带 token 的完整直链
+            return u.protocol + '//' + u.host + u.pathname.slice(0, 48);
+        } catch (e) { return '(bad-url)'; }
+    }
+
+    function unpack(buf, enc) {
+        if (!enc) return buf;
+        try {
+            const opt = { maxOutputLength: MAX_DECOMPRESSED };
+            if (enc === 'gzip') return zlib.gunzipSync(buf, opt);
+            if (enc === 'deflate') return zlib.inflateSync(buf, opt);
+            if (enc === 'br') return zlib.brotliDecompressSync(buf, opt);
+        } catch (e) {
+            // 1.8.13：解压失败必须让请求失败。旧实现会静默把压缩二进制当明文返回，
+            // 业务解析出乱码后继续重试，白烧一轮内存还看不出原因。
+            throw new Error('fetch shim: decompress failed (' + (e && e.message ? e.message : e) + ')');
+        }
         return buf;
     }
 
@@ -115,41 +138,91 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
                 path: u.pathname + u.search,
                 headers: plainHeaders(opts.headers)
             };
+            const t0 = Date.now();
+            const tag = shape(url);
+            let settled = false;
+            let received = 0;
+
+            function settleErr(e) {
+                if (settled) return;
+                settled = true;
+                log('FETCHERR ' + tag + ' ms=' + (Date.now() - t0) + ' got=' + received + 'B '
+                    + String(e && e.message ? e.message : e).slice(0, 100));
+                reject(e);
+            }
+            function settleOK(v, raw, out, enc, code) {
+                if (settled) return;
+                settled = true;
+                log('FETCH ' + tag + ' status=' + code + ' ms=' + (Date.now() - t0)
+                    + ' raw=' + Math.round(raw / 1024) + 'KB out=' + Math.round(out / 1024)
+                    + 'KB enc=' + (enc || '-'));
+                resolve(v);
+            }
+
             // 不主动声明 accept-encoding；服务端若仍返回压缩，unpack() 负责解
             const req = mod.request(reqOpts, (res) => {
                 const chunks = [];
-                res.on('data', (d) => chunks.push(d));
+                res.on('data', (d) => {
+                    if (settled) return;
+                    received += d.length;
+                    if (received > MAX_BODY) {
+                        log('BIGBODY ' + tag + ' got=' + received + 'B > ' + MAX_BODY + 'B · 已中止');
+                        try { res.destroy(); } catch (e) {}
+                        try { req.destroy(); } catch (e) {}
+                        settleErr(new Error('fetch shim: body too large (> ' + MAX_BODY + 'B)'));
+                        return;
+                    }
+                    chunks.push(d);
+                });
+                // 1.8.13：原来只接了 'end'。服务端中途断开时 'end' 不触发，
+                // Promise 永久 pending —— 这正是「/play 请求在飞、未见返回」的
+                // 另一个成因。现在 aborted / error 一律收口成 reject。
+                res.on('aborted', () => settleErr(new Error('fetch shim: response aborted')));
+                res.on('error', (e) => settleErr(e));
                 res.on('end', () => {
+                    if (settled) return;
                     const code = res.statusCode || 0;
                     const loc = res.headers.location;
                     if (code >= 300 && code < 400 && loc && redirects > 0) {
                         let next = null;
                         try { next = new URLCtor(loc, url).toString(); } catch (e) {}
-                        if (next) { once(next, opts, redirects - 1).then(resolve, reject); return; }
+                        if (next) {
+                            // 重定向不是本请求的结局，交给下一跳去写 FETCH 行
+                            settled = true;
+                            once(next, opts, redirects - 1).then(resolve, reject);
+                            return;
+                        }
                     }
-                    const raw = Buffer.concat(chunks);
-                    const buf = unpack(raw, String(res.headers['content-encoding'] || '').toLowerCase());
-                    const hdrs = {
-                        get: (k) => {
-                            const v = res.headers[String(k).toLowerCase()];
-                            return Array.isArray(v) ? v.join(', ') : (v == null ? null : String(v));
-                        },
-                        forEach: (fn) => Object.keys(res.headers).forEach((k) => fn(String(res.headers[k]), k))
-                    };
-                    resolve({
-                        ok: code >= 200 && code < 300,
-                        status: code,
-                        statusText: res.statusMessage || '',
-                        headers: hdrs,
-                        url: url,
-                        redirected: false,
-                        text: () => Promise.resolve(buf.toString('utf8')),
-                        json: () => Promise.resolve(JSON.parse(buf.toString('utf8'))),
-                        arrayBuffer: () => Promise.resolve(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength))
-                    });
+                    let buf;
+                    try {
+                        const raw = Buffer.concat(chunks);
+                        const enc = String(res.headers['content-encoding'] || '').toLowerCase();
+                        buf = unpack(raw, enc);
+                        const hdrs = {
+                            get: (k) => {
+                                const v = res.headers[String(k).toLowerCase()];
+                                return Array.isArray(v) ? v.join(', ') : (v == null ? null : String(v));
+                            },
+                            forEach: (fn) => Object.keys(res.headers).forEach((k) => fn(String(res.headers[k]), k))
+                        };
+                        const value = {
+                            ok: code >= 200 && code < 300,
+                            status: code,
+                            statusText: res.statusMessage || '',
+                            headers: hdrs,
+                            url: url,
+                            redirected: false,
+                            text: () => Promise.resolve(buf.toString('utf8')),
+                            json: () => Promise.resolve(JSON.parse(buf.toString('utf8'))),
+                            arrayBuffer: () => Promise.resolve(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength))
+                        };
+                        settleOK(value, raw.length, buf.length, enc, code);
+                    } catch (e) {
+                        settleErr(e);
+                    }
                 });
             });
-            req.on('error', reject);
+            req.on('error', settleErr);
             req.setTimeout(20000, () => req.destroy(new Error('fetch shim: timeout')));
             if (opts.signal) {
                 const sig = opts.signal;
@@ -188,6 +261,78 @@ log('PORT=' + process.env.PORT + ' HOST=' + process.env.HOST + ' NODE_ENV=' + pr
     };
     log('fetch shim: installed (WebAssembly missing → http/https fallback)');
     writeShim(true, false);
+})();
+
+// ---------------------------------------------------------------------------
+// 1.8.13：/play 在飞取证
+//
+// 1.8.12 的判别器只能说「/play 取流请求在飞（未见返回）」，因为 Swift 侧
+// 只看得到「发起」和「结束」两个面包屑，中间整段是黑的：请求到底有没有进
+// Node？Node 有没有回？是 Node 卡在事件循环、卡在外网 fetch，还是回包时
+// 进程已经没了？三种情况修法完全不同，不能靠猜。
+//
+// 在 require(bundle) 之前包装 http.createServer，给每个进来的请求补一个
+// 观察 listener（不改原有 listener 的行为）：
+//   REQ /spider/.../play      → 请求进 Node 了
+//   RES ... status/ms/bytes   → Node 回包了（finish）
+//   RES-ABORT ...             → 连接中途断了，Swift 侧会一直等
+// 同时 /play 窗口内开 1 秒一条的 mem1（含 external / arrayBuffers），
+// 这是 Node 侧 Buffer 的直接指标，与 Swift 的 phys_footprint 曲线对齐。
+// ---------------------------------------------------------------------------
+(function installRequestTrace() {
+    try {
+        const http = require('http');
+        const orig = http.createServer;
+        let memTimer = null;
+        let memStopAt = 0;
+
+        function startMem1(reason) {
+            if (memTimer) return;
+            log('MEM1 start ' + reason);
+            memStopAt = Date.now() + 25000;
+            memTimer = setInterval(() => {
+                try {
+                    const m = process.memoryUsage();
+                    log('mem1 heap=' + Math.round(m.heapUsed / 1048576) + 'MB'
+                        + ' rss=' + Math.round(m.rss / 1048576) + 'MB'
+                        + ' ext=' + Math.round(m.external / 1048576) + 'MB'
+                        + ' buf=' + Math.round((m.arrayBuffers || 0) / 1048576) + 'MB');
+                } catch (e) { /* 忽略 */ }
+                if (Date.now() > memStopAt) {
+                    clearInterval(memTimer);
+                    memTimer = null;
+                    log('MEM1 stop');
+                }
+            }, 1000);
+            if (memTimer.unref) memTimer.unref();
+        }
+
+        http.createServer = function () {
+            const server = orig.apply(this, arguments);
+            try {
+                server.on('request', (req, res) => {
+                    const p = String(req.url || '').split('?')[0];
+                    const t0 = Date.now();
+                    log('REQ ' + (req.method || '?') + ' ' + p);
+                    if (p.indexOf('/play') >= 0) startMem1(p);
+                    res.once('finish', () => {
+                        const cl = res.getHeader ? res.getHeader('content-length') : null;
+                        log('RES ' + p + ' status=' + res.statusCode
+                            + ' ms=' + (Date.now() - t0) + ' len=' + (cl == null ? -1 : cl));
+                    });
+                    res.once('close', () => {
+                        if (!res.writableFinished) {
+                            log('RES-ABORT ' + p + ' ms=' + (Date.now() - t0));
+                        }
+                    });
+                });
+            } catch (e) { log('WARN reqtrace: ' + (e && e.message ? e.message : e)); }
+            return server;
+        };
+        log('reqtrace: http.createServer wrapped');
+    } catch (e) {
+        log('WARN reqtrace install: ' + (e && e.message ? e.message : e));
+    }
 })();
 
 process.on('uncaughtException', (e) => {

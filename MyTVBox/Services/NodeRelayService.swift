@@ -241,6 +241,12 @@ final class NodeRelayService {
             SessionTrace.mark("败 取流 原因=无可用 baseURL"); return nil
         }
         let endpoint = base + "/spider/" + key + "/" + type + "/play"
+        // 1.8.13：/play 是崩溃高发窗口（1.8.12 死在「请求在飞、未见返回」）。
+        // 开 100ms 高频内存采样；defer 保证成功 / 失败 / 抛错都会写 END。
+        // 进程若被 SIGKILL，spike.log 里就留下一个没有 END 的窗口，
+        // 峰值与「单次最大跃升」能在下一轮诊断里直接读到。
+        SpikeProbe.shared.start("/play " + key)
+        defer { SpikeProbe.shared.stop("/play " + key) }
         let r: [String: Any]
         do {
             r = try await postJSON(endpoint, body: ["id": id], timeout: 20)
@@ -297,6 +303,13 @@ final class NodeRelayService {
         req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
         let (data, resp) = try await Self.session.data(for: req)
+        // 1.8.13：Node 侧 fetch shim 已有 8MB 上限，这里是 Swift 侧第二道闸。
+        // /play 正常只回几 KB JSON；若回了几 MB，说明有线路把整段内容塞进响应，
+        // 光是 data(for:) 的这一次分配就够把 phys_footprint 顶上去。
+        if data.count > 4 * 1024 * 1024 {
+            SessionTrace.mark("阻 取流 响应体 \(data.count / 1024)KB 超过 4MB，丢弃")
+            throw NetworkError.decodingFailed("Node 响应体过大 \(data.count) B")
+        }
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard (200...299).contains(status) else {
             throw NetworkError.decodingFailed("Node 服务返回 \(status)")

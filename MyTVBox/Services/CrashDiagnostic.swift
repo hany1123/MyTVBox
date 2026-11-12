@@ -67,7 +67,7 @@ enum CrashDiagnostic {
             || nodeLog.contains("FATAL uncaught")
             || nodeLog.contains("FATAL unhandled")
         let nodeExit = nodeLog.contains("EXIT code=")
-        let nodeMemLines = NodeRuntime.shared.tailLog(lines: 400).split(separator: "\n")
+        let nodeMemLines = NodeRuntime.shared.tailLog(lines: 1200).split(separator: "\n")
             .filter { $0.contains("mem10 ") || $0.contains("mem HIGH") }
 
         var out: [String] = []
@@ -109,9 +109,15 @@ enum CrashDiagnostic {
                            + (interrupted ? "**被截断（进程消失）**" : "完整收尾"))
                 let verdict: String
                 if interrupted && footList.count < 3 {
-                    verdict = "**证据不足，不能排除 Jetsam**：曲线在跃升刚开始处被砍断（只有 \(footList.count) 条心跳、无「完 心跳」），按 \(Int(rate))MB/s 外推 3 秒还会再涨约 \(Int(rate * 3))MB。1.8.9 那次是播到 t=6s 且正常退出，那才叫真平稳"
+                    // 1.8.13：rate=0 时不能再写「跃升刚开始处被砍断」——
+                    // 没有上升苗头就说没有，同时点明 1s 心跳抓不到亚秒级尖峰。
+                    let shapeText = rate > 0
+                        ? "曲线在跃升刚开始处被砍断（只有 \(footList.count) 条心跳、无「完 心跳」），按 \(Int(rate))MB/s 外推 3 秒还会再涨约 \(Int(rate * 3))MB"
+                        : "曲线被砍断且未见上升苗头（只有 \(footList.count) 条心跳、无「完 心跳」）；但 1s 心跳采不到亚秒级尖峰，不能据此排除"
+                    verdict = "**证据不足，不能排除 Jetsam**：" + shapeText
+                        + "。1.8.9 那次是播到 t=6s 且正常退出，那才叫真平稳；本轮请看 [9] 的 100ms 采样"
                 } else if jump < 40 && fp < 400 {
-                    verdict = "**按现有证据基本排除 Jetsam**（曲线完整，foot 平稳且绝对值不高）"
+                    verdict = "**按现有证据基本排除 Jetsam**（1s 心跳曲线完整、foot 平稳且绝对值不高；若 [9] 抓到尖峰则以 [9] 为准）"
                 } else {
                     verdict = "**高度可疑**（foot 明显跃升，优先查视频侧缓冲与 Node V8 堆）"
                 }
@@ -119,11 +125,15 @@ enum CrashDiagnostic {
             } else {
                 out.append("     foot 判读      : 本版心跳应带 foot=；若为空请回报（task_vm_info 在该设备读取失败）")
             }
-            // 1.8.12：node.log 的 mem10 是另一条独立曲线。1.8.11 里 Node RSS
-            // 144→164→182MB 与 App RSS 186→232MB 同步上涨，说明内存在 Node 侧
-            // （跨站搜索 + /play 同时在跑），不是纯 AVFoundation 解码缓冲。
-            let nodeRssList: [Int] = NodeRuntime.shared.tailLog(lines: 400)
-                .split(separator: "\n")
+            // 1.8.13：原来从 tail 400 行直接取 mem10，跨了好几次 === boot ===，
+            // 于是 1.8.12 里「177→154MB」这种下降曲线也被硬写成「同步上涨、
+            // 内存在 Node 侧」。现在只取本次启动之后的样本，
+            // 并按真实趋势措辞，不再预设结论。
+            let bootScoped = NodeRuntime.shared.tailLog(lines: 1200)
+                .split(separator: "\n").map(String.init)
+            let bootIdx = bootScoped.lastIndex(where: { $0.contains("=== boot ===") })
+                ?? bootScoped.startIndex
+            let nodeRssList: [Int] = bootScoped[bootIdx...]
                 .filter { $0.contains("mem10 ") }
                 .suffix(8)
                 .compactMap { line in
@@ -132,7 +142,15 @@ enum CrashDiagnostic {
                     return Int(digits)
                 }
             if !nodeRssList.isEmpty {
-                out.append("     Node RSS       : 最近 \(nodeRssList.count) 条 mem10 样本 \(nodeRssList.first ?? 0)→\(nodeRssList.last ?? 0)MB（峰值 \(nodeRssList.max() ?? 0)MB）· 与 App RSS 同步上涨 = 内存在 Node 侧；不同步才更像视频解码缓冲")
+                let nf = nodeRssList.first ?? 0
+                let nl = nodeRssList.last ?? 0
+                let nt = nl - nf
+                let trendText = nt > 12 ? "上升" : (nt < -12 ? "下降" : "平稳")
+                out.append("     Node RSS       : 本次启动 \(nodeRssList.count) 条 mem10 样本 \(nf)→\(nl)MB"
+                           + "（峰值 \(nodeRssList.max() ?? 0)MB）· 趋势 \(trendText)（\(nt >= 0 ? "+" : "")\(nt)MB）")
+                out.append("     判读          : " + (trendText == "上升"
+                    ? "Node 侧在涨，倾向跨站搜索 / fetch 缓冲区持续占用；再看 [9] 的 mem1 buf="
+                    : "Node 侧无明显持续增长，压力更可能来自一次性大分配或视频侧映射（看 [9] 的 100ms 尖峰）"))
             }
         }
 
@@ -223,6 +241,65 @@ enum CrashDiagnostic {
                       ? "有「完 心跳」→ 播放页主动消失，心跳是正常收尾"
                       : "**无「完 心跳」→ 进程被直接终止**，末条心跳即最后存活证据"))
         out.append("     死亡时刻      : `启 启动` 是老大重开 App 的时间，不是进程消失时刻；以末条心跳为准")
+
+        // 9. /play 在飞取证 —— 1.8.13
+        // 1.8.12 死在「/play 取流请求在飞」，[1] 的 1s 心跳只给出
+        //「foot 111→110MB 平稳」。这里补两个此前完全空白的证据源：
+        //   spike.log 的 100ms 采样（亚秒尖峰）、node.log 的 REQ/RES/FETCH 轨迹。
+        var trace = NodeRuntime.shared.playTraceLines()
+        var traceLabel = "本次"
+        let prevTrace = NodeRuntime.shared.previousPlayTraceLines()
+        if !trace.contains(where: { $0.contains("REQ ") && $0.contains("/play") }),
+           !prevTrace.isEmpty {
+            // 崩溃轮是上一轮；本次刚重开还没发起取流，只看本次会得出「无请求」的错误结论
+            trace = prevTrace
+            traceLabel = "上一轮"
+        }
+        let reqPlay = trace.filter { $0.contains("REQ ") && $0.contains("/play") }
+        let resPlay = trace.filter { $0.contains("RES ") && $0.contains("/play") }
+        let aborted = trace.filter { $0.contains("RES-ABORT") }
+        let bigBody = trace.filter { $0.contains("BIGBODY") }
+        let fetchErr = trace.filter { $0.contains("FETCHERR") }
+        let mem1 = trace.filter { $0.contains("mem1 ") }
+        let wins = SpikeProbe.shared.recentWindows(2)
+        out.append("[9] /play 在飞取证 : spike 窗口 \(wins.count) 个 · \(traceLabel) Node 轨迹 \(trace.count) 行"
+                   + "（REQ /play \(reqPlay.count) / RES /play \(resPlay.count) / ABORT \(aborted.count)"
+                   + " / BIGBODY \(bigBody.count) / FETCHERR \(fetchErr.count) / mem1 \(mem1.count)）")
+        if wins.isEmpty {
+            out.append("     spike.log     : 无窗口（本版首次运行，或没走过 mytvboxnode://play 解析）")
+        } else {
+            for (i, w) in wins.enumerated() {
+                out.append("     窗口\(i + 1) \(w.ended ? "正常" : "**无 END=崩溃轮**") : " + w.describe)
+            }
+            if let crash = wins.reversed().first(where: { !$0.ended }) {
+                let v9: String
+                if crash.peak >= 400 || crash.maxJump >= 80 {
+                    v9 = "**Jetsam 高度可疑**：100ms 采样抓到了 1s 心跳看不到的尖峰"
+                        + "（峰值 \(crash.peak)MB / 单次 +\(crash.maxJump)MB）→ 内存主要来自 Node fetch 响应体或视频侧映射"
+                } else if crash.samples > 0 {
+                    v9 = "**尖峰证据阴性**：100ms 采样全程 \(crash.first)→\(crash.peak)MB 平稳，"
+                        + "但窗口无 END → 进程仍是被直接终止；优先查 Node 请求悬空 / 事件循环阻塞 / 系统回收，别再只盯内存"
+                } else {
+                    v9 = "窗口无采样，证据不足"
+                }
+                out.append("     结论          : " + v9)
+            }
+        }
+        if resPlay.isEmpty && !reqPlay.isEmpty {
+            out.append("     Node 请求     : **REQ 已进 Node、但没有 RES** → /play 在 Node 侧没回包"
+                       + "（外网 fetch 挂住 / 同步 CPU 阻塞 / 回包前进程被杀）")
+        } else if !resPlay.isEmpty {
+            out.append("     Node 请求     : REQ→RES 成对，Node 回包了；若 Swift 侧仍无「/play 结束」，问题在 Swift 侧")
+        } else if !reqPlay.isEmpty {
+            out.append("     Node 请求     : 已有 /play 请求轨迹，但 createServer 包装未覆盖到该路由")
+        }
+        if let b = bigBody.last { out.append("     大响应体      : " + b) }
+        for l in fetchErr.suffix(2) { out.append("     fetch 失败    : " + l) }
+        if let m = mem1.last {
+            out.append("     Node mem1     : " + m + " · buf= 是响应 Buffer 的直接指标")
+        }
+        out.append("     判据          : 1s 心跳与 100ms 采样冲突时以 100ms 为准；SIGKILL 抓不到，"
+                   + "「无 END」+「尖峰」= Jetsam，「无 END」+「全程平稳」= 请求悬空或其他终止")
 
         // 心跳覆盖度
         if beats.isEmpty {
