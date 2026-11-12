@@ -76,7 +76,10 @@ final class APIService {
     func fetchVideoDetail(site: Site, vodId: String,
                           timeout: TimeInterval? = nil) async throws -> VideoDetail? {
         if NodeRelayService.isNodeSite(site) {
-            let r = try? await NodeRelayService.shared.call(
+            // 1.8.2：原来是 `try?` 把 Node 侧错误吞成 nil，诊断里只看到「空响应 0ms」，
+            // 分不清是「站点没数据」还是「请求根本没发出去/被拒」。改为向上抛，
+            // 详情页的 catch 会把错误原文记进链路诊断。
+            let r = try await NodeRelayService.shared.call(
                 site: site, method: "detail", body: ["id": vodId],
                 timeout: timeout ?? 20)
             var dict = r ?? [:]

@@ -117,6 +117,10 @@ enum CrossSiteResolver {
     ///   `FATAL ERROR: Reached heap limit` → **整个 App 进程被 abort，表现就是闪退**。
     ///   分批后峰值内存与连接数都可控；16 路是 1.8.0 再压一档的取值（24 路仍偏多，
     ///   98 个站约 7 批，代价是总耗时多几秒，换来内存峰值明显下降）。
+    /// 1.8.2：所有聚合搜索都必须过 `HeavyWorkGate` 的闸。
+    /// 崩溃现场是「搜索页 60 站」与「详情页跨站接管 110 站」同时在跑，
+    /// Node 侧同时执行两批 spider，V8 堆撞顶 → abort。
+    /// 过闸后两件重活会排队，峰值只有一批。
     static func search(keyword: String,
                        in sites: [Site],
                        limitPerSite: Int = 12,
@@ -124,6 +128,22 @@ enum CrossSiteResolver {
                        preferredSiteKey: String? = nil,
                        maxSites: Int = 24,
                        concurrency: Int = 16) async -> [SiteSearchResult] {
+        let result = await HeavyWorkGate.shared.run {
+            await searchUngated(
+                keyword: keyword, in: sites, limitPerSite: limitPerSite,
+                limitTotal: limitTotal, preferredSiteKey: preferredSiteKey,
+                maxSites: maxSites, concurrency: concurrency)
+        }
+        return result ?? []
+    }
+
+    private static func searchUngated(keyword: String,
+                                      in sites: [Site],
+                                      limitPerSite: Int = 12,
+                                      limitTotal: Int = 120,
+                                      preferredSiteKey: String? = nil,
+                                      maxSites: Int = 24,
+                                      concurrency: Int = 16) async -> [SiteSearchResult] {
         let targets = Array(usableSites(sites).prefix(max(1, maxSites)))
         guard !targets.isEmpty else { return [] }
 
@@ -135,6 +155,9 @@ enum CrossSiteResolver {
         var batches: [Batch] = []
         var start = 0
         while start < indexed.count {
+            // 1.8.2：页面已经退了（详情页被 dismiss / 搜索被新词取代）就别再往下扫了。
+            // 不判取消的话，跨站接管会把 60 个站跑完还占着闸，用户接下来的搜索只能排队。
+            if Task.isCancelled { break }
             let end = min(start + width, indexed.count)
             let slice = Array(indexed[start..<end])
             let part: [Batch] = await withTaskGroup(

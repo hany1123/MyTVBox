@@ -534,10 +534,21 @@ final class SpiderEngine {
         out.append("本机源配置    : " + LocalSourceCache.lastProbe)
         out.append("配置缓存      : " + LocalSourceCache.describe())
         // 1.8.0：闪退定位 —— 上次最后停在哪个动作上（`开` 之后没有对应的 `完`）
+        // 1.8.2：只认「本次启动线之前」的内容，且必须同时给出上一轮最后一行。
+        // 上一版只找 `开 `，最后一行是 `弃 搜索` 时就报「无记录」—— 恰是崩溃现场。
         if let step = SessionTrace.interruptedStep() {
-            out.append("上次最后停在  : \(step)（这一步没走完）")
+            out.append("上次最后停在  : \(step)（这一步没走完 → 崩在这里）")
+        } else if let last = SessionTrace.previousLastLine() {
+            out.append("上次最后停在  : \(last)（正常收尾，不是崩在这一步）")
         } else {
-            out.append("上次最后停在  : （无记录）")
+            out.append("上次最后停在  : （本版首次启动，还没有上一轮记录）")
+        }
+        let prevTail = SessionTrace.previousTail(3)
+        if !prevTail.isEmpty {
+            out.append("上一轮末 3 行 :")
+            for line in prevTail {
+                out.append("  " + line)
+            }
         }
         let marks = SessionTrace.recent(8)
         if !marks.isEmpty {

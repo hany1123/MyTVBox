@@ -220,7 +220,10 @@ final class NodeRuntime {
             var lastError: Error?
             // 1.8.0：连接被拒时补一次。实测过「ready 了但 TCP 还没接受连接」的瞬间
             // （`Could not connect to the server.` 0.0s），等一下就能连上。
-            for attempt in 0..<2 {
+            // 1.8.2：2 次 → 3 次、退避 0.8s/1.6s。1.8.1 的 node.log 里还有
+            // `[swift] config 1.1s 失败: Could not connect to the server.` —— 冷启动时
+            // bundle 刚 start() resolved、READY 刚打印，端口还在握手窗口里，两次都撞上了。
+            for attempt in 0..<3 {
                 do {
                     let (data, _) = try await URLSession.shared.data(for: req)
                     let cost = Date().timeIntervalSince(t0)
@@ -237,9 +240,11 @@ final class NodeRuntime {
                     let retriable = (code == .cannotConnectToHost
                                      || code == .networkConnectionLost
                                      || code == .notConnectedToInternet)
-                    if retriable, attempt == 0 {
-                        self.appendLog("config 连接失败（\(error.localizedDescription)），1 秒后重试")
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if retriable, attempt < 2 {
+                        let wait = 0.8 * Double(attempt + 1)
+                        self.appendLog(String(format: "config 连接失败（%@），%.1f 秒后重试",
+                                              error.localizedDescription, wait))
+                        try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
                         continue
                     }
                     break

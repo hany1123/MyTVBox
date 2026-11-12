@@ -25,6 +25,10 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // 1.7.7：抓 NSException 型闪退，落到 Documents/MyTVBox/crash.log
         CrashGuard.install()
 
+        // 1.8.2：写启动分界线。诊断里「上一轮最后一行」只认这条线之前的内容，
+        // 否则本次会话里正在飞的 `开 搜索` 会被误报成上次闪退。
+        SessionTrace.mark(SessionTrace.bootToken)
+
         // 注册后台/前台切换通知
         NotificationCenter.default.addObserver(
             self, selector: #selector(didEnterBackground),

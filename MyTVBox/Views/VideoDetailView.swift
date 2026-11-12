@@ -624,6 +624,7 @@ struct VideoDetailView: View {
             return
         }
 
+        var failReason = "推荐墙条目，本站无片源"
         if !isRecommendWallItem {
             let t0 = Date()
             do {
@@ -637,17 +638,25 @@ struct VideoDetailView: View {
                         return
                     }
                     diag("本站 detail 有数据但没有可播线路 → 跨站")
+                    failReason = "本站 \(ms)ms 有数据但无线路"
                 } else {
-                    diag("本站 detail: 空响应 \(Int(Date().timeIntervalSince(t0) * 1000))ms → 跨站")
+                    let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                    diag("本站 detail: 空响应 \(ms)ms → 跨站")
+                    failReason = "本站 \(ms)ms 空响应"
                 }
             } catch {
                 let ms = Int(Date().timeIntervalSince(t0) * 1000)
                 diag("本站 detail: 失败 \(ms)ms · \(error.localizedDescription) → 跨站")
+                failReason = "本站 \(ms)ms 失败:\(error.localizedDescription)"
             }
         }
 
-        SessionTrace.mark("完 详情 \(title.isEmpty ? vodId : title) 无线路")
+        // 1.8.2：这行「完 详情 … 无线路」以前写在跨站接管**之前**，结果日志里
+        // 一进详情 1 毫秒就出现「无线路」，看起来像瞬间失败 —— 其实接管还在跑。
+        // 现在挪到接管之后，并把本站失败原因一起记下。
+        if Task.isCancelled { return }
         if await adoptDetailFromOtherSites(title: title) { return }
+        SessionTrace.mark("完 详情 \(title.isEmpty ? vodId : title) 无线路（\(failReason)）")
 
         if title.isEmpty {
             errorMessage = "没拿到这个条目的详情（id=\(vodId)），也没有片名可以拿去其它站搜。"
@@ -752,10 +761,17 @@ struct VideoDetailView: View {
             return true
         }
 
-        // 第二轮：全量站点，放宽到包含匹配
+        // 第二轮：放宽到包含匹配。
+        // 1.8.2：maxSites 200 → 60。原来这轮会把 110 个站全搜一遍，正好和搜索页的
+        // 聚合搜索撞在一起，两批 spider 同时跑把 V8 堆顶爆（闪退）。
+        // 页面上早就 dismiss 掉的时候也没必要再扫，先判取消。
+        if Task.isCancelled {
+            diag("接管：页面已退，放弃第二轮")
+            return false
+        }
         let t1 = Date()
         let hits2 = await CrossSiteResolver.search(
-            keyword: query, in: allSites, limitPerSite: 3, limitTotal: 60, maxSites: 200)
+            keyword: query, in: allSites, limitPerSite: 3, limitTotal: 60, maxSites: 60)
         let loose = hits2.filter { $0.relevance >= 1 && !excluding.contains($0.site.key) }
             .filter { h in !exact.contains(where: { $0.site.key == h.site.key && $0.item.vodId == h.item.vodId }) }
         diag("接管第二轮：全量 \(Int(Date().timeIntervalSince(t1) * 1000))ms · 命中 \(hits2.count) · 可用候选 \(loose.count)")
