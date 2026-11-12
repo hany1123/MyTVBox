@@ -7,11 +7,12 @@ import SwiftUI
 struct MainTabView: View {
 
     @EnvironmentObject var appState: AppState
-    @State private var selection: Int = 0
+    // 1.7.4：选中态提到 AppState，详情页的「去搜索」才能把用户送过去
+    private var selection: Binding<Int> { $appState.selectedTab }
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            TabView(selection: $selection) {
+            TabView(selection: selection) {
                 HomeView()
                     .environmentObject(appState)
                     .tabItem {

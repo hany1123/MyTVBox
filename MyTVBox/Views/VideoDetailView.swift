@@ -11,6 +11,10 @@ struct VideoDetailView: View {
     let site: Site?
 
     @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+
+    /// 1.7.4：详情/接管的链路记录，出问题时长按复制即可，不用再跑整站诊断
+    @State private var detailDiag: [String] = []
 
     @State private var detail: VideoDetail?
     /// 本片所有可用线路：本片所在站点在前，其它站点的同片线路在后
@@ -518,42 +522,114 @@ struct VideoDetailView: View {
                 .font(PlayerTheme.sans(13))
                 .foregroundColor(PlayerTheme.textHigh)
                 .multilineTextAlignment(.center)
-            Button("重试") {
-                Task { await loadDetail() }
+
+            HStack(spacing: 12) {
+                Button("重试") {
+                    Task { await loadDetail() }
+                }
+                .font(PlayerTheme.sans(13, weight: .heavy))
+                .foregroundColor(PlayerTheme.ink)
+                .padding(.horizontal, 18).padding(.vertical, 8)
+                .background(Capsule().fill(PlayerTheme.amber))
+
+                // 1.7.4：推荐墙条目（豆瓣这类）唯一的出路是按片名去别的站找，
+                // 一键把用户送到搜索页，别让人卡在这一页。
+                if let kw = (previewItem?.vodName ?? detail?.vodName), !kw.isEmpty {
+                    Button("去搜索") {
+                        appState.pendingSearchKeyword = kw
+                        dismiss()
+                        appState.selectedTab = 2
+                    }
+                    .font(PlayerTheme.sans(13, weight: .heavy))
+                    .foregroundColor(PlayerTheme.textHigh)
+                    .padding(.horizontal, 18).padding(.vertical, 8)
+                    .background(Capsule().stroke(PlayerTheme.textHigh.opacity(0.4), lineWidth: 1))
+                }
             }
-            .font(PlayerTheme.sans(13, weight: .heavy))
-            .foregroundColor(PlayerTheme.ink)
-            .padding(.horizontal, 18).padding(.vertical, 8)
-            .background(Capsule().fill(PlayerTheme.amber))
+
+            // 详情链路诊断：出问题时长按这段文字复制给我即可，不用再跑整站诊断
+            if !detailDiag.isEmpty {
+                DisclosureGroup("详情链路诊断") {
+                    Text(detailDiag.joined(separator: "\n"))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(PlayerTheme.textHigh.opacity(0.75))
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .font(PlayerTheme.sans(11))
+                .foregroundColor(PlayerTheme.textHigh.opacity(0.6))
+                .padding(.top, 4)
+            }
         }
         .padding(28)
     }
 
+    private func diag(_ line: String) {
+        detailDiag.append(line)
+        print("[Detail] " + line)
+    }
+
     // MARK: - Logic
+
+    /// 1.7.4：推荐墙站点的条目 id 前缀。
+    ///
+    /// 源里这些站点的 detail / play / search 全是空实现（实测：
+    /// `meta:{key:"douban",indexs:1}` 的 spider 就是 `async detail(){return{}}`）。
+    /// 条目只有「片名 + 豆瓣 id」，片源必须按片名去别的站找 —— 这是设计如此，不是 bug。
+    /// 所以见到 `msearch:` 就别再浪费一次往返去问 detail。
+    private var isRecommendWallItem: Bool {
+        vodId.lowercased().hasPrefix("msearch")
+    }
 
     private func loadDetail() async {
         isLoading = true
         errorMessage = nil
+        detailDiag.removeAll()
         defer { isLoading = false }
 
         guard let site = resolvedSite else {
             errorMessage = "未选择站点"
             return
         }
-        do {
-            if let d = try await APIService.shared.fetchVideoDetail(site: site, vodId: vodId) {
-                applyDetail(d)
-            } else {
-                // 1.7.1：豆瓣这类「首页推荐墙」站点的 detail 接口本来就返回空
-                // （实测 douban detail -> {}）。以前这里直接报「未找到视频信息」，
-                // 用户点了等于死路。改成自动去其它站搜同名片的详情来接管。
-                if await adoptDetailFromOtherSites(title: previewItem?.vodName ?? "") {
-                    return
+
+        let title = previewItem?.vodName ?? detail?.vodName ?? ""
+        diag("站点 \(site.key) · vodId=\(vodId) · 标题=\(title)")
+        diag(isRecommendWallItem ? "判定：推荐墙条目 → 直接跨站找片源" : "判定：普通条目 → 先问本驿站")
+
+        if !isRecommendWallItem {
+            let t0 = Date()
+            do {
+                if let d = try await APIService.shared.fetchVideoDetail(
+                    site: site, vodId: vodId, timeout: 20) {
+                    let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                    let parsed = d.parsePlaySources()
+                    diag("本站 detail: OK \(ms)ms · 线路 \(parsed.count) 条")
+                    if !parsed.isEmpty {
+                        applyDetail(d)
+                        return
+                    }
+                    diag("本站 detail 有数据但没有可播线路 → 跨站")
+                } else {
+                    diag("本站 detail: 空响应 \(Int(Date().timeIntervalSince(t0) * 1000))ms → 跨站")
                 }
-                self.errorMessage = "未找到视频信息"
+            } catch {
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                diag("本站 detail: 失败 \(ms)ms · \(error.localizedDescription) → 跨站")
             }
-        } catch {
-            self.errorMessage = error.localizedDescription
+        }
+
+        if await adoptDetailFromOtherSites(title: title) { return }
+
+        if title.isEmpty {
+            errorMessage = "没拿到这个条目的详情（id=\(vodId)），也没有片名可以拿去其它站搜。"
+        } else if isRecommendWallItem {
+            errorMessage = """
+            「\(site.name)」只做推荐，条目本身不带片源，需要按片名到其它站找。
+            自动搜索没搜到可播的「\(title)」—— 可以点「去搜索」换个名字试试。
+            """
+        } else {
+            errorMessage = "「\(title)」在本站和其它站都没拿到可播线路。可以重试，或点「去搜索」换个站点找。"
         }
     }
 
@@ -570,40 +646,100 @@ struct VideoDetailView: View {
         Task { await loadCrossSiteLines(title: d.vodName) }
     }
 
-    /// 当前站拿不到详情时，去其它已启用站点搜同名片的详情。
+    /// 并发试若干候选站点，谁先拿到可播线路就用谁。
+    /// 串行试的话，第一个候选如果是「详情要现解析网盘」的慢站（实测 wogg 那种
+    /// 200 KB play_url 能拖十几秒），用户就干等着；并发 3 路能把首播等待压下来。
+    private struct PlayableHit: @unchecked Sendable {
+        let hit: CrossSiteResolver.SiteSearchResult
+        let detail: VideoDetail
+    }
+
+    private func firstPlayableDetail(
+        _ candidates: [CrossSiteResolver.SiteSearchResult],
+        width: Int = 3,
+        timeout: TimeInterval = 15
+    ) async -> PlayableHit? {
+        var queue = candidates
+        while !queue.isEmpty {
+            let batch = Array(queue.prefix(width))
+            queue.removeFirst(min(width, queue.count))
+
+            let got: PlayableHit? = await withTaskGroup(
+                of: PlayableHit?.self, returning: PlayableHit?.self
+            ) { group in
+                for c in batch {
+                    group.addTask {
+                        guard let d = try? await APIService.shared.fetchVideoDetail(
+                            site: c.site, vodId: c.item.vodId, timeout: timeout) else { return nil }
+                        guard !d.parsePlaySources().isEmpty else { return nil }
+                        return PlayableHit(hit: c, detail: d)
+                    }
+                }
+                for await r in group {
+                    if let r { group.cancelAll(); return r }
+                }
+                return nil
+            }
+            if let got { return got }
+            diag("  批内 \(batch.count) 个站都没拿到线路：\(batch.map { $0.site.name }.joined(separator: "、"))")
+        }
+        return nil
+    }
+
+    /// 当前站拿不到详情时，去其它已启用站点搜同名片的详情来接管。
     ///
-    /// 只接受标题完全一致的命中（relevance == 2），避免把「第二季」「番外」
-    /// 之类当成同一部；并且要求目标站能解析出至少一条线路，否则继续找下一个。
+    /// 只接受标题一致的命中（relevance == 2）；第一轮搜前 16 个站就够覆盖热门站，
+    /// 没命中才扩大到全部站点并用包含匹配兜底 —— 97 个站全量搜一轮在端上要几十秒，
+    /// 不能一上来就这么干。
     private func adoptDetailFromOtherSites(title rawTitle: String) async -> Bool {
-        let title = CrossSiteResolver.normalizedTitle(rawTitle)
-        guard title.count >= 2 else { return false }
+        let query = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = CrossSiteResolver.normalizedTitle(query)
+        guard title.count >= 2 else {
+            diag("接管：标题太短（\"\(rawTitle)\"），放弃跨站")
+            return false
+        }
 
         let allSites = appState.currentConfig?.sites ?? []
-        guard !allSites.isEmpty else { return false }
+        guard !allSites.isEmpty else {
+            diag("接管：没有可用站点")
+            return false
+        }
 
         var excluding = Set<String>()
         if let key = resolvedSiteKey { excluding.insert(key) }
 
-        let hits = await CrossSiteResolver.search(
-            keyword: title,
-            in: allSites,
-            limitPerSite: 6,
-            limitTotal: 40,
-            preferredSiteKey: nil
-        )
+        // 第一轮：热门站，严格同名片
+        let t0 = Date()
+        let hits1 = await CrossSiteResolver.search(
+            keyword: query, in: allSites, limitPerSite: 6, limitTotal: 40, maxSites: 16)
+        let exact = hits1.filter { $0.relevance >= 2 && !excluding.contains($0.site.key) }
+        diag("接管第一轮：搜 16 站 \(Int(Date().timeIntervalSince(t0) * 1000))ms · 命中 \(hits1.count) · 同名 \(exact.count)")
 
-        for hit in hits where hit.relevance >= 2 {
-            if excluding.contains(hit.site.key) { continue }
-            guard let d = try? await APIService.shared.fetchVideoDetail(
-                site: hit.site, vodId: hit.item.vodId, timeout: 8
-            ) else { continue }
-            guard !d.parsePlaySources().isEmpty else { continue }
-
-            adoptInfo = "本片由「\(hit.site.name)」提供"
-            applyDetail(d)
-            adoptedSiteKey = hit.site.key
+        if !exact.isEmpty, let got = await firstPlayableDetail(exact) {
+            adoptInfo = "本片由「\(got.hit.site.name)」提供"
+            applyDetail(got.detail)
+            adoptedSiteKey = got.hit.site.key
+            diag("接管成功：\(got.hit.site.name)（\(got.detail.parsePlaySources().count) 条线路）")
             return true
         }
+
+        // 第二轮：全量站点，放宽到包含匹配
+        let t1 = Date()
+        let hits2 = await CrossSiteResolver.search(
+            keyword: query, in: allSites, limitPerSite: 3, limitTotal: 60, maxSites: 200)
+        let loose = hits2.filter { $0.relevance >= 1 && !excluding.contains($0.site.key) }
+            .filter { h in !exact.contains(where: { $0.site.key == h.site.key && $0.item.vodId == h.item.vodId }) }
+        diag("接管第二轮：全量 \(Int(Date().timeIntervalSince(t1) * 1000))ms · 命中 \(hits2.count) · 可用候选 \(loose.count)")
+
+        if !loose.isEmpty, let got = await firstPlayableDetail(loose) {
+            adoptInfo = "本片由「\(got.hit.site.name)」提供（\(got.hit.item.vodName)）"
+            applyDetail(got.detail)
+            adoptedSiteKey = got.hit.site.key
+            diag("接管成功：\(got.hit.site.name)")
+            return true
+        }
+
+        diag("接管失败：两轮都没有可播线路")
         return false
     }
 

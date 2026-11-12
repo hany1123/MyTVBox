@@ -129,6 +129,12 @@ final class AppState: ObservableObject {
     @Published var subscriptions: [Subscription] = []
     /// 当前聚焦的订阅（只是界面高亮，不再决定加载范围）
     @Published var activeSubscriptionId: UUID?
+
+    /// 1.7.4：跨页跳转用的两个小通道
+    /// 主 Tab 当前页（0 首页 / 1 分类 / 2 搜索 / 3 收藏 / 4 设置）
+    @Published var selectedTab: Int = 0
+    /// 详情页「去搜索」时带给搜索页的关键字，搜索页取走后置 nil
+    @Published var pendingSearchKeyword: String?
     /// 当前订阅若是多仓，这里是可切换的子仓库列表
     @Published var availableRepos: [RepoLink] = []
     @Published var activeRepoURL: String?

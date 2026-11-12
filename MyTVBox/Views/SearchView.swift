@@ -118,7 +118,23 @@ struct SearchView: View {
                                 site: result.site)
                     .environmentObject(appState)
             }
+            // 1.7.4：详情页「去搜索」把关键词扔过来，这里接住并直接搜
+            .onChange(of: appState.pendingSearchKeyword) { _ in
+                consumePendingKeyword()
+            }
+            .onAppear {
+                consumePendingKeyword()
+            }
         }
+    }
+
+    /// 取走详情页递过来的关键词；取完就清空，避免来回切 Tab 重复触发
+    private func consumePendingKeyword() {
+        guard let kw = appState.pendingSearchKeyword,
+              !kw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        appState.pendingSearchKeyword = nil
+        keyword = kw
+        performSearch()
     }
 
     // MARK: - 聚合开关

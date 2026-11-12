@@ -73,6 +73,20 @@ enum CrossSiteResolver {
             of: "第[0-9一二三四五六七八九十]+季",
             with: "", options: .regularExpression
         )
+        // 1.7.4：站点标题普遍带进度尾巴，不剥掉就永远判不成「完全一致」
+        // 例：谷雨(更新至06集) / 谷雨 全24集 / 谷雨-完结 / 谷雨 超前点映
+        s = s.replacingOccurrences(
+            of: "(更新至|更新到|已更新|更至|连载至|全)\\s*[0-9]+\\s*[集话話期]?",
+            with: "", options: .regularExpression
+        )
+        s = s.replacingOccurrences(
+            of: "[0-9]+\\s*[集话話期]\\s*(全|完|完结)?",
+            with: "", options: .regularExpression
+        )
+        s = s.replacingOccurrences(
+            of: "(完结|已完结|大结局|超前点映|超前点播|点映|抢先版|预告)",
+            with: "", options: .regularExpression
+        )
         s = s.replacingOccurrences(
             of: "(4k|8k|1080p|720p|hd|bd|蓝光|国语|粤语|中字|完整版|未删减|dvd|vip)",
             with: "", options: .regularExpression
@@ -100,8 +114,9 @@ enum CrossSiteResolver {
                        in sites: [Site],
                        limitPerSite: Int = 12,
                        limitTotal: Int = 120,
-                       preferredSiteKey: String? = nil) async -> [SiteSearchResult] {
-        let targets = Array(usableSites(sites).prefix(24))
+                       preferredSiteKey: String? = nil,
+                       maxSites: Int = 24) async -> [SiteSearchResult] {
+        let targets = Array(usableSites(sites).prefix(max(1, maxSites)))
         guard !targets.isEmpty else { return [] }
 
         let kw = keyword
