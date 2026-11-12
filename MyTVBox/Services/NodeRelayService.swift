@@ -27,6 +27,22 @@ final class NodeRelayService {
 
     private static let baseKey = "MyTVBox.nodeRelay.baseURL"
 
+    /// 1.7.5：专用会话 —— 这是端上化后最大的一处性能坑。
+    ///
+    /// 所有请求都打到同一个 host（127.0.0.1:端上 Node），而 URLSession 默认
+    /// `httpMaximumConnectionsPerHost = 6`。聚合搜索要同时打 97 个站，等于 97 个
+    /// 请求排队挤 6 条连接，一轮下来几十秒。把上限提到 48 之后，97 站基本两三轮就完了。
+    /// 图片走同一个 Node 的 /imageProxy，也吃这个池子，所以一起受益。
+    private static let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.httpMaximumConnectionsPerHost = 48
+        cfg.timeoutIntervalForRequest = 25
+        cfg.timeoutIntervalForResource = 60
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.waitsForConnectivity = false
+        return URLSession(configuration: cfg)
+    }()
+
     /// 最近一次成功识别的 Node 服务基址（多个服务时播放地址里还会带 base）
     var baseURL: String? {
         get { UserDefaults.standard.string(forKey: Self.baseKey) }
@@ -92,6 +108,9 @@ final class NodeRelayService {
         baseURL = base
         let sites: [Site] = arr.compactMap { d in
             guard let key = d["key"] as? String, !key.isEmpty else { return nil }
+            // 1.7.5：源自己勾了「不启用」的站点直接跳过 —— 源作者标了 enable:false
+            // 就别硬塞进列表里；enable:true 的一律自动可用，不需要用户再点开关。
+            if let en = Self.intValue(d["enable"]), en == 0 { return nil }
             let prefix = "nodejs_"
             let rawKey = key.hasPrefix(prefix) ? String(key.dropFirst(prefix.count)) : key
             guard !rawKey.isEmpty else { return nil }
@@ -200,7 +219,7 @@ final class NodeRelayService {
         guard let url = URL(string: urlString) else { throw NetworkError.invalidURL }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = "GET"
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await Self.session.data(for: req)
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard (200...299).contains(status) else {
             throw NetworkError.decodingFailed("Node 服务返回 \(status)")
@@ -218,7 +237,7 @@ final class NodeRelayService {
         req.httpMethod = "POST"
         req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await Self.session.data(for: req)
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard (200...299).contains(status) else {
             throw NetworkError.decodingFailed("Node 服务返回 \(status)")

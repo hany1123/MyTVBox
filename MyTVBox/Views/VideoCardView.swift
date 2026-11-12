@@ -71,18 +71,9 @@ struct VideoCardView: View {
     @ViewBuilder
     private var posterImage: some View {
         if let s = item.vodPic, !s.isEmpty, let url = URL(string: s) {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .empty:
-                    posterPlaceholder
-                case .success(let img):
-                    img.resizable().scaledToFill()
-                case .failure:
-                    posterPlaceholder
-                @unknown default:
-                    posterPlaceholder
-                }
-            }
+            // 1.7.5：改用自带连接池 + 内存缓存的海报加载（AsyncImage 只能用共享会话，
+            // 每 host 6 条连接，端上一屏图全挤在同一个 127.0.0.1 上会明显卡顿）
+            RemoteImage(url: url) { posterPlaceholder }
         } else {
             posterPlaceholder
         }

@@ -51,10 +51,17 @@ struct VideoDetailView: View {
         isPlayerActive = true
     }
 
-    init(vodId: String, previewItem: VideoItem? = nil, site: Site? = nil) {
+    /// 1.7.5：推荐墙条目是否「一进来就跳全站搜索」。
+    /// 首页/分类/收藏进来要跳（对标 MiraPlay）；从搜索结果再点进详情则不能跳，
+    /// 否则会在「搜索 → 详情 → 搜索」之间来回弹。
+    let autoSearchOnOpen: Bool
+
+    init(vodId: String, previewItem: VideoItem? = nil, site: Site? = nil,
+         autoSearchOnOpen: Bool = true) {
         self.vodId = vodId
         self.previewItem = previewItem
         self.site = site
+        self.autoSearchOnOpen = autoSearchOnOpen
     }
 
     /// 本片实际取详情的站点：优先用结果携带的站点，否则退回当前站点
@@ -596,6 +603,17 @@ struct VideoDetailView: View {
         let title = previewItem?.vodName ?? detail?.vodName ?? ""
         diag("站点 \(site.key) · vodId=\(vodId) · 标题=\(title)")
         diag(isRecommendWallItem ? "判定：推荐墙条目 → 直接跨站找片源" : "判定：普通条目 → 先问本驿站")
+
+        // 1.7.5：豆瓣这类推荐墙，直接跳到「全站聚合搜索」。
+        // 以前是在详情页里静默接管一个站，用户看不到「这部片还有哪些源有」，
+        // 也没法挑。跳过去能按站点筛选，和 MiraPlay 一致。
+        if autoSearchOnOpen, isRecommendWallItem, !title.isEmpty {
+            diag("推荐墙条目 → 跳转全站搜索「\(title)」")
+            appState.pendingSearchKeyword = title
+            appState.selectedTab = 2
+            dismiss()
+            return
+        }
 
         if !isRecommendWallItem {
             let t0 = Date()

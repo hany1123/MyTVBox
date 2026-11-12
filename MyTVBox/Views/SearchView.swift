@@ -15,6 +15,8 @@ struct SearchView: View {
     @State private var errorMessage: String?
     @State private var hasSearched: Bool = false   // 是否已发起过搜索
     @State private var searchedSiteCount: Int = 0
+    /// 1.7.5：左侧站点筛选（nil = 全部）
+    @State private var siteFilter: String? = nil
     /// 是否聚合当前配置的全部 CMS 站点（关掉则只搜当前站点）
     @AppStorage("MyTVBox.aggregateSearch")
     private var aggregateSearch: Bool = true
@@ -60,12 +62,6 @@ struct SearchView: View {
 
     // MARK: - 网格列
 
-    private let columns: [GridItem] = [
-        GridItem(.flexible(), spacing: 10),
-        GridItem(.flexible(), spacing: 10),
-        GridItem(.flexible(), spacing: 10)
-    ]
-
     // MARK: - Body
 
     var body: some View {
@@ -109,13 +105,15 @@ struct SearchView: View {
             }
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: VideoItem.self) { item in
-                VideoDetailView(vodId: item.vodId, previewItem: item)
+                VideoDetailView(vodId: item.vodId, previewItem: item,
+                                autoSearchOnOpen: false)
                     .environmentObject(appState)
             }
             .navigationDestination(for: CrossSiteResolver.SiteSearchResult.self) { result in
                 VideoDetailView(vodId: result.item.vodId,
                                 previewItem: result.item,
-                                site: result.site)
+                                site: result.site,
+                                autoSearchOnOpen: false)
                     .environmentObject(appState)
             }
             // 1.7.4：详情页「去搜索」把关键词扔过来，这里接住并直接搜
@@ -365,58 +363,140 @@ struct SearchView: View {
 
     // MARK: - 搜索结果
 
+    // MARK: - 站点分组（对标 MiraPlay 左侧筛选列）
+
+    private struct SiteBucket: Identifiable {
+        let key: String
+        let name: String
+        let count: Int
+        var id: String { key }
+    }
+
+    /// 按站点聚合命中数，顺序沿用配置里的站序（和 MiraPlay 一致，不按数量重排）
+    private var siteBuckets: [SiteBucket] {
+        var order: [String] = []
+        var names: [String: String] = [:]
+        var counts: [String: Int] = [:]
+        for r in results {
+            let k = r.site.key
+            if counts[k] == nil {
+                order.append(k)
+                names[k] = r.site.name
+            }
+            counts[k, default: 0] += 1
+        }
+        return order.map { SiteBucket(key: $0, name: names[$0] ?? $0, count: counts[$0] ?? 0) }
+    }
+
+    private var filteredResults: [CrossSiteResolver.SiteSearchResult] {
+        guard let f = siteFilter else { return results }
+        return results.filter { $0.site.key == f }
+    }
+
+    private var resultColumns: [GridItem] {
+        // 左侧有筛选列时，右边只放得下 2 列
+        [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
+    }
+
     private var resultSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             // 结果标题
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Rectangle()
                     .fill(TVBoxTheme.accent)
                     .frame(width: 3, height: 14)
                 Text("SEARCH RESULT")
                     .font(TVBoxTheme.mono(11, weight: .heavy))
-                    .tracking(3)
+                    .tracking(2)
                     .foregroundStyle(TVBoxTheme.textPrimary)
                 Text(String(format: "// %02d", results.count))
                     .font(TVBoxTheme.mono(10, weight: .medium))
                     .foregroundStyle(TVBoxTheme.textMuted)
                 if searchedSiteCount > 0 {
-                    Text("· \(searchedSiteCount) 站")
-                        .font(TVBoxTheme.mono(10, weight: .medium))
+                    Text("· \(siteBuckets.count)/\(searchedSiteCount) 站有结果")
+                        .font(TVBoxTheme.mono(9, weight: .medium))
                         .foregroundStyle(TVBoxTheme.accent.opacity(0.75))
+                        .lineLimit(1)
                 }
-                Text("「\(keyword)」")
-                    .font(TVBoxTheme.text(12))
-                    .foregroundStyle(TVBoxTheme.accent.opacity(0.7))
-                Rectangle()
-                    .fill(TVBoxTheme.stroke)
-                    .frame(height: 1)
             }
             .padding(.horizontal, 16)
             .padding(.top, 4)
 
-            // 结果网格：角标显示该结果来自哪个站点
-            LazyVGrid(columns: columns, spacing: 14) {
-                ForEach(Array(results.enumerated()), id: \.element.id) { idx, result in
-                    Button {
-                        path.append(result)
-                    } label: {
-                        VideoCardView(item: result.item, index: idx + 1)
-                            .overlay(alignment: .topTrailing) {
-                                Text(result.siteName)
-                                    .font(.system(size: 9, weight: .bold))
-                                    .foregroundStyle(.white)
-                                    .lineLimit(1)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 3)
-                                    .background(Capsule().fill(TVBoxTheme.accent.opacity(0.88)))
-                                    .padding(5)
-                            }
+            HStack(alignment: .top, spacing: 10) {
+                siteFilterColumn
+
+                LazyVGrid(columns: resultColumns, spacing: 14) {
+                    ForEach(Array(filteredResults.enumerated()), id: \.element.id) { idx, result in
+                        Button {
+                            path.append(result)
+                        } label: {
+                            VideoCardView(item: result.item, index: idx + 1)
+                                .overlay(alignment: .topTrailing) {
+                                    Text(result.siteName)
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .lineLimit(1)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 2)
+                                        .background(Capsule().fill(TVBoxTheme.accent.opacity(0.9)))
+                                        .padding(4)
+                                }
+                        }
+                        .buttonStyle(CardPressStyle())
                     }
-                    .buttonStyle(CardPressStyle())
                 }
+                .frame(maxWidth: .infinity)
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 12)
+
+            if filteredResults.isEmpty {
+                Text("这个站点没有可用结果的预览")
+                    .font(TVBoxTheme.mono(10))
+                    .foregroundStyle(TVBoxTheme.textMuted)
+                    .padding(.horizontal, 16)
+            }
         }
+    }
+
+    /// 左侧竖排站点筛选：全部 + 每个有命中的站点（带命中数）
+    private var siteFilterColumn: some View {
+        VStack(spacing: 6) {
+            siteFilterRow(title: "全部", count: results.count, key: nil)
+            ForEach(siteBuckets) { b in
+                siteFilterRow(title: b.name, count: b.count, key: b.key)
+            }
+        }
+        .frame(width: 104)
+    }
+
+    private func siteFilterRow(title: String, count: Int, key: String?) -> some View {
+        let selected = (siteFilter == key)
+        return Button {
+            siteFilter = key
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(TVBoxTheme.text(11, weight: selected ? .bold : .medium))
+                    .foregroundStyle(selected ? Color.black : TVBoxTheme.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("\(count)")
+                    .font(TVBoxTheme.mono(10, weight: .heavy))
+                    .foregroundStyle(selected ? Color.black.opacity(0.75) : TVBoxTheme.accent.opacity(0.85))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(selected ? TVBoxTheme.accent : TVBoxTheme.surface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .stroke(selected ? Color.clear : TVBoxTheme.stroke, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 状态视图
@@ -495,6 +575,7 @@ struct SearchView: View {
         errorMessage = nil
         hasSearched = true
         results = []
+        siteFilter = nil
 
         // 快照当前配置，避免搜索过程中切站导致结果错位
         let useAll = aggregateSearch
@@ -511,10 +592,15 @@ struct SearchView: View {
                 self.isLoading = false
                 return
             }
+            // 1.7.5：搜索页就是要「全站聚合」，别只搜前 24 个。
+            // 每站取 30 条（MiraPlay 音乐站动辄 30 条），总量放宽到 400。
             let found = await CrossSiteResolver.search(
                 keyword: trimmed,
                 in: usable,
-                preferredSiteKey: preferred
+                limitPerSite: 30,
+                limitTotal: 400,
+                preferredSiteKey: preferred,
+                maxSites: 200
             )
             guard !Task.isCancelled else { return }
             self.searchedSiteCount = usable.count
