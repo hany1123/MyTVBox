@@ -530,6 +530,9 @@ final class SpiderEngine {
         if let p = rt.pendingKernelMD5 {
             out.append("已下载待生效  : md5 \(p)（需完全退出 App 再打开）")
         }
+        // 1.7.8：/config 到底慢在哪一步，直接看这两行
+        out.append("本机源配置    : " + LocalSourceCache.lastProbe)
+        out.append("配置缓存      : " + LocalSourceCache.describe())
         if let crash = CrashGuard.lastReport() {
             out.append("上次崩溃记录  :")
             for line in crash.split(separator: "\n").suffix(24) {

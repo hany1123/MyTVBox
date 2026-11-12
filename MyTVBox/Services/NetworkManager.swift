@@ -26,6 +26,8 @@ final class NetworkManager {
     static let shared = NetworkManager()
 
     private let session: URLSession
+    /// 1.7.8：本机 Node 源专用会话（超时放宽，见下方注释）
+    private let localSession: URLSession
 
     private init() {
         let cfg = URLSessionConfiguration.default
@@ -38,9 +40,39 @@ final class NetworkManager {
         // 使用 delegate 来处理重定向时保留 Auth header
         let delegate = RedirectDelegate()
         self.session = URLSession(configuration: cfg, delegate: delegate, delegateQueue: nil)
+
+        // 1.7.8：源在设备上是解释执行，第一次生成 /config 可能要几十秒。
+        // 用默认 20 秒会把「慢但能成」变成「失败」，而上层失败后还会再打
+        // relay + 6 条备选路径，一次慢请求被放大成好几分钟（用户看到的就是
+        // 「加载很慢，最后报错」）。这里给足 60/120 秒，且不等连通性。
+        let lcfg = URLSessionConfiguration.default
+        lcfg.timeoutIntervalForRequest = 60
+        lcfg.timeoutIntervalForResource = 120
+        lcfg.waitsForConnectivity = false
+        lcfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        lcfg.httpAdditionalHeaders = [
+            "User-Agent": "MyTVBox/1.0 (iOS)"
+        ]
+        self.localSession = URLSession(configuration: lcfg)
     }
 
     // MARK: - 公共接口
+
+    /// 是否是「本机/回环」地址（端上 Node）
+    static func isLoopback(_ urlString: String) -> Bool {
+        guard let h = URLNormalizer.url(urlString)?.host?.lowercased() else { return false }
+        return h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "0.0.0.0"
+    }
+
+    /// 本机源请求：放宽超时，不走重定向/Auth 那套
+    func localData(from urlString: String) async throws -> Data {
+        guard let url = URLNormalizer.url(urlString) else { throw NetworkError.invalidURL }
+        var request = URLRequest(url: url)
+        request.setValue("application/json,text/plain,*/*", forHTTPHeaderField: "Accept")
+        let (data, response) = try await localSession.data(for: request)
+        try validate(response)
+        return data
+    }
 
     /// 发起请求并返回原始 Data
     func data(from urlString: String, timeout: TimeInterval? = nil) async throws -> Data {

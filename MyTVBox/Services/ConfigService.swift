@@ -33,6 +33,13 @@ final class ConfigService {
     /// 站点为空（Node 的 /config 顶层是 video.sites，不是 sites）时，
     /// 才探测 /health 严格确认是 CatVodSpiderios，避免普通订阅多一次网络请求。
     func loadConfig(from urlString: String) async throws -> TVBoxConfig {
+        // 1.7.8：本机源（端上 Node）走专用快路径。
+        // 以前这里会走「标准流程 → 失败 → relay → 6 条备选路径」，每条 20 秒，
+        // 设备上 /config 稍慢就被放大成几分钟的等待，最后还报失败。
+        if NetworkManager.isLoopback(urlString) {
+            return try await loadLocalSourceConfig(urlString)
+        }
+
         var standard: TVBoxConfig?
         var standardError: Error?
         do {
@@ -50,6 +57,43 @@ final class ConfigService {
         }
         if let standard { return standard }
         throw standardError ?? NetworkError.invalidURL
+    }
+
+    /// 1.7.8：本机源（127.0.0.1）专用加载路径。
+    ///
+    /// 三条原则：
+    /// 1. **只打一发** `/config`，不猜备选路径、不再走一遍 relay（同一个地址没意义）；
+    /// 2. 超时放宽到 60 秒（设备上源首次生成 config 确实可能慢）；
+    /// 3. 缓存 30 分钟内直接命中（打开就出站点），失败则退回任意年龄的缓存，
+    ///    宁可给旧站点也别让界面空着。缓存由启动流程里的预热负责刷新。
+    private func loadLocalSourceConfig(_ urlString: String) async throws -> TVBoxConfig {
+        lastStats = nil
+        lastRepos = []
+
+        // 1) 缓存够新：直接命中（打开就出站点，源再慢也不影响界面）
+        if let cached = LocalSourceCache.data(maxAge: 30 * 60),
+           let cfg = try? decodeWithExtras(cached) {
+            LocalSourceCache.note("缓存命中 · " + LocalSourceCache.describe())
+            return cfg
+        }
+
+        // 2) 单飞取一次：和启动预热共用同一个请求，60 秒超时，不猜备选路径
+        if let data = await NodeRuntime.shared.fetchLocalConfigOnce(),
+           let cfg = try? decodeWithExtras(data),
+           (cfg.sites ?? []).isEmpty == false {
+            return cfg
+        }
+        // 注意：源刚起来时可能返回 200 但 sites 为空（远端站点配置还没拉到），
+        // 那不能算成功 —— 继续往下走缓存，否则界面就是「0 个站点」。
+
+        // 3) 任意年龄的缓存兜底：宁可给旧站点，也别让界面空着
+        if let cached = LocalSourceCache.data(),
+           let cfg = try? decodeWithExtras(cached) {
+            LocalSourceCache.note("已退回缓存 · " + LocalSourceCache.describe())
+            return cfg
+        }
+
+        throw NetworkError.noData
     }
 
     private func loadStandardConfig(from urlString: String) async throws -> TVBoxConfig {

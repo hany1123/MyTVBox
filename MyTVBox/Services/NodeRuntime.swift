@@ -34,6 +34,8 @@ final class NodeRuntime {
 
     private var booted = false
     private let lock = NSLock()
+    /// 1.7.8：`/config` 单飞任务（启动预热与界面加载共用同一次请求）
+    private var localConfigTask: Task<Data?, Never>?
 
     private init() {}
 
@@ -187,21 +189,55 @@ final class NodeRuntime {
     /// 源刚 listen 的时候，`/config` 内部还要去拉远端站点配置（设备上是解释执行，
     /// 第一次可能要十几秒），App 这时候去拉就成了「超时 → 0 个站点 → 用户发现
     /// 得手动点一下订阅才出来」。先在这儿敲一次把它的缓存热起来，超时给足。
-    func warmUpConfig(timeout: TimeInterval = 45) async {
-        guard isReady else { return }
-        guard let url = URL(string: baseURL + "/config") else { return }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = timeout
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        let t0 = Date()
-        do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            appendLog(String(format: "warmup /config %.1fs %d bytes",
-                             Date().timeIntervalSince(t0), data.count))
-        } catch {
-            appendLog(String(format: "warmup /config %.1fs 失败: %@",
-                             Date().timeIntervalSince(t0), error.localizedDescription))
+    ///
+    /// 1.7.8：改成「单飞 + 落缓存」—— 启动预热与界面加载共用同一次请求，
+    /// 不会再出现两份 /config 同时飞、把设备上的源压得更慢。
+    func warmUpConfig(timeout: TimeInterval = 60) async {
+        _ = await fetchLocalConfigOnce(timeout: timeout)
+    }
+
+    /// 单飞地取一次 `/config`（同一进程内只发一次，结果落缓存并复用）。
+    @discardableResult
+    func fetchLocalConfigOnce(timeout: TimeInterval = 60) async -> Data? {
+        // 启动预热和界面加载会同时进来，占位要加锁，否则会各飞一个请求
+        lock.lock()
+        if let t = localConfigTask {
+            lock.unlock()
+            return await t.value
         }
+        let task = Task<Data?, Never> { [weak self] in
+            guard let self else { return nil }
+            guard self.isReady else { return nil }
+            guard let url = URL(string: self.baseURL + "/config") else { return nil }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = timeout
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            let t0 = Date()
+            do {
+                let (data, _) = try await URLSession.shared.data(for: req)
+                let cost = Date().timeIntervalSince(t0)
+                self.appendLog(String(format: "warmup /config %.1fs %d bytes", cost, data.count))
+                if data.count > 200 {
+                    LocalSourceCache.save(data)
+                    LocalSourceCache.note(String(format: "预热成功 %.1fs · %d 字节", cost, data.count))
+                }
+                return data
+            } catch {
+                let cost = Date().timeIntervalSince(t0)
+                self.appendLog(String(format: "warmup /config %.1fs 失败: %@", cost,
+                                      error.localizedDescription))
+                LocalSourceCache.note(String(format: "预热失败 %.1fs · %@", cost,
+                                             error.localizedDescription))
+                // 失败要清掉单飞占位，否则「重新加载」永远拿到同一个失败结果
+                self.lock.lock()
+                self.localConfigTask = nil
+                self.lock.unlock()
+                return nil
+            }
+        }
+        localConfigTask = task
+        lock.unlock()
+        return await task.value
     }
 
     private func currentReadyPort() -> UInt16? {
