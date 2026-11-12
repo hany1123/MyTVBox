@@ -195,10 +195,15 @@ process.on('uncaughtException', (e) => {
 });
 process.on('unhandledRejection', (e) => {
     const msg = e && e.stack ? e.stack : String(e);
-    // 1.8.6：WebAssembly 缺失是 iOS V8 的构建限制，不是崩溃。
-    // 装了 fetch shim 后不该再出现；万一出现也只记 WARN，
-    // 免得诊断把它当成「[3] Node V8 abort」的 FATAL 证据。
-    log((msg.indexOf('WebAssembly') >= 0 ? 'WARN fetch-shim: ' : 'FATAL unhandled: ') + msg);
+    // 1.8.8：装了 shim 后仍会出现一次 WebAssembly ReferenceError —— 那是 Node
+    // 内置 undici 模块加载期 lazyllhttp() 的 rejected Promise，与业务 fetch 无关，
+    // 服务照样 READY / config 秒回。只留首 3 行，别让 10 行栈帧又把关键行
+    // 窗口占满（BF2：高频噪声会吃掉低频关键事件的视野）。
+    if (msg.indexOf('WebAssembly') >= 0) {
+        log('WARN fetch-shim: ' + msg.split('\n').slice(0, 3).join(' | '));
+    } else {
+        log('FATAL unhandled: ' + msg);
+    }
 });
 // 1.8.5：Node 与 App 同进程。若 Node 事件循环退出 / V8 abort，会带走整个 App，
 // 所以要把「正常退出」也记下来，用于和「崩溃」区分。

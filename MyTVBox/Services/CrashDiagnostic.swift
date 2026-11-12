@@ -135,7 +135,13 @@ enum CrashDiagnostic {
             out.append("心跳覆盖度        : \(beats.count) 条（\(scopeName)最近一次播放） · 首条 \(beats.first ?? "") · 末条 \(beats.last ?? "")")
             out.append("     说明          : 末条心跳的 t= 是最后一次采样；进程若在此之后消失，t≈消失时刻")
         }
-        out.append("播放结局          : " + (both.last(where: { $0.contains("完 播放") }) ?? "未观测到「完 播放」"))
+        // 1.8.8：只看本次播放范围。旧版在 both（本轮+上一轮）里取最后一条
+        // 「完 播放」，1.8.7 崩溃那一轮却显示了上一轮的「正常退出」，误导判读。
+        let pStart = scope.lastIndex(where: { $0.contains("开 播放") }) ?? scope.startIndex
+        let playScope = Array(scope[pStart...])
+        out.append("播放结局          : "
+                   + (playScope.last(where: { $0.contains("完 播放") })
+                      ?? "本次播放没有「完 播放」（未正常收尾）"))
 
         out.append("证据不足时不下结论：请连同 node.log 关键行与本段一起复制给我。")
         out.append("")

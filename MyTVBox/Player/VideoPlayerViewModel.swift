@@ -95,6 +95,10 @@ final class VideoPlayerViewModel: ObservableObject {
 
     /// 自动换源状态：本次播放已试过的线路下标
     private var autoTriedSources: Set<Int> = []
+    /// 1.8.8：短时窗口限流。AVPlayerItem 的 failed 回调可能连发，
+    /// 旧版每次都立刻换线路、耗尽后直接启动整站级跨站搜索。
+    private var lastAutoSwitchAt: Date = .distantPast
+    private var autoSwitchBurst: Int = 0
     /// 本次运行内一旦自定义 scheme 加载失败，就永久退回直连，不再尝试过滤
     private var adProxyBypassed = false
     /// 跨站点换源已经试过的站点（含当前站点），避免来回切同一个坏站
@@ -496,6 +500,18 @@ final class VideoPlayerViewModel: ObservableObject {
 
     // MARK: - 1.5.4 Spider play() 结果解析
 
+    /// 1.8.8：只记「URL 形态」的最小信息，不落完整地址 —— 播放直链常带
+    /// token/签名，写进 breadcrumb.log 不合适。scheme / host / path 前缀 /
+    /// 参数个数已经足够判断「AVFoundation 为什么会报 unsupported URL」。
+    static func urlDigest(_ url: URL) -> String {
+        let scheme = url.scheme?.lowercased() ?? "(无scheme)"
+        let host = url.host ?? "(无host)"
+        let path = url.path.isEmpty ? "/" : String(url.path.prefix(48))
+        let qCount = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.count ?? 0
+        return "\(scheme)://\(host)\(path) · 参数\(qCount)项"
+    }
+
     /// Spider 的 play() 可能返回 {url}、{data:{url}}，也可能返回 JSON 字符串
     private static func extractPlayURL(from dict: [String: Any]) -> String? {
         for k in ["url", "playUrl", "play_url", "m3u8", "data"] {
@@ -683,6 +699,9 @@ final class VideoPlayerViewModel: ObservableObject {
                 guard let resolved else {
                     self.showHint(nil)
                     self.errorMessage = "该线路暂时无法获取播放地址"
+                    // 1.8.8：/play 没给出有效 URL 也要留痕，才能区分
+                    // 「取流失败」和「取到了但 URL 形态不对」
+                    SessionTrace.mark("败 播放 取流失败（/play 无有效 URL）")
                     self.autoSwitchSource(reason: "取流失败")
                     return
                 }
@@ -801,6 +820,26 @@ final class VideoPlayerViewModel: ObservableObject {
 
         bufferingSince = nil
 
+        // 1.8.8：AVURLAsset 只认 http/https（以及已接好 resourceLoader delegate
+        // 的本地代理 scheme）。把 relative URL / 嵌套占位 / 未知 scheme 交给
+        // AVPlayerItem 只会得到 `unsupported URL`，failed 回调再触发整条
+        // 自动换源链（最多 12 条线路 + 整站级跨站搜索）。
+        // 1.8.7 真机两次都是这个错，随后约 8 秒进程消失；心跳 3 秒一条，
+        // 内存暴涨来不及留下证据。先在这里挡住，并把 URL 形态写进轨迹。
+        let scheme = url.scheme?.lowercased() ?? ""
+        let proxyOK = scheme == LocalPlaylistProxy.scheme.lowercased()
+            && LocalPlaylistProxy.isProxied(url)
+        guard scheme == "http" || scheme == "https" || proxyOK else {
+            SessionTrace.mark("败 播放 URL 不支持 scheme=\(scheme.isEmpty ? "(空)" : scheme) · "
+                              + Self.urlDigest(url))
+            errorMessage = "该线路地址不被支持（\(scheme.isEmpty ? "无 scheme" : scheme)）"
+            isLoading = false
+            isBuffering = false
+            autoSwitchSource(reason: "播放地址不支持")
+            return
+        }
+        SessionTrace.mark("记 播放 URL " + Self.urlDigest(url))
+
         // 同一地址重入（比如误触重播）：只 seek，不重建 item，避免整轮重新缓冲
         if urlString == currentURLString,
            let item = player.currentItem, item.status == .readyToPlay {
@@ -883,8 +922,13 @@ final class VideoPlayerViewModel: ObservableObject {
                     self.isBuffering = false
                     self.slowTimer?.cancel()
                     // 1.8.5：AVFoundation 侧的失败要留痕，用于排除「播放器错误导致退出」
+                    // 1.8.8：附上 URL 形态摘要，下一份诊断能直接看出是哪个 scheme/host
+                    let digest = self.currentURLString
+                        .flatMap { URL(string: $0) }
+                        .map { Self.urlDigest($0) } ?? "(无 URL 记录)"
                     SessionTrace.mark("败 播放 item.failed: "
-                                      + (item.error?.localizedDescription ?? "未知错误"))
+                                      + (item.error?.localizedDescription ?? "未知错误")
+                                      + " · " + digest)
                     // 自定义 scheme 加载失败：整轮关掉过滤并用原始地址重建，
                     // 绝不让「去广告」把正常播放拖垮（1.4.7 回归的最终兜底）
                     if !self.adProxyBypassed,
@@ -1018,6 +1062,29 @@ final class VideoPlayerViewModel: ObservableObject {
             showHint("\(reason) · 自动换源已关闭，请手动切换线路", hold: 3.0)
             return
         }
+
+        // 1.8.8：AVPlayerItem 的 failed 回调会在几秒内连发（1.8.7 真机两次
+        // `unsupported URL`）。旧版每次都立刻换线路，最多 12 条，
+        // 耗尽后还会启动整站级跨站搜索 —— 端上 Node 与播放器同进程，
+        // 十几条 AVURLAsset 加整站抓取一起堆上来，3 秒一条的心跳
+        // 根本来不及记录内存变化，进程就没了。这里给失败风暴踩刹车。
+        let now = Date()
+        if now.timeIntervalSince(lastAutoSwitchAt) < 2.0 {
+            autoSwitchBurst += 1
+        } else {
+            lastAutoSwitchAt = now
+            autoSwitchBurst = 1
+        }
+        if autoSwitchBurst >= 3 {
+            SessionTrace.mark("阻 播放 换源风暴（2 秒内 \(autoSwitchBurst) 次）")
+            showHint(nil)
+            errorMessage = "多条线路连续失败，已暂停自动换源，请手动选择线路"
+            slowLineHint = nil
+            isBuffering = false
+            isLoading = false
+            return
+        }
+
         guard sources.count > 1 else {
             slowLineHint = nil
             attemptCrossSite(reason: reason)
