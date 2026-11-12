@@ -212,6 +212,10 @@ final class NodeRuntime {
             var req = URLRequest(url: url)
             req.timeoutInterval = timeout
             req.cachePolicy = .reloadIgnoringLocalCacheData
+            // 1.7.8：不用 keep-alive。URLSession 复用到已经被 Node 关掉的旧连接时，
+            // 请求会一直挂到超时（表现就是「转很久圈然后失败」）；本机回环上
+            // 每次新建连接的开销可以忽略，直接 close 最稳。
+            req.setValue("close", forHTTPHeaderField: "Connection")
             let t0 = Date()
             do {
                 let (data, _) = try await URLSession.shared.data(for: req)

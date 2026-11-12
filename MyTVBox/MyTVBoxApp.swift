@@ -182,5 +182,27 @@ struct MyTVBoxApp: App {
             // 预热那一发已经拿到数据了，再来一轮基本必成
             await appState.loadConfigWithRetry(attempts: 3, delay: 1.5)
         }
+
+        // 1.7.8：还是 0 站点就后台继续慢慢试。
+        // 设备上源第一次生成 /config 有可能要几分钟（解释执行 + 内部还在拉远端），
+        // 与其让用户盯着报错点重试，不如后台自动补，成了自动刷新界面。
+        if appState.usableSiteCount == 0, NodeRuntime.shared.isReady {
+            slowLocalConfigRetry()
+        }
+    }
+
+    /// 后台慢重试：最多 3 轮、每轮 120 秒超时，成功即刷新站点池。
+    private func slowLocalConfigRetry() {
+        Task {
+            for _ in 0..<3 {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                if await NodeRuntime.shared.fetchLocalConfigOnce(timeout: 120) != nil {
+                    await appState.loadConfigWithRetry(attempts: 1, delay: 0.2)
+                    NSLog("[App] 后台补加载成功，站点数 %d", appState.usableSiteCount)
+                    return
+                }
+            }
+            NSLog("[App] 后台补加载三轮仍未成功，请看诊断里的「本机源配置」")
+        }
     }
 }
