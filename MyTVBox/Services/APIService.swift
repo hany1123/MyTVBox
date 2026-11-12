@@ -4,6 +4,7 @@ import Foundation
 ///
 /// 1.5.1：内置 mddcloud（type=3）站点走 MddCloudService 原生客户端分流，
 /// 1.5.4：带 bundle 的 JS Spider（type=3）站点走 SpiderEngine，
+/// 1.6.0：Node 中转服务站点走 NodeRelayService（POST /spider/...），
 /// 其余站点继续走标准 CMS `ac=` 协议。
 final class APIService {
     static let shared = APIService()
@@ -17,6 +18,12 @@ final class APIService {
     /// 拉取分类
     /// 1.5.2 单独用 8 秒短超时：分类接口慢不该把整个首屏拖到 20 秒。
     func fetchCategories(site: Site, timeout: TimeInterval? = 8) async throws -> [VideoCategory] {
+        if NodeRelayService.isNodeSite(site) {
+            let r = try? await NodeRelayService.shared.call(
+                site: site, method: "home", body: [:], timeout: timeout ?? 8)
+            let resp: APIResponse? = decodeSpider(r)
+            return resp?.categories ?? []
+        }
         if SpiderEngine.isSpiderSite(site) {
             let r = await SpiderEngine.shared.call(site: site, method: "home", args: [:])
             let resp: APIResponse? = decodeSpider(r)
@@ -36,6 +43,13 @@ final class APIService {
     /// 拉取视频列表（包含分类与第一页）
     /// 注意：标准 CMS 中 `ac=list` 返回简单列表，`ac=detail` 返回详情列表，多数 TVBox 接口用 detail
     func fetchVideoList(site: Site, categoryId: String, page: Int) async throws -> APIResponse {
+        if NodeRelayService.isNodeSite(site) {
+            let body: [String: Any] = ["id": categoryId, "page": page, "filters": [:]]
+            let r = try? await NodeRelayService.shared.call(
+                site: site, method: "category", body: body)
+            if let resp: APIResponse = decodeSpider(r) { return resp }
+            return APIResponse(list: [])
+        }
         if SpiderEngine.isSpiderSite(site) {
             let r = await SpiderEngine.shared.call(
                 site: site, method: "category",
@@ -61,6 +75,15 @@ final class APIService {
     /// - timeout: 跨站点并发搜索时传 6 秒，避免一个慢站拖住整轮聚合
     func fetchVideoDetail(site: Site, vodId: String,
                           timeout: TimeInterval? = nil) async throws -> VideoDetail? {
+        if NodeRelayService.isNodeSite(site) {
+            let r = try? await NodeRelayService.shared.call(
+                site: site, method: "detail", body: ["id": vodId],
+                timeout: timeout ?? 20)
+            var dict = r ?? [:]
+            NodeRelayService.rewritePlayURLs(&dict, site: site)
+            let resp: VideoDetailResponse? = decodeSpider(dict)
+            return resp?.list?.first
+        }
         if SpiderEngine.isSpiderSite(site) {
             let r = await SpiderEngine.shared.call(
                 site: site, method: "detail", args: ["id": vodId])
@@ -84,6 +107,14 @@ final class APIService {
     /// 关键字搜索
     func searchVideos(site: Site, keyword: String,
                       timeout: TimeInterval? = nil) async throws -> [VideoItem] {
+        if NodeRelayService.isNodeSite(site) {
+            let body: [String: Any] = ["wd": keyword, "page": 1]
+            let r = try? await NodeRelayService.shared.call(
+                site: site, method: "search", body: body,
+                timeout: timeout ?? 20)
+            let resp: APIResponse? = decodeSpider(r)
+            return resp?.list ?? []
+        }
         if SpiderEngine.isSpiderSite(site) {
             let r = await SpiderEngine.shared.call(
                 site: site, method: "search", args: ["wd": keyword])

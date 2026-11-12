@@ -274,6 +274,16 @@ extension PlayURL {
         return false
     }
 
+    /// 1.6.0：可交给 `loadAndPlay` 的候选地址。
+    /// 除直链外，`mddcloud://play` / `mytvboxnode://play` 这类占位 scheme
+    /// 会在播放前换成真实 m3u8。若不把它们算作候选，`firstPlayableSourceIndex`
+    /// 和自动换源会把整组线路全部跳过，导致取流失败后直接跨站。
+    static func isPlayableCandidate(url: String) -> Bool {
+        if isDirectPlayable(url: url) { return true }
+        let lower = url.lowercased()
+        return lower.hasPrefix("mddcloud://play") || lower.hasPrefix("mytvboxnode://play")
+    }
+
     /// 线路打分：越高越该排在前面
     static func mediaScore(_ source: PlaySource, sourceName: String) -> Int {
         let nameLower = sourceName.lowercased()

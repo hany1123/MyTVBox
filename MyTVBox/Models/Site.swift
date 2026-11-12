@@ -24,11 +24,14 @@ struct Site: Codable, Identifiable, Hashable, Sendable {
     let jar: String?
     /// CatPaw bundle 中的原始 spider key（type=3 站点路由用）
     let spiderKey: String?
+    /// 1.6.0：Node 中转服务基址。非空表示这个站点由电脑常驻的
+    /// CatVodSpiderios 提供，不走 CMS `ac=` 也不走 JSC Spider。
+    let nodeRelayBase: String?
 
     enum CodingKeys: String, CodingKey {
         case key, name, type, api
         case searchable, quickSearch, filterable, playerType
-        case ext, categories, jar, spiderKey
+        case ext, categories, jar, spiderKey, nodeRelayBase
     }
 
     init(from decoder: Decoder) throws {
@@ -46,6 +49,7 @@ struct Site: Codable, Identifiable, Hashable, Sendable {
         self.categories = try? c.decodeIfPresent([String].self, forKey: .categories)
         self.jar = try? c.decodeIfPresent(String.self, forKey: .jar)
         self.spiderKey = try? c.decodeIfPresent(String.self, forKey: .spiderKey)
+        self.nodeRelayBase = try? c.decodeIfPresent(String.self, forKey: .nodeRelayBase)
 
         // ext 可能是字符串、对象或数组，统一转字符串方便存储
         if let s = try? c.decodeIfPresent(String.self, forKey: .ext) {
@@ -67,7 +71,7 @@ struct Site: Codable, Identifiable, Hashable, Sendable {
          searchable: Int? = nil, quickSearch: Int? = nil, filterable: Int? = nil,
          playerType: Int? = nil, ext: String? = nil,
          categories: [String]? = nil, jar: String? = nil,
-         spiderKey: String? = nil) {
+         spiderKey: String? = nil, nodeRelayBase: String? = nil) {
         self.key = key
         self.name = name
         self.type = type
@@ -80,6 +84,7 @@ struct Site: Codable, Identifiable, Hashable, Sendable {
         self.categories = categories
         self.jar = jar
         self.spiderKey = spiderKey
+        self.nodeRelayBase = nodeRelayBase
     }
 
     func encode(to encoder: Encoder) throws {
@@ -96,6 +101,7 @@ struct Site: Codable, Identifiable, Hashable, Sendable {
         try c.encodeIfPresent(categories, forKey: .categories)
         try c.encodeIfPresent(jar, forKey: .jar)
         try c.encodeIfPresent(spiderKey, forKey: .spiderKey)
+        try c.encodeIfPresent(nodeRelayBase, forKey: .nodeRelayBase)
     }
 
     var isSearchable: Bool { (searchable ?? 0) == 1 }
@@ -110,6 +116,6 @@ struct Site: Codable, Identifiable, Hashable, Sendable {
         Site(key: newKey, name: name, type: type, api: api,
              searchable: searchable, quickSearch: quickSearch, filterable: filterable,
              playerType: playerType, ext: ext, categories: categories,
-             jar: jar, spiderKey: spiderKey)
+             jar: jar, spiderKey: spiderKey, nodeRelayBase: nodeRelayBase)
     }
 }

@@ -198,7 +198,7 @@ final class VideoPlayerViewModel: ObservableObject {
     /// 返回第一条含可直连地址的线路下标
     private func firstPlayableSourceIndex() -> Int? {
         for (i, src) in sources.enumerated() {
-            if src.episodes.contains(where: { PlayURL.isDirectPlayable(url: $0.url) }) {
+            if src.episodes.contains(where: { PlayURL.isPlayableCandidate(url: $0.url) }) {
                 return i
             }
         }
@@ -651,6 +651,35 @@ final class VideoPlayerViewModel: ObservableObject {
             return
         }
 
+        // 1.6.0：Node 中转服务的集地址是加密参数串，用自定义 scheme 占位，
+        // 播放前调 /play 换真实 m3u8，并把服务返回的 header 注入 AVURLAsset。
+        // 必须排在网页解析之前，否则 ParseResolver 会把 scheme 当 URL 去嗅探。
+        if allowResolve, urlString.hasPrefix(NodeRelayService.playScheme) {
+            isLoading = true
+            isBuffering = false
+            errorMessage = nil
+            showHint("正在获取播放地址…", hold: nil)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let resolved = await NodeRelayService.shared.resolvePlay(urlString)
+                guard self.playEpoch == epoch else { return }
+                guard let resolved else {
+                    self.showHint(nil)
+                    self.errorMessage = "该线路暂时无法获取播放地址"
+                    self.autoSwitchSource(reason: "取流失败")
+                    return
+                }
+                self.spiderHeaders = resolved.1
+                self.showHint("取流成功 · 开始播放", hold: 2.0)
+                self.loadAndPlay(url: resolved.0,
+                                 restoreProgress: restoreProgress,
+                                 seekTo: seekTo,
+                                 allowResolve: false,
+                                 bump: false)
+            }
+            return
+        }
+
         // 1.5.4：JS Spider 站点的集地址往往是内部 id，要先调 play() 换真实地址。
         // 必须排在网页解析之前，否则 ParseResolver 会把 id 当 URL 去解析。
         if allowResolve,
@@ -996,7 +1025,7 @@ final class VideoPlayerViewModel: ObservableObject {
             let eps = sources[idx].episodes
             let epIdx = eps.indices.contains(currentEpisodeIndex) ? currentEpisodeIndex : 0
             guard eps.indices.contains(epIdx),
-                  PlayURL.isDirectPlayable(url: eps[epIdx].url),
+                  PlayURL.isPlayableCandidate(url: eps[epIdx].url),
                   let url = URL(string: eps[epIdx].url) else { continue }
 
             // 优先用真实播放时间，首帧前换源则退回会话锚点

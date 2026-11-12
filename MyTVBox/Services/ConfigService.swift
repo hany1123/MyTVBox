@@ -29,7 +29,30 @@ final class ConfigService {
     /// - 支持 URL 内嵌 Basic Auth: http://user:pass@host/path
     /// - 支持 CatPaw Spider 模块 URL（自动尝试常见配置路径）
     /// - 支持 base64 编码的 JSON 配置
+    /// 1.6.0：额外支持「Node 中转服务地址」。标准流程解析失败，或解析出来
+    /// 站点为空（Node 的 /config 顶层是 video.sites，不是 sites）时，
+    /// 才探测 /health 严格确认是 CatVodSpiderios，避免普通订阅多一次网络请求。
     func loadConfig(from urlString: String) async throws -> TVBoxConfig {
+        var standard: TVBoxConfig?
+        var standardError: Error?
+        do {
+            standard = try await loadStandardConfig(from: urlString)
+        } catch {
+            standardError = error
+        }
+        if (standard?.sites ?? []).isEmpty,
+           let cfg = await NodeRelayService.shared.tryLoadConfig(from: urlString) {
+            let n = cfg.sites?.count ?? 0
+            lastStats = ConfigStats(totalSites: n, usableSites: n,
+                                    droppedJarSites: 0, lives: 0)
+            lastRepos = []
+            return cfg
+        }
+        if let standard { return standard }
+        throw standardError ?? NetworkError.invalidURL
+    }
+
+    private func loadStandardConfig(from urlString: String) async throws -> TVBoxConfig {
         lastStats = nil
         lastRepos = []
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
