@@ -136,7 +136,7 @@ enum ConfigCenterURL {
         guard var comps = URLComponents(string: raw), comps.host != nil else { return nil }
         comps.scheme = "http"
         comps.host = "127.0.0.1"
-        comps.port = NodeRuntime.shared.port
+        comps.port = Int(NodeRuntime.shared.port)
         return comps.url
     }
 }
