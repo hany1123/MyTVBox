@@ -493,14 +493,6 @@ struct SubscriptionView: View {
                 }
             }
 
-            if let u = kernel.indexURL, !u.isEmpty {
-                Text(u)
-                    .font(TVBoxTheme.mono(10))
-                    .foregroundStyle(TVBoxTheme.textMuted)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-            }
-
             HStack(spacing: 10) {
                 Button {
                     Task { await checkKernelUpdate() }
@@ -555,11 +547,6 @@ struct SubscriptionView: View {
 
                 Spacer()
             }
-
-            Text("内核就是源本体（约 6.6 MB 的 index.js）。在「添加接口」里填 .../index.js.md5 即可让 App 自己拉新版，不用等我重新打包。")
-                .font(TVBoxTheme.mono(10))
-                .foregroundStyle(TVBoxTheme.textMuted)
-                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 6)
         .onAppear { watchKernelBoot() }

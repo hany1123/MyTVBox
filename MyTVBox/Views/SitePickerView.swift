@@ -9,15 +9,6 @@ struct SitePickerView: View {
     @EnvironmentObject var appState: AppState
     @Binding var isPresented: Bool
 
-    // 1.5.5：真机 Spider 诊断（后台跑 JS，结果可一键复制）
-    @State private var showDiagnose = false
-    @State private var diagnoseText = ""
-    @State private var isDiagnosing = false
-    // 1.5.9：把 App 已经下载好的 6.6MB bundle 原文导出（系统分享面板）
-    @State private var showBundleShare = false
-    @State private var bundleShareURL: URL?
-    @State private var bundleExportHint = ""
-
     private var availableSites: [Site] {
         (appState.currentConfig?.sites ?? []).filter {
             $0.type != 3 || $0.spiderKey != nil || SpiderEngine.isSpiderSite($0)
@@ -54,16 +45,6 @@ struct SitePickerView: View {
             .navigationTitle("CHANNEL")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        runDiagnose()
-                    } label: {
-                        Text(isDiagnosing ? "诊断中…" : "SPIDER 诊断")
-                            .font(TVBoxTheme.mono(10, weight: .semibold))
-                            .foregroundStyle(TVBoxTheme.accent)
-                    }
-                    .disabled(isDiagnosing)
-                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         isPresented = false
@@ -79,108 +60,9 @@ struct SitePickerView: View {
             .toolbarColorScheme(.dark, for: .navigationBar)
         }
         .preferredColorScheme(.dark)
-        .sheet(isPresented: $showDiagnose) {
-            NavigationStack {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(diagnoseText)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(TVBoxTheme.textPrimary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                        Divider().padding(.vertical, 8)
-                        Text("拿不到诊断报告之外的 bundle 原文？直接导出：")
-                            .font(TVBoxTheme.text(12))
-                            .foregroundStyle(TVBoxTheme.textPrimary)
-                        Button {
-                            exportBundle()
-                        } label: {
-                            Label("导出 BUNDLE 原文（约 6 MB）", systemImage: "square.and.arrow.up")
-                                .font(TVBoxTheme.text(13, weight: .semibold))
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(TVBoxTheme.accent)
-                        if !bundleExportHint.isEmpty {
-                            Text(bundleExportHint)
-                                .font(TVBoxTheme.mono(10))
-                                .foregroundStyle(TVBoxTheme.textPrimary)
-                                .textSelection(.enabled)
-                        }
-                        Text("选择「存储到文件」或发给自己，再把文件放到电脑桌面给我。")
-                            .font(TVBoxTheme.mono(10))
-                            .foregroundStyle(TVBoxTheme.textPrimary)
-                    }
-                    .padding(14)
-                }
-                .background(TVBoxTheme.bg)
-                .navigationTitle("SPIDER 诊断")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarLeading) {
-                        Button("关闭") { showDiagnose = false }
-                            .foregroundStyle(TVBoxTheme.accent)
-                    }
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button {
-                            UIPasteboard.general.string = diagnoseText
-                        } label: {
-                            Label("复制报告", systemImage: "doc.on.doc")
-                        }
-                        .foregroundStyle(TVBoxTheme.accent)
-                    }
-                }
-            }
-            .preferredColorScheme(.dark)
-            .sheet(isPresented: $showBundleShare) {
-                if let url = bundleShareURL {
-                    ActivityView(url: url)
-                        .preferredColorScheme(.dark)
-                }
-            }
-        }
         .task {
             // 打开选择器时后台预热各站点首页，选定后立刻有画面
             ContentViewModel.prefetch(sites: availableSites)
-        }
-    }
-
-    // MARK: - 1.5.5 诊断
-
-    /// 诊断要在后台线程跑：bundle 执行 + home() 可能发同步网络请求，
-    /// 放主线程会把整个界面冻住。
-    private func runDiagnose() {
-        guard !isDiagnosing else { return }
-        isDiagnosing = true
-        let site = appState.currentSite
-        DispatchQueue.global(qos: .userInitiated).async {
-            let report = SpiderEngine.shared.diagnoseSync(site: site)
-            DispatchQueue.main.async {
-                self.diagnoseText = report
-                self.isDiagnosing = false
-                self.showDiagnose = true
-            }
-        }
-    }
-
-    /// 1.5.9：App 里已经握着完整 bundle 原文，直接写临时文件走系统分享，
-    /// 省得老大去源站手动下载（Basic Auth / 302 / 混淆文件名都容易踩坑）。
-    private func exportBundle() {
-        guard let site = appState.currentSite,
-              let code = SpiderContextManager.shared.moduleCode(for: site.key) else {
-            bundleExportHint = "当前站点没有 bundle：先切到猫爪 T3 站点再试"
-            return
-        }
-        let hash = SpiderContextManager.shared.sourceHash(for: site.key) ?? "unknown"
-        let fileName = "catpaw_" + hash + ".js"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
-        do {
-            try code.write(to: url, atomically: true, encoding: .utf8)
-            bundleShareURL = url
-            bundleExportHint = "已就绪：\(fileName)，\(code.utf8.count) 字节 / MD5 \(hash)"
-            showBundleShare = true
-        } catch {
-            bundleExportHint = "写文件失败：\(error.localizedDescription)"
         }
     }
 
