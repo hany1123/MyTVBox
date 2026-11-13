@@ -94,31 +94,49 @@ enum ConfigCenterURL {
     ///
     /// 匹配形如 `http://10.64.81.45:18923/website` / `https://1.2.3.4:8080/website/index.html`。
     /// 只认 IPv4 字面量，避免误伤普通网页链接。
-    static func extract(from text: String) -> URL? {
+    ///
+    /// 1.8.19 兜底：源的配置页路径不一定叫 `/website`（有的写成 `/config`、`/admin`，
+    /// 或者只有 `:端口/`）。当站名 / 站 key 表明这是配置类站点时，放宽到任意
+    /// `IPv4:端口[/路径]`。之前只认 `/website`，换个源就识别不出来，
+    /// 页面直接退化成「没拿到可播线路」的报错浮层，把入口整个盖住了。
+    static func extract(from text: String, siteName: String? = nil, siteKey: String? = nil) -> URL? {
         guard !text.isEmpty else { return nil }
 
-        let pattern = #"https?://[0-9]{1,3}(?:\.[0-9]{1,3}){3}:[0-9]{1,5}/website[^\s"'”’）)]*"#
+        let strict = #"https?://[0-9]{1,3}(?:\.[0-9]{1,3}){3}:[0-9]{1,5}/website[^\s"'”’）)]*"#
+        if let url = match(text, pattern: strict) { return url }
+
+        let hint = ((siteName ?? "") + " " + (siteKey ?? "")).lowercased()
+        let looksLikeConfig = hint.contains("配置") || hint.contains("扫码")
+            || hint.contains("config") || hint.contains("setting")
+            || text.contains("配置中心") || text.contains("扫码")
+        guard looksLikeConfig else { return nil }
+
+        let loose = #"https?://[0-9]{1,3}(?:\.[0-9]{1,3}){3}:[0-9]{1,5}(?:/[^\s"'”’）)，。；、]*)?"#
+        return match(text, pattern: loose)
+    }
+
+    private static func match(_ text: String, pattern: String) -> URL? {
         guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return nil
         }
         let ns = text as NSString
-        guard let match = re.firstMatch(in: text,
-                                        range: NSRange(location: 0, length: ns.length)) else {
+        guard let m = re.firstMatch(in: text,
+                                    range: NSRange(location: 0, length: ns.length)) else {
             return nil
         }
 
-        var raw = ns.substring(with: match.range)
+        var raw = ns.substring(with: m.range)
         // 只保留到第一个空白/中文标点为止
         if let cut = raw.firstIndex(where: { $0 == " " || $0 == "\n" || $0 == "，" || $0 == "。" }) {
             raw = String(raw[raw.startIndex..<cut])
         }
-
-        // 端上 Node 只监听 127.0.0.1，源拼出来的局域网 IP 直接换掉。
-        if let hostRange = raw.range(of: #"//[0-9]{1,3}(?:\.[0-9]{1,3}){3}:[0-9]{1,5}/"#,
-                                     options: .regularExpression) {
-            raw.replaceSubrange(hostRange, with: "//127.0.0.1:\(NodeRuntime.shared.port)/")
-        }
-
-        return URL(string: raw)
+        // 端上 Node 只监听 127.0.0.1，源拼出来的局域网 IP 必须整段换掉。
+        // 用 URLComponents 而不是字符串替换：源里可能写成 `:18923`（没有结尾斜杠）、
+        // 也可能带查询参数，字符串替换会漏。
+        guard var comps = URLComponents(string: raw), comps.host != nil else { return nil }
+        comps.scheme = "http"
+        comps.host = "127.0.0.1"
+        comps.port = NodeRuntime.shared.port
+        return comps.url
     }
 }

@@ -107,25 +107,10 @@ private struct SettingsTab: View {
                         }
                         .buttonStyle(.plain)
 
-                        // 1.8.1：诊断入口从站点选择器搬到这里 —— 站点列表为空时
-                        // 那个入口本身进不去，恰恰是最需要诊断的时候。
-                        SectionHeader(title: "诊断", code: "02")
-                            .padding(.top, 8)
-
-                        NavigationLink {
-                            DiagnosticsView()
-                                .environmentObject(appState)
-                        } label: {
-                            settingRow(
-                                icon: "stethoscope",
-                                title: "诊断信息",
-                                subtitle: "内核 / 配置 / 崩溃轨迹，可一键复制",
-                                badge: "LOG"
-                            )
-                        }
-                        .buttonStyle(.plain)
-
-                        SectionHeader(title: "关于", code: "03")
+                        // 1.8.19：诊断入口整体移除。探针在 1.8.18 已经全部拆掉，
+                        // 这页只剩「运行状态 + 去看系统 .ips」的说明，日常没人会点，
+                        // 放在设置里纯属干扰。真出问题按 .ips 栈定位，比这个页面准。
+                        SectionHeader(title: "关于", code: "02")
                             .padding(.top, 8)
 
                         infoRow(icon: "info.circle", title: "版本", value: appVersion)

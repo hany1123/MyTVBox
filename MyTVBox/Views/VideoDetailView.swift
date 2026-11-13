@@ -73,6 +73,9 @@ struct VideoDetailView: View {
     private var resolvedSite: Site? { site ?? appState.currentSite }
     private var resolvedSiteKey: String? { resolvedSite?.key ?? appState.currentSite?.key }
 
+    /// 1.8.19：配置类站点（「扫码配置 / 配置中心」）—— 正文只给一条网页入口，没有可播线路
+    private var isConfigCenterPage: Bool { configCenterURL != nil && sources.isEmpty }
+
     /// 其它站点的同片线路
     private var crossSiteSources: [PlaySource] {
         sources.filter { $0.isCrossSite }
@@ -91,7 +94,10 @@ struct VideoDetailView: View {
                 VStack(spacing: 0) {
                     heroSection
                     metaSection
-                    actionSection
+                    // 1.8.19：配置类站点没有可播内容，「立即播放」是个必然点不动的死按钮
+                    if !isConfigCenterPage {
+                        actionSection
+                    }
                     configCenterSection
                     sourceSection
                     episodeSection
@@ -483,6 +489,21 @@ struct VideoDetailView: View {
     @ViewBuilder
     private var configCenterSection: some View {
         if let url = configCenterURL {
+            if sources.isEmpty {
+                // 1.8.19：这类站点本来就没有片源，先说清楚，别让人以为是加载失败
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("这是「\(resolvedSite?.name ?? "配置")」站点的配置页，本身没有片源 —— 点下面的按钮打开配置中心。")
+                        .font(PlayerTheme.sans(11))
+                        .lineSpacing(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundColor(PlayerTheme.textMid)
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+            }
+
             Button {
                 showConfigCenter = true
             } label: {
@@ -636,8 +657,21 @@ struct VideoDetailView: View {
                     site: site, vodId: vodId, timeout: 10) {
                     let ms = Int(Date().timeIntervalSince(t0) * 1000)
                     let parsed = d.parsePlaySources()
-                    diag("本站 detail: OK \(ms)ms · 线路 \(parsed.count) 条")
+                    let cfg = ConfigCenterURL.extract(from: d.vodContent ?? "",
+                                                      siteName: site.name,
+                                                      siteKey: site.key)
+                    let cfgText = cfg == nil ? "无" : "有"
+                    diag("本站 detail: OK \(ms)ms · 线路 \(parsed.count) 条 · 配置入口 \(cfgText)")
                     if !parsed.isEmpty {
+                        applyDetail(d)
+                        return
+                    }
+                    // 1.8.19：「扫码配置 / 配置中心」这类站点，正文里给的就是一条网页入口，
+                    // 天生没有可播线路。以前会当成失败去跨站接管，最后盖上一层
+                    // 「没拿到可播线路」的报错浮层 —— 正好把配置入口按钮压住，
+                    // 页面看起来就是坏的。现在直接按「配置页」渲染。
+                    if cfg != nil {
+                        diag("判定：配置类站点 → 直接打开配置入口，不跨站")
                         applyDetail(d)
                         return
                     }
@@ -681,9 +715,17 @@ struct VideoDetailView: View {
         self.selectedSourceIndex = 0
         // 1.7.1：配置中心类站点的正文里带 http://<ip>:<port>/website，
         // 识别出来并把局域网 IP 换成端上 Node 的 127.0.0.1。
-        self.configCenterURL = ConfigCenterURL.extract(from: d.vodContent ?? "")
-        // 后台加载其它站点的同片线路（不阻塞详情展示）
-        Task { await loadCrossSiteLines(title: d.vodName) }
+        self.configCenterURL = ConfigCenterURL.extract(
+            from: d.vodContent ?? "",
+            siteName: (adoptedSiteKey == nil ? resolvedSite?.name : nil),
+            siteKey: adoptedSiteKey
+        )
+        // 后台加载其它站点的同片线路（不阻塞详情展示）。
+        // 1.8.19：本片一条线路都没有（典型是配置页）时不必再拿标题去搜 8 个站，
+        // 「扫码配置」这种标题在别的站永远搜不到，纯属白发请求。
+        if !parsed.isEmpty {
+            Task { await loadCrossSiteLines(title: d.vodName) }
+        }
     }
 
     /// 并发试若干候选站点，谁先拿到可播线路就用谁。

@@ -386,7 +386,8 @@ struct SearchView: View {
         var id: String { key }
     }
 
-    /// 按站点聚合命中数，顺序沿用配置里的站序（和 MiraPlay 一致，不按数量重排）
+    /// 按站点聚合命中数。顺序 = `results` 的顺序：搜索过程中按到达顺序，
+    /// 整轮结束后 `sortBySiteCount()` 已把命中多的站点整块提到前面。
     private var siteBuckets: [SiteBucket] {
         var order: [String] = []
         var names: [String: String] = [:]
@@ -621,6 +622,41 @@ struct SearchView: View {
         .padding(.vertical, 6)
     }
 
+    /// 1.8.19：整轮搜索结束后按「站点命中数」重排。
+    ///
+    /// - 主键：站点命中条数，多的在前；
+    /// - 次键：配置里的站序（保证同样条数时次序稳定、可预期）；
+    /// - 站内：保持原顺序（同一站的结果本来就按相关度排好了）。
+    private func sortBySiteCount() {
+        guard results.count > 1 else { return }
+
+        var counts: [String: Int] = [:]
+        var firstSeen: [String: Int] = [:]
+        var configOrder: [String: Int] = [:]
+        let configSites = appState.currentConfig?.sites ?? []
+        for (i, site) in configSites.enumerated() {
+            if configOrder[site.key] == nil { configOrder[site.key] = i }
+        }
+        for (i, r) in results.enumerated() {
+            counts[r.site.key, default: 0] += 1
+            if firstSeen[r.site.key] == nil { firstSeen[r.site.key] = i }
+        }
+
+        let ordered = results.enumerated().sorted { a, b in
+            let ka = a.element.site.key, kb = b.element.site.key
+            if ka != kb {
+                let ca = counts[ka] ?? 0, cb = counts[kb] ?? 0
+                if ca != cb { return ca > cb }
+                let oa = configOrder[ka] ?? Int.max, ob = configOrder[kb] ?? Int.max
+                if oa != ob { return oa < ob }
+                return (firstSeen[ka] ?? 0) < (firstSeen[kb] ?? 0)
+            }
+            return a.offset < b.offset
+        }.map { $0.element }
+
+        results = ordered
+    }
+
     private func performSearch() {
         let trimmed = keyword.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
@@ -688,6 +724,10 @@ struct SearchView: View {
             }
             self.isLoading = false
             self.streaming = false
+            // 1.8.19：搜索过程中按到达顺序上屏（快站先出），整轮结束后再统一按
+            // 「站点命中数」重排一次 —— 命中多的站点整块排前面，站内保持原顺序。
+            // 只重排这一次，所以只跳一下，不会边搜边抖。
+            self.sortBySiteCount()
         }
     }
 }
